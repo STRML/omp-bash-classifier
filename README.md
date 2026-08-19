@@ -15,7 +15,7 @@ Shadows the builtin `bash` tool via the documented OMP extension re-registration
 
 In non-`yolo` approval modes (`always-ask`/`write`), the host's own approval gate runs first and may prompt before the classifier path executes. Classification happens after any host approval the active mode requires.
 
-A per-session cache (`SAFE`/`UNSAFE`), keyed by session id and command, remembers verdicts. Cache state never crosses sessions (the #6263 P3 fix).
+A per-session cache (`SAFE`/`UNSAFE`), keyed by session id, working directory, and command, remembers verdicts. Cache state never crosses sessions or directories (the #6263 P3 fix).
 
 ## Safety model
 
@@ -44,7 +44,7 @@ or remove the symlink and the `omp-plugins.lock.json` entry by hand.
 
 ## Model used
 
-The current session model (`ctx.model`) via `@oh-my-pi/pi-ai` `completeSimple`, single-turn, reasoning disabled, 20s timeout (combined with the caller's abort signal), key resolved from `ctx.modelRegistry.resolver`. Classifier calls are sent only for commands no static rule decides; the cache avoids repeat calls for identical commands within a session.
+The current session model (`ctx.model`) via `@oh-my-pi/pi-ai` `completeSimple`, single-turn, reasoning disabled, 20s timeout (combined with the caller's abort signal), key resolved from `ctx.modelRegistry.resolver`. Classifier calls are sent only for commands no static rule decides; the cache avoids repeat calls for the same command in the same working directory within a session.
 
 ## Configuration
 
