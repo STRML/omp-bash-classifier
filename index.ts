@@ -7,40 +7,51 @@
  * ctx.invokeTool delegation), so execution always flows through native bash:
  * CRITICAL_BASH_PATTERNS and real exec semantics stay authoritative.
  *
- * Design (from spec /tmp/omp-classifier-plugin-spec.md):
+ * Design:
  *   - approval(): SYNC coarse gate. Critical patterns + static config deny are
  *     decided here, before any model call. Never async. Never calls a model.
  *   - execute(): the classifier. Static allow passes straight to native bash.
  *     Everything else is model-judged: SAFE -> native bash, UNSAFE -> blocked,
- *     UNSURE -> interactive confirm (headless: fail closed). Classifier/model
- *     plumbing errors fail open to native bash (that is today's static-gate
- *     behavior; the classifier is additive).
- *   - onSession: per-session classifier cache, cleared on every session event.
+ *     UNSURE -> interactive confirm (headless: fail closed). Classifier
+ *     plumbing errors fail closed (blocked) — never run a command the gate is
+ *     unsure about.
+ *   - onSession: per-session classifier cache, cleared on session boundaries.
  *
- * Safety invariants (from upstream #6263 P3 review):
- *   1. The model NEVER overrides a static deny or critical pattern.
+ * Safety invariants (from upstream #6263 P3 review + repo review 2026-08-19):
+ *   1. The model NEVER overrides a static deny or critical pattern — the sync
+ *      approval() gate runs first, independent of the model.
  *   2. The model NEVER runs a command directly — always via ctx.invokeTool ->
  *      native bash, so CRITICAL_BASH_PATTERNS is authoritative regardless of
  *      model output.
- *   3. Fail-closed: classify-UNSURE with no UI, and model-timeout, block.
- *   4. Session-scoped cache only. No process-global state.
+ *   3. Fail-closed: classify-UNSURE with no UI, classifier error/timeout,
+ *      malformed verdict, and unexpected plugin errors BLOCK. We never execute
+ *      a command the classifier could not judge.
+ *   4. Session-scoped cache only, keyed by session + command. No process-global
+ *      command state.
+ *   5. Static-gate fidelity: segment matching uses the SAME tokenizer as native
+ *      bash approval (tokenizeShellSegments), so deny/prompt rules see
+ *      identical segmentation. invokeTool delegates to native execute WITHOUT
+ *      re-running native approval, so the plugin's static gate must mirror the
+ *      native one exactly — sharing the tokenizer is what makes that hold.
  */
 import type { ExtensionAPI, AgentToolResult } from "@oh-my-pi/pi-coding-agent";
 import { settings } from "@oh-my-pi/pi-coding-agent";
 import { CRITICAL_BASH_PATTERNS } from "@oh-my-pi/pi-coding-agent/tools/bash";
+import { tokenizeShellSegments } from "@oh-my-pi/pi-coding-agent/tools/shell-tokenize";
 import { completeSimple, type TextContent, type UserMessage } from "@oh-my-pi/pi-ai";
 
 type Verdict = "SAFE" | "UNSAFE" | "UNSURE";
 
-/** Session-scoped classifier cache. Cleared in onSession; bounded. */
-const cache = new Map<string, Verdict>();
+/** Per-session classifier cache: sessionId -> command -> verdict. Bounded per session. */
+const cache = new Map<string, Map<string, Verdict>>();
 const CACHE_CAP = 500;
 
 /** Deterministic static-decision for a command: critical + bash.patterns only. */
 type StaticDecision = "deny" | "allow" | "pass";
 
 // Bash pattern helpers, mirrored from the builtin (tools/bash.ts:233-266).
-// Not exported from the package, so copied here to stay behavior-identical.
+// The match/segment LOGIC is imported from the native tokenizer below; these
+// remain because the glob/segment helpers themselves are not package-exported.
 type BashPatternApproval = "allow" | "deny" | "prompt";
 
 function normalizeBashApprovalPattern(value: string): string {
@@ -66,10 +77,15 @@ function commandMatchesBashApprovalPattern(command: string, pattern: string): bo
 	return bashApprovalPatternToRegExp(pattern).test(normalizedCommand);
 }
 
+// Segment matching uses the SAME tokenizer as the native BashTool approval
+// (tools/bash.ts:264 tokenizeShellSegments), so deny/prompt rules see identical
+// segmentation to the builtin. This closes the copied-matcher divergence class:
+// invokeTool delegates to native execute without re-running native approval,
+// so the plugin's own static gate must be behaviorally identical to the native
+// one or a native deny could be routed around.
 function bashCommandSegments(command: string): string[] {
-	return command
-		.split(/[;&|&()\n]/)
-		.map(segment => segment.trim())
+	return tokenizeShellSegments(command)
+		.map(segment => segment.join(" "))
 		.filter(segment => segment.length > 0);
 }
 
@@ -132,14 +148,32 @@ UNSAFE — destructive or irreversible (e.g. rm of source/config/untracked work,
 UNSURE — ambiguous or missing context.
 Reply with exactly one word: SAFE, UNSAFE, or UNSURE.`;
 
+/**
+ * Strict verdict parsing. The classifier must reply with EXACTLY one word; any
+ * other content (a model explaining, or a prompt-injected command echoing
+ * verdict words back) is rejected and treated as UNSURE (fail closed). This
+ * closes the "first SAFE anywhere in the reply" auto-allow vector.
+ */
 function extractVerdict(reply: string): Verdict {
-	const m = /(SAFE|UNSAFE|UNSURE)/.exec(reply.toUpperCase());
-	if (!m) throw new Error(`No verdict in classifier reply: ${reply.slice(0, 80)}`);
-	return m[1] as Verdict;
+	const trimmed = reply.trim();
+	if (/^(SAFE|UNSAFE|UNSURE)$/i.test(trimmed)) {
+		return trimmed.toUpperCase() as Verdict;
+	}
+	return "UNSURE";
 }
 
 function truncated(value: string, max = 400): string {
 	return value.length > max ? `${value.slice(0, max)}…` : value;
+}
+
+function sessionCache(sessionId: string | undefined): Map<string, Verdict> {
+	const key = sessionId ?? "unknown-session";
+	let scoped = cache.get(key);
+	if (!scoped) {
+		scoped = new Map();
+		cache.set(key, scoped);
+	}
+	return scoped;
 }
 
 export default function (pi: ExtensionAPI) {
@@ -181,9 +215,17 @@ export default function (pi: ExtensionAPI) {
 			// pass: no static opinion; execute() classifies.
 			return { tier: "exec" };
 		},
-		onSession: () => {
+		onSession: (event) => {
 			// Session boundaries — a fresh session inherits no classifier state.
-			cache.clear();
+			if (event.reason === "shutdown") {
+				cache.clear();
+				return;
+			}
+			// On start/switch/branch/tree, drop only this session's entries; other
+			// concurrent sessions keep theirs. Keyed on the session id when one is
+			// available at event time.
+			const sessionId = (event as { sessionId?: string }).sessionId;
+			if (sessionId) cache.delete(sessionId);
 		},
 		execute: async (_toolCallId, params, signal, _onUpdate, ctx) => {
 			const command = params.command;
@@ -210,6 +252,9 @@ export default function (pi: ExtensionAPI) {
 				details: {},
 			});
 
+			const sessionId = (ctx.sessionManager as { getSessionId?: () => string } | undefined)?.getSessionId?.();
+			const scopedCache = sessionCache(sessionId);
+
 			try {
 				const decision = staticDecision(command);
 				// Static deny should have been caught by approval(), but re-check
@@ -218,21 +263,25 @@ export default function (pi: ExtensionAPI) {
 				if (decision === "allow") return runNative();
 
 				// Classifier path (decision === "pass").
-				const cached = cache.get(command);
+				const cached = scopedCache.get(command);
 				if (cached === "SAFE") return runNative();
 				if (cached === "UNSAFE") return blocked("classified unsafe (cached)");
 
 				// Model call — bounded, one completion, reasoning disabled.
 				const model = ctx.model;
-				if (!model) return runNative(); // no model: today's static-gate behavior
-				let reply: string;
+				if (!model) return blocked("no model available to classify command");
+
 				try {
-					const sessionId = (ctx.sessionManager as { getSessionId?: () => string } | undefined)?.getSessionId?.();
+					// Combine the caller's abort signal with our timeout so cancelling
+					// the tool call also cancels the classifier request.
+					const classifierSignal = signal
+						? AbortSignal.any([signal, AbortSignal.timeout(20000)])
+						: AbortSignal.timeout(20000);
 					const promptMessage = {
-					role: "user",
-					content: truncated(command, 2000),
-					timestamp: Date.now(),
-				} satisfies UserMessage;
+						role: "user",
+						content: truncated(command, 2000),
+						timestamp: Date.now(),
+					} satisfies UserMessage;
 					const msg = await completeSimple(
 						model,
 						{
@@ -242,52 +291,51 @@ export default function (pi: ExtensionAPI) {
 						{
 							apiKey: ctx.modelRegistry.resolver(model, sessionId),
 							disableReasoning: true,
-							signal: AbortSignal.timeout(20000),
+							signal: classifierSignal,
 						},
 					);
-					reply = msg.content
-						.filter((c): c is { type: "text"; text: string } => c.type === "text")
+					const reply = msg.content
+						.filter((c): c is TextContent => c.type === "text")
 						.map(c => c.text)
 						.join(" ");
-				} catch {
-					// Classifier plumbing failed (model down, timeout, auth). Fail
-					// open to native bash: that is today's behavior — the static
-					// gate (critical patterns + rules) still guards. The classifier
-					// is additive; losing it reverts to baseline, nothing worse.
-					return runNative();
-				}
+					const verdict = extractVerdict(reply);
 
-				const verdict = extractVerdict(reply);
-				if (cache.size >= CACHE_CAP) cache.clear();
-				cache.set(command, verdict);
+					if (scopedCache.size >= CACHE_CAP) scopedCache.clear();
+					scopedCache.set(command, verdict);
 
-				switch (verdict) {
-					case "SAFE":
-						return runNative();
-					case "UNSAFE":
-						return blocked("classified unsafe");
-					case "UNSURE":
-						if (ctx.hasUI) {
-const ok = await ctx.ui.confirm(
-							"Run bash command?",
-							`${truncated(command, 1200)}\n\nClassifier is unsure. Approve to run, deny to block.`,
-						);
-							if (ok) {
-								cache.set(command, "SAFE");
-								return runNative();
+					switch (verdict) {
+						case "SAFE":
+							return runNative();
+						case "UNSAFE":
+							return blocked("classified unsafe");
+						case "UNSURE":
+							if (ctx.hasUI) {
+								const ok = await ctx.ui.confirm(
+									"Run bash command?",
+									`${truncated(command, 1200)}\n\nClassifier is unsure. Approve to run, deny to block.`,
+								);
+								if (ok) {
+									scopedCache.set(command, "SAFE");
+									return runNative();
+								}
+								return blocked("not approved");
 							}
-							return blocked("not approved");
-						}
-						// Headless / no UI: fail closed.
-						return blocked("classifier uncertain and no interactive UI");
+							// Headless / no UI: fail closed.
+							return blocked("classifier uncertain and no interactive UI");
+					}
+				} catch {
+					// Classifier plumbing failed (model down, timeout, auth, malformed
+					// response). Fail CLOSED: never run a command the classifier
+					// could not judge. This is the conservative side of the
+					// divergence-risk tradeoff — the classifier is the gate for
+					// non-allow commands, so its failure must not silently allow.
+					return blocked("classifier unavailable or errored");
 				}
-			} catch (err) {
-				// Any unexpected plugin error: fail open to native bash (the static
-				// gate still guards; this is baseline behavior, never a bypass of
-				// critical patterns which live in native bash).
-				return runNative();
+			} catch {
+				// Unexpected plugin error. Fail closed: never run a command through
+				// a path we cannot vouch for. (Native bash is NOT reached.)
+				return blocked("plugin error");
 			}
 		},
 	});
 }
-
