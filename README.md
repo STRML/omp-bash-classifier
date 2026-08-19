@@ -13,15 +13,17 @@ Shadows the builtin `bash` tool via the documented OMP extension re-registration
 | Static config allow | allow | — | native bash |
 | No rule / prompt rule | pass | model judges | SAFE → native · UNSAFE → block · UNSURE → confirm / fail-closed |
 
-A per-session cache (`SAFE`/`UNSAFE`) remembers verdicts; cleared on every session event so no state crosses sessions (the #6263 P3 fix).
+In non-`yolo` approval modes (`always-ask`/`write`), the host's own approval gate runs first and may prompt before the classifier path executes. Classification happens after any host approval the active mode requires.
+
+A per-session cache (`SAFE`/`UNSAFE`), keyed by session id and command, remembers verdicts. Cache state never crosses sessions (the #6263 P3 fix).
 
 ## Safety model
 
 1. The model **never** overrides a static `deny` or critical pattern — the sync `approval()` gate runs first, independent of the model.
 2. The model **never** runs a command directly — all execution is `ctx.invokeTool` → native bash. Critical patterns live there and cannot be bypassed by classifier output.
-3. Fail-closed: classifier `UNSURE` with no UI, or model timeout/error → command blocked, never silently run.
-4. Session-scoped cache only. No process-global state.
-5. On a plugin/model *plumbing* failure, execution falls back to native bash — which is exactly today's static-gate behavior. The classifier is additive; losing it reverts to baseline, it cannot weaken the static safety net.
+3. Fail-closed everywhere: classifier `UNSURE` with no UI, model timeout/error, malformed verdict, and unexpected plugin errors all block the command. A command the classifier could not judge is never run.
+4. Session-scoped cache only, keyed by session. No process-global command state.
+5. Static-gate fidelity: the plugin uses the same shell tokenizer as native bash approval (`tokenizeShellSegments`), so `deny`/`prompt` rules see identical segmentation to the builtin. This matters because `ctx.invokeTool` delegates to native execution without re-running native approval — the plugin's static gate must mirror the native one exactly, and sharing the tokenizer is what makes that hold.
 
 ## Install
 
@@ -42,7 +44,7 @@ or remove the symlink and the `omp-plugins.lock.json` entry by hand.
 
 ## Model used
 
-The current session model (`ctx.model`) via `@oh-my-pi/pi-ai` `completeSimple`, single-turn, reasoning disabled, 20s bound, key resolved from `ctx.modelRegistry.resolver`. On any model failure it falls back to native bash (baseline behavior).
+The current session model (`ctx.model`) via `@oh-my-pi/pi-ai` `completeSimple`, single-turn, reasoning disabled, 20s timeout (combined with the caller's abort signal), key resolved from `ctx.modelRegistry.resolver`. Classifier calls are sent only for commands no static rule decides; the cache avoids repeat calls for identical commands within a session.
 
 ## Configuration
 
@@ -50,9 +52,10 @@ No plugin config. It reads the existing `bash.patterns` (from `@oh-my-pi/pi-codi
 
 ## Risks
 
-- **Model misevaluation**: bounded by critical patterns + native delegation (never runs directly) + fail-closed on uncertainty.
+- **Command privacy**: commands that static rules do not allow are sent, up to 2,000 characters, to the configured model provider for classification. Command text can contain private paths, proprietary code snippets, inline environment assignments, or secrets in flags, so those values may leave your machine. The provider's logging, retention, and privacy policies apply. The session cache only avoids repeat requests after the first classification.
+- **Model misevaluation**: bounded by critical patterns + native delegation (never runs directly) + fail-closed on uncertainty and on classifier errors.
 - **Latency**: one model call per non-allow bash command (cached per session). Uses reasoning-disabled single turn, cheap.
-- **Shadowing regression**: if the plugin is broken, all bash is affected. Mitigated by fail-open-to-native on any plugin error — the static gate is never weakened.
+- **Shadowing regression**: if the plugin is broken, non-allow commands fail closed (blocked) rather than executing. Static allow/deny rules and critical patterns are unaffected; to disable entirely, uninstall the plugin.
 
 ## Files
 
