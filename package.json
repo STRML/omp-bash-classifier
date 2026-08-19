@@ -1,0 +1,10 @@
+{
+	"name": "omp-bash-classifier",
+	"version": "0.1.0",
+	"description": "Classifier-graceful bash approval for OMP: trivial commands auto-run, dangerous commands block, ambiguous commands prompt. Shadows the builtin bash tool; delegates execution to native bash.",
+	"type": "module",
+	"private": true,
+	"omp": {
+		"extensions": ["./index.ts"]
+	}
+}
