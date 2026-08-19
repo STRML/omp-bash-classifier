@@ -66,6 +66,70 @@ function bashApprovalPatternToRegExp(pattern: string): RegExp {
 	return new RegExp(`^${escaped}$`, "u");
 }
 
+// Mirrored from tools/bash.ts:59-127 (module-private, not package-exported).
+// allow rules must never ride a compound line: shell-control syntax can smuggle
+// a second command past a narrow allow (`git status; rm -rf x` with allow
+// `git *`), and the compound would reach native exec via invokeTool without
+// native re-approval. The native gate refuses allow matches here; so do we.
+const BASH_APPROVAL_SHELL_CONTROL_CHARS: Record<string, true> = {
+	"\n": true,
+	"\r": true,
+	";": true,
+	"&": true,
+	"|": true,
+	"<": true,
+	">": true,
+	"`": true,
+	$: true,
+	"(": true,
+	")": true,
+};
+const BASH_APPROVAL_REINTERPRETED_ARGUMENT_RE = /(?:^|[ \t])(?:-[^-]*[ce]|--(?:command|eval))(?:[= \t]|$)/u;
+
+function hasBashApprovalShellControl(command: string): boolean {
+	let quote: "'" | '"' | undefined;
+	let hasReinterpretableShellControl = false;
+	for (let i = 0; i < command.length; i++) {
+		const ch = command[i];
+		if (quote === "'") {
+			if (ch === "'") {
+				quote = undefined;
+			} else if (Object.hasOwn(BASH_APPROVAL_SHELL_CONTROL_CHARS, ch)) {
+				hasReinterpretableShellControl = true;
+			}
+			continue;
+		}
+		if (ch === "\\") {
+			const escaped = command[i + 1];
+			if (escaped && Object.hasOwn(BASH_APPROVAL_SHELL_CONTROL_CHARS, escaped)) {
+				hasReinterpretableShellControl = true;
+			}
+			i++;
+			continue;
+		}
+		if (quote === '"') {
+			if (ch === '"') {
+				quote = undefined;
+				continue;
+			}
+			// Expansion is active inside double quotes even in the original line.
+			if (ch === "`" || ch === "$") return true;
+			// Other control characters are literal here but become executable if a
+			// `-c`/`-e` option reinterprets the argument through another shell.
+			if (Object.hasOwn(BASH_APPROVAL_SHELL_CONTROL_CHARS, ch)) hasReinterpretableShellControl = true;
+			continue;
+		}
+		if (ch === "'" || ch === '"') {
+			quote = ch;
+			continue;
+		}
+		if (Object.hasOwn(BASH_APPROVAL_SHELL_CONTROL_CHARS, ch)) return true;
+	}
+	// Options such as `git -c alias.x='!...'` and `sh -c "..."` reinterpret
+	// otherwise literal quoted or escaped arguments as executable code.
+	return hasReinterpretableShellControl && BASH_APPROVAL_REINTERPRETED_ARGUMENT_RE.test(command);
+}
+
 interface BashApprovalPatternRule {
 	match: string;
 	approval: BashPatternApproval;
@@ -99,7 +163,11 @@ function commandSegmentMatchesBashApprovalPattern(command: string, pattern: stri
 
 function bashApprovalRuleMatches(command: string, rule: BashApprovalPatternRule): boolean {
 	if (rule.approval === "allow") {
-		// allow only vouches for the ENTIRE command, never a compound segment
+		// allow must vouch for the ENTIRE command: shell-control syntax could
+		// smuggle a second command past a narrow allow (`git status; rm -rf x`
+		// with allow `git *`), and the compound would reach native exec without
+		// native re-approval. Mirror the native guard (tools/bash.ts:283-288).
+		if (hasBashApprovalShellControl(command)) return false;
 		return commandMatchesBashApprovalPattern(command, rule.match);
 	}
 	return commandSegmentMatchesBashApprovalPattern(command, rule.match);
@@ -215,17 +283,18 @@ export default function (pi: ExtensionAPI) {
 			// pass: no static opinion; execute() classifies.
 			return { tier: "exec" };
 		},
-		onSession: (event) => {
+		onSession: (event, ctx) => {
 			// Session boundaries — a fresh session inherits no classifier state.
 			if (event.reason === "shutdown") {
 				cache.clear();
 				return;
 			}
 			// On start/switch/branch/tree, drop only this session's entries; other
-			// concurrent sessions keep theirs. Keyed on the session id when one is
-			// available at event time.
-			const sessionId = (event as { sessionId?: string }).sessionId;
-			if (sessionId) cache.delete(sessionId);
+			// concurrent sessions keep theirs. The event carries no session id
+			// (ToolSessionEvent: reason + previousSessionFile only), so the
+			// manager on ctx is the reliable source.
+			const sid = (ctx.sessionManager as { getSessionId?: () => string } | undefined)?.getSessionId?.();
+			if (sid) cache.delete(sid);
 		},
 		execute: async (_toolCallId, params, signal, _onUpdate, ctx) => {
 			const command = params.command;
@@ -254,6 +323,12 @@ export default function (pi: ExtensionAPI) {
 
 			const sessionId = (ctx.sessionManager as { getSessionId?: () => string } | undefined)?.getSessionId?.();
 			const scopedCache = sessionCache(sessionId);
+			// A verdict is only meaningful for the working directory it was made
+			// in: `rm -rf build` judged against repo A must not auto-run in repo B.
+			// (The native bash schema names optional params with a literal "?"
+			// inside the key: "cwd?", "env?", "pty?".)
+			const cwd = params["cwd?"] ?? "";
+			const cacheKey = `${cwd}\u0000${command}`;
 
 			try {
 				const decision = staticDecision(command);
@@ -263,7 +338,7 @@ export default function (pi: ExtensionAPI) {
 				if (decision === "allow") return runNative();
 
 				// Classifier path (decision === "pass").
-				const cached = scopedCache.get(command);
+				const cached = scopedCache.get(cacheKey);
 				if (cached === "SAFE") return runNative();
 				if (cached === "UNSAFE") return blocked("classified unsafe (cached)");
 
@@ -279,7 +354,7 @@ export default function (pi: ExtensionAPI) {
 						: AbortSignal.timeout(20000);
 					const promptMessage = {
 						role: "user",
-						content: truncated(command, 2000),
+						content: `Command:\n${truncated(command, 2000)}\n\nWorking directory: ${truncated(cwd, 300) || "(session default)"}`,
 						timestamp: Date.now(),
 					} satisfies UserMessage;
 					const msg = await completeSimple(
@@ -300,8 +375,15 @@ export default function (pi: ExtensionAPI) {
 						.join(" ");
 					const verdict = extractVerdict(reply);
 
-					if (scopedCache.size >= CACHE_CAP) scopedCache.clear();
-					scopedCache.set(command, verdict);
+					// Evict oldest entries first (Map preserves insertion order);
+					// clearing the whole cache would forget every UNSAFE verdict a
+					// long or hostile session already paid for.
+					while (scopedCache.size >= CACHE_CAP) {
+						const oldest = scopedCache.keys().next().value;
+						if (oldest === undefined) break;
+						scopedCache.delete(oldest);
+					}
+					scopedCache.set(cacheKey, verdict);
 
 					switch (verdict) {
 						case "SAFE":
@@ -315,7 +397,7 @@ export default function (pi: ExtensionAPI) {
 									`${truncated(command, 1200)}\n\nClassifier is unsure. Approve to run, deny to block.`,
 								);
 								if (ok) {
-									scopedCache.set(command, "SAFE");
+									scopedCache.set(cacheKey, "SAFE");
 									return runNative();
 								}
 								return blocked("not approved");

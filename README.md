@@ -23,7 +23,7 @@ A per-session cache (`SAFE`/`UNSAFE`), keyed by session id and command, remember
 2. The model **never** runs a command directly — all execution is `ctx.invokeTool` → native bash. Critical patterns live there and cannot be bypassed by classifier output.
 3. Fail-closed everywhere: classifier `UNSURE` with no UI, model timeout/error, malformed verdict, and unexpected plugin errors all block the command. A command the classifier could not judge is never run.
 4. Session-scoped cache only, keyed by session. No process-global command state.
-5. Static-gate fidelity: the plugin uses the same shell tokenizer as native bash approval (`tokenizeShellSegments`), so `deny`/`prompt` rules see identical segmentation to the builtin. This matters because `ctx.invokeTool` delegates to native execution without re-running native approval — the plugin's static gate must mirror the native one exactly, and sharing the tokenizer is what makes that hold.
+5. Static-gate fidelity: the plugin uses the same shell tokenizer as native bash approval (`tokenizeShellSegments`) and mirrors the native allow-rule shell-control guard (`hasBashApprovalShellControl`), so `allow` rules never ride a compound line (`git status; rm -rf x` cannot pass an `allow: git *`) and `deny`/`prompt` rules see identical segmentation to the builtin. This matters because `ctx.invokeTool` delegates to native execution without re-running native approval — the plugin's static gate must mirror the native one exactly.
 
 ## Install
 
