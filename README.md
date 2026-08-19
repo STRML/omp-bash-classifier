@@ -26,7 +26,8 @@ A per-session cache (`SAFE`/`UNSAFE`) remembers verdicts; cleared on every sessi
 ## Install
 
 ```bash
-cd ~/git && omp plugin install ./omp-bash-classifier
+git clone https://github.com/STRML/omp-bash-classifier.git
+cd omp-bash-classifier && omp plugin install .
 ```
 
 This symlinks the directory into `~/.omp/plugins/node_modules/omp-bash-classifier` and writes `omp-plugins.lock.json`. No build step, no npm deps. Then start a new OMP session (config/plugins load at session start).
@@ -45,7 +46,7 @@ The current session model (`ctx.model`) via `@oh-my-pi/pi-ai` `completeSimple`, 
 
 ## Configuration
 
-No plugin config. It reads the existing `bash.patterns` (from `@oh-my-pi/pi-coding-agent` `settings`) and `CRITICAL_BASH_PATTERNS` from the fork, so your current guardrails keep working — the classifier only adds judgment for commands no static rule decides.
+No plugin config. It reads the existing `bash.patterns` (from `@oh-my-pi/pi-coding-agent` `settings`) and imports `CRITICAL_BASH_PATTERNS` from `@oh-my-pi/pi-coding-agent/tools/bash`, so your current guardrails keep working — the classifier only adds judgment for commands no static rule decides.
 
 ## Risks
 
@@ -57,4 +58,4 @@ No plugin config. It reads the existing `bash.patterns` (from `@oh-my-pi/pi-codi
 
 - `index.ts` — the plugin (single file: registerTool bash, sync approval, async execute, onSession cache).
 - `package.json` — manifest (`omp.extensions: ["./index.ts"]`, no deps).
-- `tsconfig.json` — typecheck against the fork (`~/git/forks/omp`), `extends` its base.
+- `LICENSE` — MIT.

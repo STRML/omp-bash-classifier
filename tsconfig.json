@@ -1,8 +1,0 @@
-{
-	"extends": "../forks/omp/tsconfig.base.json",
-	"compilerOptions": {
-		"noEmit": true,
-		"typeRoots": ["../forks/omp/types", "../forks/omp/node_modules/@types"]
-	},
-	"include": ["index.ts"]
-}
