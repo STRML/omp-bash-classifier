@@ -57,9 +57,11 @@ Uninstall: `omp plugin uninstall omp-bash-classifier`.
 
 ## Model used
 
-The `@tiny` model role — the role core reserves for online title/memory/classifier work — falling back to the session model when `@tiny` resolves to nothing. Single turn, reasoning disabled, 15s timeout. Set `modelRoles.tiny` to something cheap and fast; unset, it inherits the `smol` chain.
+The `@tiny` model role — the role core reserves for online title/memory/classifier work — falling back to the session model when `@tiny` resolves to nothing. Single turn, reasoning disabled, 15s timeout.
 
-One call per novel command, then cached for the session per (native-resolved cwd, `env`, `pty`, timeout, async, command). With `modelRoles.tiny` unset the `smol` chain decides, which on a Claude-only setup is a Sonnet-class model — set the role explicitly if you want the call to be genuinely cheap.
+Assign the TINY role in `/models`; there is no `omp config` key for it (`modelRoles` is a record the CLI does not address by sub-key). Unset, the role auto-resolves through the `smol` chain, which on a Claude-only setup is a Sonnet-class model — assign it explicitly if you want the call to be genuinely cheap.
+
+One call per novel command, then cached for the session per (native-resolved cwd, `env`, `pty`, timeout, async, command).
 
 ## Configuration
 
