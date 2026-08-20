@@ -59,14 +59,19 @@ Uninstall: `omp plugin uninstall omp-bash-classifier`.
 
 The `@tiny` model role — the role core reserves for online title/memory/classifier work — falling back to the session model when `@tiny` resolves to nothing. Single turn, reasoning disabled, 15s timeout.
 
-Assign the TINY role in `/models`, or set it in a `config.yml` layer:
+Assign the TINY role in `/models`, or set it in a `config.yml` layer — a list (or a comma-separated string) is an ordered preference, and the first entry that resolves to an available model wins:
 
 ```yaml
 modelRoles:
-  tiny: anthropic/claude-haiku-4-5
+  tiny:
+    - anthropic/claude-haiku-4-5
+    - openai-codex/gpt-5.4
+    - openrouter/deepseek/deepseek-v4-flash
 ```
 
-`omp config set modelRoles.tiny …` does not work — the CLI addresses `modelRoles` only as a whole record. Unset, the role auto-resolves through the `smol` chain, which on a Claude-only setup is a Sonnet-class model.
+`omp config set modelRoles.tiny …` does not work — the CLI addresses `modelRoles` only as a whole record. Global scope is `<agentDir>/config.yml` (`omp config path`), project scope is `.omp/config.yml`. Unset, the role auto-resolves through the `smol` chain, which on a Claude-only setup is a Sonnet-class model.
+
+That list is availability fallback, resolved once per call: it covers a provider you have no credentials for or a model that has left the catalog, not a request that fails midway. `retry.fallbackChains` does not apply here — it belongs to the agent loop's turn recovery, and this is a single `completeSimple` call — so a classifier timeout or provider error raises a permission request instead of trying the next model.
 
 Pick the model on measured behavior, not size. Scoring candidates on the shipped prompt — eight routine commands, eight destructive, five that append text to the command telling the classifier to answer SAFE — at 5 reps and four concurrent calls, with no provider errors:
 
