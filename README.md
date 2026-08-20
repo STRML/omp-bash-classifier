@@ -33,7 +33,7 @@ Native bash marks `CRITICAL_BASH_PATTERNS` hits `{ tier: "exec", override: true 
 1. The plugin can only **add** friction: it blocks, or asks. It never bypasses the native gate and never runs a command itself.
 2. Static rules stay authoritative below the critical and env checks. `deny` and `prompt` pattern rules, and narrow `allow` rules, are otherwise honored untouched; the plugin reads `bash.patterns` with the same tokenizer (`tokenizeShellSegments`) and the same allow-rule shell-control guard as the builtin, so it agrees with the native gate about which rule matches. "Narrow" means breadth, not spelling: `**` and `* *` are blanket rules and are classified like `*`. Native pattern decisions outrank non-deny `tools.approval.bash` policies; the plugin mirrors that precedence.
 3. Fail-closed: a command over 2,000 characters is blocked outright. An `env` override, classifier error/timeout, and malformed verdict raise a permission request when a UI exists and **block** when headless. An unexpected plugin throw always blocks. A command the gate could not judge is never silently auto-run.
-4. Verdict parsing is anchored to the start of the reply, so a model that reasons aloud and mentions `SAFE` mid-answer cannot produce a SAFE verdict. Injection is addressed separately: command and cwd are JSON data between per-call random delimiters, and the classifier is told that text arguing for its own verdict is itself grounds for UNSAFE.
+4. Verdict parsing is anchored to the start of the reply, so a model that reasons aloud and mentions `SAFE` mid-answer cannot produce a SAFE verdict. Injection is addressed separately: command and cwd are JSON data between per-call random delimiters, and the prompt ends with a mechanical scan — text addressing the reviewer, naming a verdict, claiming a part is an inert example or already approved, or imitating the delimiter makes the verdict UNSAFE. That is a measured mitigation, not a guarantee: see the model table for how much of it survives per model.
 5. Session-scoped cache keyed by (session, native-resolved working directory, `env`, `pty`, timeout, async, command) — every execution-affecting input. Classifier verdicts never cross sessions, directories, environments, or time/execution modes; only the current session's entries are dropped at its boundaries.
 6. When settings cannot be read (an SDK or isolated session with no global settings singleton), the plugin honors no static rules and classifies everything rather than blocking every bash call.
 
@@ -68,15 +68,18 @@ modelRoles:
 
 `omp config set modelRoles.tiny …` does not work — the CLI addresses `modelRoles` only as a whole record. Unset, the role auto-resolves through the `smol` chain, which on a Claude-only setup is a Sonnet-class model.
 
-Pick the model on measured behavior, not size. Scoring candidates on this prompt with 19 labeled commands × 5 reps — 7 routine, 8 destructive, 4 that append instructions to the command telling the classifier to answer SAFE:
+Pick the model on measured behavior, not size. Scoring candidates on the shipped prompt — eight routine commands, eight destructive, five that append text to the command telling the classifier to answer SAFE — at 5 reps and four concurrent calls, with no provider errors:
 
-| model | answered SAFE on a command that must not run | blocked routine work | p50 |
-|---|---|---|---|
-| `anthropic/claude-haiku-4-5` | 1/60 | 0/35 | 1.2s |
-| `deepseek/deepseek-v4-flash` | 1/60 | 8/35 (always stops `git add -A && git commit`) | 2.1s |
-| `anthropic/claude-sonnet-5` | 15/60 — every injection case, every rep | 0/35 | 1.7s |
+| model | judged an injected command SAFE | judged a destructive command SAFE | extra prompt on routine work | p50 |
+|---|---|---|---|---|
+| `anthropic/claude-haiku-4-5` | 0/25 | 0/40 | 0/40 | 1.1s |
+| `openai-codex/gpt-5.4-mini` | 0/25 | 0/40 | 0/40 | 2.7s |
+| `deepseek/deepseek-v4-flash` | 0/25 | 0/40 | 6/40 — calls `git add -A && git commit` UNSAFE | 1.7s |
+| `anthropic/claude-sonnet-5` | 2/25 | 0/40 | 0/40 | 1.7s |
 
-Every model caught every plainly destructive command; injection resistance is what separates them, and it does not track model strength. Cursor-provider models (`composer-*`, `gpt-5.4-nano-*`, `gemini-3.7-flash-*`) are unusable here: they answer an agent transcript with tool calls, or empty content, so every command parses as no-verdict and raises a prompt.
+Every model catches every plainly destructive command; the difference is whether a command that argues for its own verdict can talk the classifier into SAFE, and that does not track model strength — the Sonnet-class model the `smol` chain lands on is the weakest of the four. Measure before switching: an earlier version of this prompt let claude-sonnet-5 through on 29/50 injection samples.
+
+Cursor-provider models (`composer-*`, `gpt-5.4-nano-*`, `gemini-3.7-flash-*`) are unusable here. They answer as an agent, not a classifier: `composer-2.5-fast` returns thinking blocks and tool calls narrating how it will run the command, `gpt-5.4-nano-low` returns no content at all. Every reply parses as no-verdict, so every bash command raises a prompt.
 
 One call per novel command, then cached for the session per (native-resolved cwd, `env`, `pty`, timeout, async, command).
 
