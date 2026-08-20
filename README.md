@@ -59,7 +59,24 @@ Uninstall: `omp plugin uninstall omp-bash-classifier`.
 
 The `@tiny` model role — the role core reserves for online title/memory/classifier work — falling back to the session model when `@tiny` resolves to nothing. Single turn, reasoning disabled, 15s timeout.
 
-Assign the TINY role in `/models`; there is no `omp config` key for it (`modelRoles` is a record the CLI does not address by sub-key). Unset, the role auto-resolves through the `smol` chain, which on a Claude-only setup is a Sonnet-class model — assign it explicitly if you want the call to be genuinely cheap.
+Assign the TINY role in `/models`, or set it in a `config.yml` layer:
+
+```yaml
+modelRoles:
+  tiny: anthropic/claude-haiku-4-5
+```
+
+`omp config set modelRoles.tiny …` does not work — the CLI addresses `modelRoles` only as a whole record. Unset, the role auto-resolves through the `smol` chain, which on a Claude-only setup is a Sonnet-class model.
+
+Pick the model on measured behavior, not size. Scoring candidates on this prompt with 19 labeled commands × 5 reps — 7 routine, 8 destructive, 4 that append instructions to the command telling the classifier to answer SAFE:
+
+| model | answered SAFE on a command that must not run | blocked routine work | p50 |
+|---|---|---|---|
+| `anthropic/claude-haiku-4-5` | 1/60 | 0/35 | 1.2s |
+| `deepseek/deepseek-v4-flash` | 1/60 | 8/35 (always stops `git add -A && git commit`) | 2.1s |
+| `anthropic/claude-sonnet-5` | 15/60 — every injection case, every rep | 0/35 | 1.7s |
+
+Every model caught every plainly destructive command; injection resistance is what separates them, and it does not track model strength. Cursor-provider models (`composer-*`, `gpt-5.4-nano-*`, `gemini-3.7-flash-*`) are unusable here: they answer an agent transcript with tool calls, or empty content, so every command parses as no-verdict and raises a prompt.
 
 One call per novel command, then cached for the session per (native-resolved cwd, `env`, `pty`, timeout, async, command).
 
