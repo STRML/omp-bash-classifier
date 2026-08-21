@@ -57,8 +57,20 @@ No plugin config. It reads the existing `bash.patterns` (from `@oh-my-pi/pi-codi
 - **Latency**: one model call per non-allow bash command (cached per session). Uses reasoning-disabled single turn, cheap.
 - **Shadowing regression**: if the plugin is broken, non-allow commands fail closed (blocked) rather than executing. Static allow/deny rules and critical patterns are unaffected; to disable entirely, uninstall the plugin.
 
+## Testing
+
+```bash
+bun install
+bun test        # 38 unit tests: static gate, classifier verdicts, cache keying
+bun run typecheck
+```
+
+The suite mocks the three package boundaries the plugin crosses (`pi-ai` completion, the `settings`/`CRITICAL_BASH_PATTERNS` import surface) and exercises the real published `shell-tokenize` artifact, so gate semantics are tested against production segmentation. CI runs the same commands on push/PR. The model-based classifier itself is deliberately not tested in CI; verdict-boundary evaluation is tracked in issue #2.
+
 ## Files
 
 - `index.ts` — the plugin (single file: registerTool bash, sync approval, async execute, onSession cache).
-- `package.json` — manifest (`omp.extensions: ["./index.ts"]`, no deps).
+- `tests/` — unit suite (bun:test). No runtime deps; `@oh-my-pi/*` in devDependencies supply published types.
+- `.github/workflows/ci.yml` — typecheck + test gate.
+- `package.json` — manifest (`omp.extensions: ["./index.ts"]`, no runtime deps).
 - `LICENSE` — MIT.
