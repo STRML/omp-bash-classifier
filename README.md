@@ -104,13 +104,17 @@ Settings are read through the host module instance (`pi.pi.settings`). A plugin-
 ## Files
 
 - `index.ts` — the plugin (single file: `tool_call` gate, static rule mirror, classifier, session cache).
-- `package.json` — manifest (`omp.extensions: ["./index.ts"]`, dev-only deps for `bun run typecheck`).
+- `tests/` — unit suite (bun:test) against the interceptor surface; the model boundary (`pi-ai` completion) is stubbed and everything else runs real against the published packages.
+- `.github/workflows/ci.yml` — typecheck + test gate on push/PR.
+- `package.json` — manifest (`omp.extensions: ["./index.ts"]`, devDependencies pin the exact host package versions the tests exercise).
 - `LICENSE` — MIT.
 
-## Development
+## Testing
 
 ```bash
 bun install
-ln -sfn "$(bun pm -g bin)/../install/global/node_modules/@oh-my-pi" node_modules/@oh-my-pi   # resolve host types
-bun run typecheck
+bun test          # static gate, classifier verdicts, cache keying, fail-closed paths
+bun run typecheck # against the pinned published host types
 ```
+
+CI runs both on push/PR (`bun install --frozen-lockfile`). The model-based classifier's verdict quality is evaluated on demand against a live model (`eval/`, tracked in issue #2), not in CI.
