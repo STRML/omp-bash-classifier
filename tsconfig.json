@@ -10,7 +10,8 @@
 		"skipLibCheck": true,
 		"noUnusedLocals": true,
 		"noUnusedParameters": true,
-		"isolatedModules": true
+		"isolatedModules": true,
+		"allowImportingTsExtensions": true
 	},
 	"include": ["index.ts", "tests/**/*.ts"]
 }
