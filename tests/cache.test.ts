@@ -95,4 +95,28 @@ describe("cache keying", () => {
 		await run("cache-session", "", "ls -la");
 		expect(classifierCalls).toBe(callsAfterFirst);
 	});
+
+	test("trailing-slash cwd collapses to bare path", async () => {
+		setClassifier("SAFE");
+		await run("cache-session", "/repo/a", "make build");
+		const callsAfterFirst = classifierCalls;
+		await run("cache-session", "/repo/a/", "make build");
+		expect(classifierCalls).toBe(callsAfterFirst);
+	});
+
+	test("explicit '.' cwd collapses to absent", async () => {
+		setClassifier("SAFE");
+		await run("cache-session", undefined, "make build");
+		const callsAfterFirst = classifierCalls;
+		await run("cache-session", ".", "make build");
+		expect(classifierCalls).toBe(callsAfterFirst);
+	});
+
+	test("root '/' is not collapsed to empty", async () => {
+		setClassifier("SAFE");
+		await run("cache-session", "/", "make root-distinct");
+		const callsAfterFirst = classifierCalls;
+		await run("cache-session", "", "make root-distinct");
+		expect(classifierCalls).toBe(callsAfterFirst + 1); // different cwd: reclassify
+	});
 });

@@ -49,6 +49,16 @@ const CACHE_CAP = 500;
 /** Deterministic static-decision for a command: critical + bash.patterns only. */
 type StaticDecision = "deny" | "allow" | "pass";
 
+/** Canonicalize a cwd for cache keying. Root stays "/"; trailing slashes and
+ *  explicit "." collapse to the same key space as the bare (or absent) path. */
+function normalizeCwdKey(cwd: string | undefined): string {
+	if (!cwd) return "";
+	const trimmed = cwd.trim();
+	if (trimmed === "." || trimmed === "./") return "";
+	if (trimmed.length > 1 && trimmed.endsWith("/")) return trimmed.slice(0, -1);
+	return trimmed;
+}
+
 // Bash pattern helpers, mirrored from the builtin (tools/bash.ts:233-266).
 // The match/segment LOGIC is imported from the native tokenizer below; these
 // remain because the glob/segment helpers themselves are not package-exported.
@@ -328,7 +338,11 @@ export default function (pi: ExtensionAPI) {
 			// (The native bash schema names optional params with a literal "?"
 			// inside the key: "cwd?", "env?", "pty?".)
 			const cwd = params["cwd?"] ?? "";
-			const cacheKey = `${cwd}\u0000${command}`;
+			// Normalize cosmetic cwd variance so identical commands in the same
+			// directory share a verdict: a trailing slash and explicit "." both
+			// denote the same working directory as the bare path (and as absent).
+			const normalizedCwd = normalizeCwdKey(cwd);
+			const cacheKey = `${normalizedCwd}\u0000${command}`;
 
 			try {
 				const decision = staticDecision(command);
