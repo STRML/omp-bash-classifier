@@ -49,7 +49,9 @@
  * `env` override, classifier error/timeout, and malformed verdict raise a
  * permission request when a UI exists and block when headless; any unexpected
  * plugin throw always blocks. A command the gate could not judge is never
- * silently auto-run.
+ * silently auto-run. A SAFE verdict alone is never enough to auto-run a
+ * command carrying a destructive/irreversible token (matchModerateRiskTokens):
+ * those raise a permission request even when the model said SAFE.
  */
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -60,7 +62,7 @@ import { resolveToCwd } from "@oh-my-pi/pi-coding-agent/tools/path-utils";
 import { extractLeadingCdTarget, tokenizeShellSegments } from "@oh-my-pi/pi-coding-agent/tools/shell-tokenize";
 import { completeSimple, type Model, type TextContent, type UserMessage } from "@oh-my-pi/pi-ai";
 
-type Verdict = "SAFE" | "UNSAFE" | "UNSURE";
+type Verdict = "SAFE" | "UNSAFE" | "UNSURE" | "PARSE_ERROR";
 
 interface Judgement {
 	verdict: Verdict;
@@ -69,6 +71,12 @@ interface Judgement {
 
 /** Per-session cache: sessionId -> `${cwd}\0${env}\0${pty}\0${command}` -> judgement. */
 const cache = new Map<string, Map<string, Judgement>>();
+// Effective-config signature of the last gate run. The classifier config
+// (enabled, model, timeoutMs, maxCommandLength) is part of the trust state a
+// cached verdict was made under: changing any of it invalidates every session's
+// cached judgements, so `/classifier model x` cannot reuse a SAFE verdict made
+// by (or under the policy of) a different configuration.
+let classifierConfigSignature = "";
 const CACHE_CAP = 500;
 // Classifier timeout is config-driven (config.timeoutMs, default 15_000).
 
@@ -383,14 +391,16 @@ VERDICT is exactly SAFE, UNSAFE, or UNSURE.`;
 /**
  * Verdict parsing is anchored to the START of the reply: a model that reasons
  * aloud and mentions SAFE mid-answer cannot produce a SAFE verdict. Anything
- * that does not begin with a verdict token is UNSURE. This does not, and cannot,
- * stop a model that an injected command talked into opening with `SAFE` — the
- * delimiter and the DATA framing in CLASSIFIER_PROMPT are what address that.
+ * that does not begin with a verdict token is a PARSE_ERROR, which raises a
+ * permission request and is NOT cached (one flaky reply must not pin the
+ * session to a repeated prompt). This does not, and cannot, stop a model that
+ * an injected command talked into opening with `SAFE` — the moderate-risk
+ * overlay and the DATA framing in CLASSIFIER_PROMPT are what address that.
  */
 function parseJudgement(reply: string): Judgement {
 	const firstLine = reply.trim().split(/\r?\n/u, 1)[0] ?? "";
 	const match = /^(SAFE|UNSAFE|UNSURE)\b[\s|:.,-]*(.*)$/iu.exec(firstLine.trim());
-	if (!match) return { verdict: "UNSURE", reason: "classifier reply was not a verdict" };
+	if (!match) return { verdict: "PARSE_ERROR", reason: "classifier reply was not a verdict" };
 	return {
 		verdict: match[1].toUpperCase() as Verdict,
 		reason: truncated(match[2].trim().replace(/\s+/gu, " "), 160),
@@ -399,6 +409,26 @@ function parseJudgement(reply: string): Judgement {
 
 function truncated(value: string, max: number): string {
 	return value.length > max ? `${value.slice(0, max)}…` : value;
+}
+
+// Commands carrying any of these tokens never auto-run on a classifier SAFE
+// verdict alone: they are destructive, move/replace files, rewrite history,
+// change ownership/permissions, elevate, or fetch-and-execute remote content.
+// The anti-steering scan is prompt text and measured leaky (2/25 injections
+// accepted as SAFE by claude-sonnet-5, index.ts header notes), so a model
+// talked into answering `SAFE` must still raise a permission request for this
+// class. The builtin CRITICAL_BASH_PATTERNS does not cover them all.
+// Anything NOT listed (echo, git status/diff/log, cd, pipes, redirects, &&)
+// keeps the graceful auto-run path.
+const MODERATE_RISK_RE =
+	/\b(rm|rmdir|unlink|mv|dd\b|mkfs[a-z0-9._-]*|chmod|chown|chattr|truncate|shred|wipefs|ddrescue|sudo|curl|wget|tee\b|eval|git\s+push|git\s+reset|git\s+clean|git\s+checkout\s+--|git\s+commit\s+--amend|python[23]?\s+-c|bash\s+-c|sh\s+-c|perl\s+-e)(?=[\s;&|()'"`]|$)/giu;
+
+export function matchModerateRiskTokens(command: string): string[] {
+	const flags = new Set<string>();
+	for (const match of command.matchAll(MODERATE_RISK_RE)) {
+		flags.add(match[1].trim().toLowerCase());
+	}
+	return [...flags].sort();
 }
 
 function sessionCache(sessionId: string): Map<string, Judgement> {
@@ -636,6 +666,11 @@ export default function (pi: ExtensionAPI) {
 		if (command.trim() === "") return;
 
 		const config = readClassifierConfig();
+		const configSignature = [config.enabled, config.model, config.timeoutMs, config.maxCommandLength].join("|");
+		if (configSignature !== classifierConfigSignature) {
+			cache.clear();
+			classifierConfigSignature = configSignature;
+		}
 
 		// Universal bound, before every static-rule/critical/env branch: neither
 		// the classifier nor a permission dialog may approve unseen suffix text.
@@ -749,15 +784,34 @@ export default function (pi: ExtensionAPI) {
 					"classifier unavailable",
 				);
 			}
-			if (!cached) remember(scoped, cacheKey, judgement);
+			// A malformed reply is a transient failure, not a policy: cache it
+			// and one flaky answer pins the session to continuous prompts (and a
+			// later config change could never retire it). Anything else caches.
+			if (!cached && judgement.verdict !== "PARSE_ERROR") remember(scoped, cacheKey, judgement);
 
-			if (judgement.verdict === "SAFE") return;
-			return await requestPermission(
-				ctx,
-				target,
-				judgement.verdict === "UNSAFE" ? "classified unsafe" : "classifier unsure",
-				judgement.reason,
-			);
+			if (judgement.verdict === "SAFE") {
+				// SAFE verdicts still hit a permission request when the command
+				// carries a destructive/irreversible token. The anti-steering
+				// scan is prompt text and measured leaky; a model talked into
+				// answering `SAFE` must not auto-run rm/dd/mkfs-class commands
+				// the builtin critical list does not cover.
+				const flags = matchModerateRiskTokens(command);
+				if (flags.length === 0) return;
+				return await requestPermission(
+					ctx,
+					target,
+					"flagged for approval",
+					`classifier-safe but flags: ${flags.join(", ")}`,
+				);
+			}
+			const verdict = judgement.verdict;
+			const detail =
+				verdict === "UNSAFE"
+					? "classified unsafe"
+					: verdict === "PARSE_ERROR"
+						? "classifier parse error"
+						: "classifier unsure";
+			return await requestPermission(ctx, target, detail, judgement.reason);
 		} catch (err) {
 			// Unexpected plugin error: fail closed rather than wave the command
 			// through on a path we cannot vouch for.

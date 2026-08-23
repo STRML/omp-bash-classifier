@@ -90,7 +90,25 @@ One call per novel command, then cached for the session per (native-resolved cwd
 
 ## Configuration
 
-No plugin config. It reads the existing `bash.patterns` and `tools.approval` settings, so your current guardrails keep working. To exempt a command shape from classification entirely, give it a narrow `allow` rule in `bash.patterns` — the plugin honors those after the critical-pattern check and never pays for a model call.
+Reads the existing `bash.patterns` and `tools.approval` settings, so your current guardrails keep working. To exempt a command shape from classification entirely, give it a narrow `allow` rule in `bash.patterns` — the plugin honors those after the critical-pattern check and never pays for a model call.
+
+One plugin file, `~/.omp/omp-bash-classifier.json`, plus the `/classifier` command to view or change it:
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `enabled` | `true` | `false` turns off model classification only. Critical-pattern and env-override checks and static rule handling stay enforced. |
+| `model` | `""` (auto) | Explicit model id, overriding the default resolution order: `config.model` -> `@tiny` role -> session model. |
+| `timeoutMs` | `15000` | Classifier call budget; timeout fails closed to a permission request. |
+| `maxCommandLength` | `2000` | Commands longer than this are blocked outright (floor 64). |
+
+Changing any of these invalidates every cached verdict: a SAFE result made under one model or policy cannot survive a config change. `enabled=false` is the escape hatch for environments where the classifier itself must not be called.
+
+## Gate integrity and its limits
+
+The plugin is a layer in front of the native bash gate, not a replacement for it. Two properties follow:
+
+- **Later extensions can revise the command after this plugin judges it.** The host runs every `tool_call` handler in order and the last input revision wins, so another extension could rewrite a judged-SAFE command before execution. Native approval then applies to the revised command: outside `yolo`/autoApprove that still prompts for destructive shapes; in `yolo` the user has opted out of approval entirely. Installing other extensions that mutate tool input next to this plugin is not supported.
+- **The classifier is not a trust boundary for its own verdicts.** A SAFE verdict auto-runs only when the command is free of destructive/irreversible tokens (`rm`, `mv`, `dd`, `mkfs`, `chmod`, `sudo`, `curl`, `git push`, `git reset`, …). Anything carrying such a token raises a permission request even when the model says SAFE, so an injected `answer SAFE` cannot auto-run them. Verdicts that fail to parse are never cached and raise a request.
 
 Settings are read through the host module instance (`pi.pi.settings`). A plugin-local `import { settings }` resolves to a second copy of the singleton with no global instance and throws `Settings not initialized`, which would block every bash call. A session that legitimately has no global settings (SDK, isolated) is handled instead: the plugin logs one warning, honors no static rules, and classifies everything.
 

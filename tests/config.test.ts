@@ -15,6 +15,7 @@ import {
 	removeConfigFile,
 	resultText,
 	setClassifierDelay,
+	setClassifierReply,
 	writeConfigFile,
 } from "./fixtures";
 
@@ -26,7 +27,7 @@ beforeEach(async () => {
 
 const gate = async (
 	command: string,
-	opts: { model?: unknown; hasUI?: boolean } = {},
+	opts: { model?: unknown; hasUI?: boolean; sessionId?: string } = {},
 	input: Record<string, unknown> = {},
 ) =>
 	resultText(
@@ -77,15 +78,38 @@ describe("enabled=false", () => {
 });
 
 describe("model override", () => {
-	test("config.model is resolved first", async () => {
+	test("config.model is resolved first, before @tiny and the session model", async () => {
 		writeConfigFile({ model: "my-classifier" });
 		const tiny = { id: "tiny" };
 		const picked = { id: "picked" };
 		const ctx = makeCtx({ tinyModel: tiny, model: picked });
 		await fire("tool_call", makeEvent("make build"), ctx);
-		// models.resolve("my-classifier") is undefined in this stub, so it falls
-		// through to @tiny — the STUB returns tiny for any query.
+		// The stub resolves a non-empty selector by name, mirroring the host
+		// resolver: the explicit model wins with no fallback involved.
+		expect((modelCalls[0].model as { id: string }).id).toBe("my-classifier");
+	});
+
+	test("@tiny is the fallback; the session model is last", async () => {
+		const tiny = { id: "tiny" };
+		const picked = { id: "picked" };
+		const ctx = makeCtx({ tinyModel: tiny, model: picked });
+		await fire("tool_call", makeEvent("make build"), ctx);
 		expect(modelCalls[0].model).toBe(tiny);
+	});
+
+	test("changing classifier config invalidates cached verdicts", async () => {
+		setClassifierReply("SAFE");
+		await gate("git status", { sessionId: "sig-session" });
+		expect(modelCalls.length).toBe(1);
+		// Same session + command + cwd: without a config change this is cached.
+		await gate("git status", { sessionId: "sig-session" });
+		expect(modelCalls.length).toBe(1);
+
+		// Toggling enabled (or model/timeout) is a trust-state change: the old
+		// SAFE verdict must not survive it.
+		writeConfigFile({ enabled: false });
+		await gate("git status", { sessionId: "sig-session" });
+		expect(modelCalls.length).toBe(1); // no classify at all now
 	});
 });
 

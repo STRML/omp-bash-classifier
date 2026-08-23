@@ -238,7 +238,17 @@ export function makeCtx(options: CtxOptions = {}): ExtensionContext {
 				return options.confirmResult ?? false;
 			},
 		},
-		models: { resolve: () => options.tinyModel },
+		// Mirrors the host resolver contract: an empty selector is the caller's
+		// fallback model; `@tiny` is the tiny role (also the fallback model in
+		// tests); any other selector resolves by name; `undefined` when the
+		// selector names no available model (like model-resolver.ts).
+		models: {
+			resolve: (selector: string | undefined) => {
+				const s = selector?.trim();
+				if (!s || s === "@tiny") return options.tinyModel;
+				return { id: s };
+			},
+		},
 		// "model" in options distinguishes an explicit undefined (no model)
 		// from an absent option (default test model).
 		model: "model" in options ? options.model : { id: "test-model" },
@@ -264,6 +274,11 @@ export function makeSettings(patterns: unknown[], bashPolicy?: string): Record<s
 
 let testConfigPath: string | undefined;
 
+// The plugin's config path must NEVER resolve to the real homedir file during
+// tests: machine state (a live /classifier edit) would silently flip defaults
+// and fail the suite. Force the env override before the plugin first reads it.
+process.env.OMP_BASH_CLASSIFIER_CONFIG = useTempConfigFile();
+
 /** Point the plugin's config file at a fresh temp path (per test file). */
 export function useTempConfigFile(): string {
 	if (!testConfigPath) {
@@ -279,15 +294,18 @@ export function writeConfigFile(raw: Record<string, unknown>): void {
 }
 
 export function removeConfigFile(): void {
-	delete process.env.OMP_BASH_CLASSIFIER_CONFIG;
+	// Point at a fresh per-process temp path instead of deleting the env var:
+	// with the var unset the plugin falls back to the real homedir file, and
+	// machine state must never leak into the suite.
 	if (testConfigPath) {
 		try {
 			fs.unlinkSync(testConfigPath);
 		} catch {
 			// absent is fine
 		}
-		testConfigPath = undefined;
 	}
+	testConfigPath = undefined;
+	process.env.OMP_BASH_CLASSIFIER_CONFIG = useTempConfigFile();
 }
 
 /** Render an interceptor result: undefined means "let the host decide/run". */
