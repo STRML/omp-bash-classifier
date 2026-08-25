@@ -745,6 +745,23 @@ const READ_ONLY_PIPE_CONSUMERS = new Set([
  * than listed here: their write target is a positional OPERAND
  * (`uniq [IN [OUT]]`, `xxd [in [out]]`), so no flag check can catch it.
  */
+/**
+ * Long flags a downstream consumer may carry. Everything else disqualifies,
+ * the same fail-closed rule the fetch flags follow, and for the same reason:
+ * `sort --compress-program=./pwn` and `rg --pre ./pwn` EXECUTE that program,
+ * so "consumes stdin and cannot execute it" is a property of the invocation,
+ * not of the verb. A missing entry here costs a prompt.
+ */
+const CONSUMER_SAFE_LONG_FLAGS = new Set([
+	"--raw-output", "--compact-output", "--slurp", "--null-input", "--tab", "--arg",
+	"--color", "--colour", "--line-number", "--no-line-number", "--only-matching",
+	"--invert-match", "--ignore-case", "--word-regexp", "--fixed-strings", "--extended-regexp",
+	"--count", "--quiet", "--silent", "--text", "--null-data", "--numeric-sort",
+	"--reverse", "--unique", "--human-numeric-sort", "--version-sort", "--lines",
+	"--bytes", "--chars", "--words", "--max-count", "--after-context", "--before-context",
+	"--context", "--with-filename", "--no-filename", "--json", "--yaml-output",
+]);
+
 const CONSUMER_WRITE_FLAGS: Record<string, RegExp> = {
 	// Anchored at `-` and then scanning the BUNDLE, not at `-o`: `sort -uo f`
 	// and `sort -ro f` write just as `sort -o f` does.
@@ -802,14 +819,21 @@ const WGET_NO_VALUE_SHORT_FLAGS = "qSvcnd46NHLkKEmpr";
 function bundleIsWgetStdout(arg: string): boolean {
 	const match = /^-([a-zA-Z]*)O-$/u.exec(arg);
 	if (!match) return false;
-	return [...match[1]].every(ch => WGET_NO_VALUE_SHORT_FLAGS.includes(ch));
+	// Both checks. Taking no value is what makes the trailing `O-` reach `-O`;
+	// being on the read-only allowlist is what keeps `-mO-` (which writes
+	// .listing files) and `-KO-` (.orig backups) from riding in on the prefix.
+	return [...match[1]].every(
+		ch => WGET_NO_VALUE_SHORT_FLAGS.includes(ch) && WGET_READ_ONLY_FLAGS.has(`-${ch}`),
+	);
 }
 
 function bundleIsWgetStdoutSplit(arg: string, next: string | undefined): boolean {
 	if (next !== "-") return false;
 	const match = /^-([a-zA-Z]*)O$/u.exec(arg);
 	if (!match) return false;
-	return [...match[1]].every(ch => WGET_NO_VALUE_SHORT_FLAGS.includes(ch));
+	return [...match[1]].every(
+		ch => WGET_NO_VALUE_SHORT_FLAGS.includes(ch) && WGET_READ_ONLY_FLAGS.has(`-${ch}`),
+	);
 }
 
 /** Short bundles like -fsSL expand to -f -s -S -L before the allowlist check. */
@@ -837,38 +861,48 @@ function expandShortBundle(arg: string): string[] {
  * `bash script.sh`. `-` and `-s` name stdin and do not count as a script.
  */
 function stdinExecutingInterpreters(stage: string): string[] {
-	const found: string[] = [];
-	for (const segment of tokenizeShellSegments(stage)) {
-		let i = 0;
-		let sawWrapper = false;
-		// Step through assignments, wrappers, and the option words and durations
-		// they carry. `nice -n 10 bash` puts the flag BETWEEN the wrapper and its
-		// value, so the numeric skip cannot be tied to the wrapper's position.
-		while (i < segment.length) {
-			const word = segment[i].toLowerCase();
-			if (/^[a-z_][a-z0-9_]*=/u.test(word) || word.startsWith("-")) {
-				i++;
-				continue;
-			}
-			if (WRAPPER_COMMANDS.has(commandBasename(word))) {
-				sawWrapper = true;
-				i++;
-				continue;
-			}
-			if (sawWrapper && /^\d+(\.\d+)?[smhd]?$/u.test(word)) {
-				i++;
-				continue;
-			}
-			break;
+	// ONLY the first segment. A pipe feeds the command it precedes, not whatever
+	// follows a `;` or `||` inside the same stage: `curl … | jq . ; node` was
+	// reported as piping into node.
+	const segment = tokenizeShellSegments(stage)[0];
+	if (!segment || segment.length === 0) return [];
+
+	let i = 0;
+	let sawWrapper = false;
+	while (i < segment.length) {
+		const word = segment[i].toLowerCase();
+		// Grouping keeps the real command one token further in: `| { sh; }`.
+		if (word === "{" || word === "(") {
+			i++;
+			continue;
 		}
-		if (i >= segment.length) continue;
-		const verb = commandBasename(segment[i]);
-		if (!STDIN_EXECUTING_INTERPRETERS.has(verb)) continue;
-		const rest = segment.slice(i + 1);
-		const hasScriptOperand = rest.some(word => !word.startsWith("-") && word !== "-");
-		if (!hasScriptOperand) found.push(verb);
+		if (/^[a-z_][a-z0-9_]*=/u.test(word) || word.startsWith("-")) {
+			i++;
+			continue;
+		}
+		if (WRAPPER_COMMANDS.has(commandBasename(word))) {
+			sawWrapper = true;
+			i++;
+			continue;
+		}
+		if (sawWrapper && /^\d+(\.\d+)?[smhd]?$/u.test(word)) {
+			i++;
+			continue;
+		}
+		break;
 	}
-	return found;
+	if (i >= segment.length) return [];
+
+	const verb = commandBasename(segment[i]);
+	if (!STDIN_EXECUTING_INTERPRETERS.has(verb)) return [];
+	const rest = segment.slice(i + 1);
+	// Inline code executes regardless of what else is on the line. The builtin
+	// INLINE_CODE_INTERPRETERS covers -c/-e for python/bash/sh/perl only, which
+	// left node, deno, bun, ruby, php and the rest with no inline-code path.
+	if (rest.some(word => /^-{1,2}(c|e|E|eval|command)$/u.test(word))) return [verb];
+	// An interpreter given a script runs the script; the pipe is just data.
+	const hasScriptOperand = rest.some(word => !word.startsWith("-") && word !== "-");
+	return hasScriptOperand ? [] : [verb];
 }
 
 /**
@@ -936,9 +970,19 @@ function isPlainReadOnlyFetch(command: string): boolean {
 	// competent model and gets UNSAFE without help. Banning `$` here would also
 	// ban `curl -H "Authorization: Bearer $TOKEN"`, which is most real curl
 	// usage, so the rule cost the feature and bought a case already covered.
-	// Risk verbs inside `$(…)` are still flagged by the substitution span scan
-	// below, which is the mechanically subtle half of the same syntax.
+	// Command substitution is handled just below on its own terms: it executes,
+	// which is mechanical, not a judgement about intent. (An earlier version of
+	// this comment claimed the substitution span scan covered it. That scan only
+	// looks for MODERATE_RISK_TOKENS, so `$(cat ~/.aws/credentials)` walked
+	// past it — `cat` is not a risk token.)
 	if (/[<>@]/u.test(command)) return false;
+	// Command substitution EXECUTES. Tested on the raw command, because relying
+	// on the tokenizer treating `(` as a boundary is an accident that does not
+	// hold inside double quotes and never held for backticks: `curl -s
+	// $(cat url.txt)` and `curl -s "$(cat url.txt)"` got opposite verdicts.
+	// `$VAR` and `${VAR}` stay allowed — parameter expansion is a value, not an
+	// execution, and banning it would ban `-H "Bearer ${TOKEN}"`.
+	if (command.includes("$(") || command.includes("`")) return false;
 
 	const stages = splitPipeStages(command);
 	for (let i = 0; i < stages.length; i++) {
@@ -994,6 +1038,10 @@ function isPlainReadOnlyFetch(command: string): boolean {
 		if (!READ_ONLY_PIPE_CONSUMERS.has(verb)) return false;
 		const writeFlag = CONSUMER_WRITE_FLAGS[verb];
 		if (writeFlag && args.some(arg => writeFlag.test(arg))) return false;
+		for (const arg of args) {
+			if (!arg.startsWith("--")) continue;
+			if (!CONSUMER_SAFE_LONG_FLAGS.has(arg.split("=", 1)[0])) return false;
+		}
 	}
 	return true;
 }
