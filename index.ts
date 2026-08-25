@@ -1029,20 +1029,29 @@ export default function (pi: ExtensionAPI) {
 		const sections = [verbatim(target.command)];
 		if (reason.trim() !== "") sections.push(`Reason:\n\n${verbatim(reason)}`);
 
+		// Detail VALUES are model-controlled and go on lines whose labels this
+		// code authored, so a newline in one forges a line: a cwd of
+		// "/tmp/stage\ntimeout: none (no deadline)" renders as two Details rows
+		// and the second is indistinguishable from ours. escapeControlChars
+		// deliberately keeps U+000A (it is the line separator for the command
+		// itself), so detail values are JSON-encoded instead — the same
+		// treatment cwd already gets on its way into the classifier prompt.
+		const detailValue = (value: string): string => JSON.stringify(value).slice(1, -1);
+
 		const details: string[] = [];
 		// Worth a line only when it is not the directory the user is already in.
 		// Compared normalized, or a caller passing "/workspace/" in a session at
 		// "/workspace" prints a line saying the cwd is the cwd, which is exactly
 		// the noise this is meant to remove.
 		if (target.cwd && !samePath(target.cwd, sessionCwd)) {
-			details.push(`working directory: ${target.cwd}`);
+			details.push(`working directory: ${detailValue(target.cwd)}`);
 		}
 		// 0 disables the deadline (host schema, tools/bash.ts), so "0s" would
 		// read as the exact opposite of what it does.
 		if (target.timeout !== undefined) {
 			details.push(target.timeout === 0 ? "timeout: none (no deadline)" : `timeout: ${target.timeout}s`);
 		}
-		if (target.envKeys.length > 0) details.push(`env: ${target.envKeys.join(", ")}`);
+		if (target.envKeys.length > 0) details.push(`env: ${detailValue(target.envKeys.join(", "))}`);
 		if (target.pty) details.push("pty: true");
 		if (target.async) details.push("async: true");
 		if (details.length > 0) sections.push(`Details:\n\n${verbatim(details.join("\n"))}`);

@@ -171,6 +171,22 @@ describe("details are omitted at their defaults", () => {
 		expect(trailing.body).not.toContain("working directory");
 	});
 
+	test("a newline in cwd cannot forge a details line", async () => {
+		const { body } = await prompt("git log", { cwd: "/tmp/stage\ntimeout: none (no deadline)" }, "/workspace");
+		// The forged text stays VISIBLE, which is right — hiding it would be its
+		// own problem. What matters is that it is one row, not two, so it cannot
+		// pass for a line this code authored.
+		const detailRows = body.split("\n").filter(l => l.startsWith("    working directory:"));
+		expect(detailRows).toHaveLength(1);
+		expect(detailRows[0]).toContain("\\ntimeout: none");
+		expect(body.split("\n").some(l => l.trim() === "timeout: none (no deadline)")).toBe(false);
+	});
+
+	test("a newline in an env key cannot forge one either", async () => {
+		const { body } = await prompt("git log", { env: { "A\nasync": "true" } });
+		expect(body.split("\n").filter(l => l.trim().startsWith("async: true"))).toHaveLength(0);
+	});
+
 	test("timeout 0 disables the deadline, so it does not read as 0s", async () => {
 		const { body } = await prompt("git log", { timeout: 0 });
 		expect(body).toContain("timeout: none (no deadline)");
