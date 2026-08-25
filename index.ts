@@ -54,13 +54,12 @@
  * those raise a permission request even when the model said SAFE.
  */
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { CRITICAL_BASH_PATTERNS } from "@oh-my-pi/pi-coding-agent/tools/bash";
 import { resolveToCwd } from "@oh-my-pi/pi-coding-agent/tools/path-utils";
 import { extractLeadingCdTarget, tokenizeShellSegments } from "@oh-my-pi/pi-coding-agent/tools/shell-tokenize";
-import { getPluginsLockfile } from "@oh-my-pi/pi-utils";
+import { getConfigRootDir, getPluginsLockfile } from "@oh-my-pi/pi-utils";
 import { completeSimple, type Model, type TextContent, type UserMessage } from "@oh-my-pi/pi-ai";
 
 type Verdict = "SAFE" | "UNSAFE" | "UNSURE" | "PARSE_ERROR";
@@ -359,7 +358,7 @@ const CLASSIFIER_CONFIG_DEFAULTS: ClassifierConfig = {
 };
 
 function classifierConfigPath(): string {
-	return process.env.OMP_BASH_CLASSIFIER_CONFIG ?? path.join(os.homedir(), ".omp", "omp-bash-classifier.json");
+	return process.env.OMP_BASH_CLASSIFIER_CONFIG ?? path.join(getConfigRootDir(), "omp-bash-classifier.json");
 }
 
 interface ClassifierConfigCache {
