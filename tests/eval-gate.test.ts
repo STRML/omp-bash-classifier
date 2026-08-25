@@ -492,3 +492,46 @@ describe("second-review regressions", () => {
 		expect(await commands("out = `git status`", "rb")).toEqual(["git status"]);
 	});
 });
+
+describe("third-review regressions", () => {
+	test("a backtick command reaches the judge with its payload intact", async () => {
+		// Locating backtick sites in the masked copy also READ from it, so the
+		// quoted payload arrived as spaces: `ssh host "            "`.
+		expect(await commands('out = `ssh host "rm -rf /data"`', "rb")).toEqual([`ssh host "rm -rf /data"`]);
+	});
+
+	test("an apostrophe in a template literal does not swallow the next spawn", async () => {
+		const code = `const cp = require("child_process");\nconst a = \`don't\`; cp.execSync("rm -rf /tmp/x"); const b = \`won't\`;`;
+		expect(await commands(code, "js")).toEqual(["rm -rf /tmp/x"]);
+	});
+
+	test("a destructured await-import binds the spawn", async () => {
+		// The JS backend rewrites static imports into exactly this shape.
+		const code = `const { execSync } = await import("node:child_process"); execSync("id");`;
+		expect(await commands(code, "js")).toEqual(["id"]);
+	});
+
+	test("a combined default and named import keeps the named binding", async () => {
+		const code = `import cp, { execSync } from "node:child_process"; execSync("id");`;
+		expect(await commands(code, "js")).toEqual(["id"]);
+	});
+
+	test("an optional call is still a call", async () => {
+		const code = `import cp from "node:child_process";\ncp.execSync?.("id")`;
+		expect(await commands(code, "js")).toEqual(["id"]);
+	});
+
+	test("a receiver-qualified ruby spawn is a spawn", async () => {
+		expect(await commands(`Kernel.system("id")`, "rb")).toEqual(["id"]);
+	});
+
+	test("a parenless ruby spawn with a non-literal argument is opaque, not invisible", async () => {
+		// `system(cmd)` already produced an opaque prompt; the idiomatic
+		// parenless spelling produced nothing at all.
+		expect(await commands(`cmd = ENV["C"]\nsystem cmd`, "rb")).toEqual([undefined]);
+	});
+
+	test("a ruby assignment named system is not a spawn", async () => {
+		expect(await sites(`system = 5\nputs system`, "rb")).toEqual([]);
+	});
+});

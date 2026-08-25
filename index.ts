@@ -1111,7 +1111,18 @@ function javascriptCallees(code: string): Map<string, SpawnArgShape> {
 			if (shape) callees.set(local, shape);
 		}
 	}
-	for (const m of matchAll(code, new RegExp(String.raw`\bimport\s*\{([^}]*)\}\s*from\s*${CP}`, "gu"))) {
+	// `import cp, { execSync } from …` — the default binding must not swallow
+	// the named list.
+	for (const m of matchAll(code, new RegExp(String.raw`\bimport\s*(?:[A-Za-z_$][\w$]*\s*,\s*)?\{([^}]*)\}\s*from\s*${CP}`, "gu"))) {
+		for (const { imported, local } of destructuredNames(m[1])) {
+			const shape = CHILD_PROCESS_MEMBERS[imported];
+			if (shape) callees.set(local, shape);
+		}
+	}
+	// `const { execSync } = await import("node:child_process")`. The JS backend
+	// rewrites static imports into exactly this shape, and the tool's own `code`
+	// description invites top-level await, so it is the common spelling.
+	for (const m of matchAll(code, new RegExp(String.raw`\b(?:const|let|var)\s*\{([^}]*)\}\s*=\s*(?:await\s+)?import\(\s*${CP}\s*\)`, "gu"))) {
 		for (const { imported, local } of destructuredNames(m[1])) {
 			const shape = CHILD_PROCESS_MEMBERS[imported];
 			if (shape) callees.set(local, shape);
@@ -1125,7 +1136,16 @@ function javascriptCallees(code: string): Map<string, SpawnArgShape> {
 }
 
 function rubyCallees(): Map<string, SpawnArgShape> {
-	return new Map(Object.entries(RUBY_MEMBERS));
+	const callees = new Map(Object.entries(RUBY_MEMBERS));
+	// `Kernel.system` and `self.system` are the same call with the receiver
+	// written out. The bare-name boundary rejects a leading dot, so without
+	// these they never match.
+	for (const bare of ["system", "exec", "spawn"]) {
+		const shape = RUBY_MEMBERS[bare];
+		callees.set(`Kernel.${bare}`, shape);
+		callees.set(`self.${bare}`, shape);
+	}
+	return callees;
 }
 
 function juliaCallees(): Map<string, SpawnArgShape> {
@@ -1207,6 +1227,41 @@ function regexLiteralAllowed(text: string, start: number): boolean {
 	return true;
 }
 
+/**
+ * Skip a backtick literal at `start`, returning the index after its closing
+ * backtick, or -1 when it never closes. `${…}` holes are tracked (and may nest
+ * further templates) so an inner backtick does not end the literal early.
+ */
+function skipTemplateLiteral(text: string, start: number): number {
+	let i = start + 1;
+	while (i < text.length) {
+		const ch = text[i];
+		if (ch === "\\") {
+			i += 2;
+			continue;
+		}
+		if (ch === "`") return i + 1;
+		if (ch === "$" && text[i + 1] === "{") {
+			let depth = 1;
+			i += 2;
+			while (i < text.length && depth > 0) {
+				if (text[i] === "`") {
+					const nested = skipTemplateLiteral(text, i);
+					if (nested === -1) return -1;
+					i = nested;
+					continue;
+				}
+				if (text[i] === "{") depth += 1;
+				else if (text[i] === "}") depth -= 1;
+				i += 1;
+			}
+			continue;
+		}
+		i += 1;
+	}
+	return -1;
+}
+
 /** Quote characters that open a string literal in each dialect. */
 function quoteChars(language: EvalLanguageToken): string[] {
 	if (language === "py") return ["'", '"'];
@@ -1278,11 +1333,15 @@ function maskComments(code: string, language: EvalLanguageToken): string {
  */
 function maskStringInteriors(code: string, language: EvalLanguageToken): string {
 	const out = code.split("");
-	// Backticks are excluded on purpose. In Ruby and Julia a backtick literal IS
-	// a command and blanking it would erase what the backtick pass must read; in
-	// JS a `$`-tagged template is the same. A backtick inside an ordinary string
-	// is still blanked, because the enclosing quote is masked.
+	// A backtick literal is stepped OVER: not blanked, and not entered. In Ruby
+	// and Julia it IS a command and blanking it would erase the very text the
+	// backtick pass has to judge — a masked `ssh host "rm -rf /data"` reaches
+	// the classifier as `ssh host "            "`. Entering it is just as bad:
+	// an apostrophe in `` `don't` `` would open a phantom string and swallow the
+	// next spawn. A backtick inside an ordinary string is still removed, because
+	// the enclosing quote is masked before the backtick is ever reached.
 	const quotes = quoteChars(language).filter(quote => quote !== "`");
+	const backtickIsLiteral = language !== "py";
 	let i = 0;
 	while (i < code.length) {
 		if (language === "js" && code[i] === "/" && regexLiteralAllowed(code, i)) {
@@ -1291,6 +1350,11 @@ function maskStringInteriors(code: string, language: EvalLanguageToken): string 
 				i = end;
 				continue;
 			}
+		}
+		if (backtickIsLiteral && code[i] === "`") {
+			const end = skipTemplateLiteral(code, i);
+			i = end === -1 ? i + 1 : end;
+			continue;
 		}
 		if (quotes.includes(code[i])) {
 			const end = skipQuoted(code, i);
@@ -1348,7 +1412,11 @@ function inlineChildProcessSites(code: string, scan: string): EvalSpawnSite[] {
  */
 function rubyParenlessSites(code: string, scan: string): EvalSpawnSite[] {
 	const sites: EvalSpawnSite[] = [];
-	for (const m of matchAll(scan, /(?:^|[^\w$.@:])(system|exec|spawn)\s+(?=['"])/gu)) {
+	// Any argument, not just a quoted one: `system cmd` must reach the opaque
+	// branch, the way `system(cmd)` already does. The exclusions keep an
+	// assignment (`system = 5`), a comment, and the parenthesized form (handled
+	// by the named-callee pass) from matching.
+	for (const m of matchAll(scan, /(?:^|[^\w$.@:])(system|exec|spawn)\s+(?![\s=;#(])/gu)) {
 		const start = (m.index ?? 0) + m[0].length;
 		const nl = code.indexOf("\n", start);
 		const argsText = code.slice(start, nl === -1 ? code.length : nl);
@@ -1413,7 +1481,8 @@ export function extractEvalSpawnSites(code: string, language: EvalLanguageToken)
 	for (const [name, shape] of callees) {
 		// A leading word/dot boundary keeps `mysubprocess.run` and `obj.system`
 		// from matching a bare or aliased callee name.
-		const calleeRe = new RegExp(String.raw`(?:^|[^\w$.])${escapeRegExp(name)}\s*\(`, "gu");
+		// `cp.execSync?.(…)` calls exactly like `cp.execSync(…)`.
+		const calleeRe = new RegExp(String.raw`(?:^|[^\w$.])${escapeRegExp(name)}\s*(?:\?\.)?\s*\(`, "gu");
 		for (const match of matchAll(scan, calleeRe)) {
 			const openParen = (match.index ?? 0) + match[0].length - 1;
 			sites.push(siteAt(code, name, shape, openParen, language));
