@@ -217,6 +217,14 @@ export function makeEvent(command: string, input: Record<string, unknown> = {}):
 	return { toolName: "bash", input: { command, ...input } };
 }
 
+/**
+ * An `eval` tool call. The host's `language` field is optional and an absent
+ * one runs the JS backend, so tests can omit it the way the model does.
+ */
+export function makeEvalEvent(code: string, language?: string): { toolName: string; input: Record<string, unknown> } {
+	return { toolName: "eval", input: { code, ...(language ? { language } : {}) } };
+}
+
 export interface CtxOptions {
 	sessionId?: string;
 	cwd?: string;
@@ -262,10 +270,13 @@ export function confirmCalls(ctx: ExtensionContext): string[][] {
 	return (ctx as unknown as { confirmCalls: string[][] }).confirmCalls;
 }
 
-export function makeSettings(patterns: unknown[], bashPolicy?: string): Record<string, unknown> {
+export function makeSettings(patterns: unknown[], bashPolicy?: string, evalPolicy?: string): Record<string, unknown> {
 	const store: Record<string, unknown> = {
 		"bash.patterns": patterns,
-		"tools.approval": bashPolicy ? { bash: bashPolicy } : {},
+		"tools.approval": {
+			...(bashPolicy ? { bash: bashPolicy } : {}),
+			...(evalPolicy ? { eval: evalPolicy } : {}),
+		},
 	};
 	// The plugin reads host settings through settings.get(key), like the real
 	// Settings singleton.

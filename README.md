@@ -4,7 +4,7 @@ Model-judged bash permission requests for OMP. Commands the host would run witho
 
 ## What it does
 
-Registers a `tool_call` handler for `bash`. The native bash tool is untouched — same description, same schema (including `async`), same approval declaration, same execution path. The plugin only sits in front of it and may block with a reason or ask the user first.
+Registers a `tool_call` handler for `bash`, and a second one for `eval` covered under [eval spawns](#eval-spawns). The rest of this section is about `bash`. The native bash tool is untouched — same description, same schema (including `async`), same approval declaration, same execution path. The plugin only sits in front of it and may block with a reason or ask the user first.
 
 `tool_call` fires before the approval gate for model-issued calls, may await a human dialog (the runner pauses its handler budget across dialogs, so the human is not on a clock), and the runner fails closed if the handler throws or times out (`extensionHandlers.toolCallTimeoutMs`, 30s default).
 
@@ -28,18 +28,43 @@ The interactive request is a **Run / Deny** confirmation. Its message — not an
 
 Native bash marks `CRITICAL_BASH_PATTERNS` hits `{ tier: "exec", override: true }` with **no explicit policy**. `resolveApproval` (`tools/approval.ts:156-171`) ignores `override` in `yolo` mode, so in `yolo` a critical command — `curl … | sh`, `rm -rf /`, `dd of=/dev/…`, `mkfs`, `kill -9 1`, `nc -e` — is auto-approved and just runs. Worse, because critical outranks the `prompt` branch natively, a `prompt` rule you wrote for exactly those commands (`rm -rf * → prompt`) never fires for the critical spelling of them. This plugin checks critical patterns before it honors any rule, in every mode, and turns them into a permission request.
 
+## eval spawns
+
+`tools.approval.eval` is a single allow/deny/prompt switch over the whole tool, and the eval backends give submitted code an unrestricted `subprocess` (Python) or `child_process` (JavaScript). Set it to `allow` and eval becomes a standing bypass of everything above: a command the bash gate refuses is rerun from inside a cell, and no gate sees it.
+
+The plugin reads the submitted code, extracts every subprocess spawn whose command is spelled out as a literal, and puts each extracted command through the same precedence a bash command goes through. Code that spawns nothing returns before any model call, so ordinary eval work is untouched.
+
+What it reads, per backend:
+
+| Backend | Spawn forms read |
+| --- | --- |
+| `py` | `subprocess.run/Popen/call/check_call/check_output/getoutput/getstatusoutput`, `os.system/popen/exec*/spawn*`, `asyncio.create_subprocess_*`, `pty.spawn`, including `import subprocess as sp` aliases and `from subprocess import run` bare names |
+| `js` | `child_process` `exec/execSync/execFile/execFileSync/spawn/spawnSync/fork` under any import or require binding, `Bun.spawn`, `Bun.spawnSync`, and `` $`…` `` shell templates |
+| `rb` | `` `…` ``, `%x{…}`, `system`, `exec`, `spawn`, `IO.popen`, `Open3.*` |
+| `jl` | `` `…` `` command literals |
+
+An argv list is reconstructed into a shell command with quoting preserved, so `subprocess.run(["bash", "-c", "rm -rf x"])` is judged as `bash -c 'rm -rf x'` rather than as the word `bash`.
+
+Two rules differ from the bash gate, both because no native per-command gate stands behind this one:
+
+- A `deny` or `prompt` rule in `bash.patterns` is enforced here rather than left to the host. The host would run the spawn without consulting it.
+- A spawn whose command is assembled at runtime (a variable, an f-string, an interpolated template) raises a permission request instead of passing. Its text is not what executes, and building the command at runtime is the shape an evasion takes.
+
+This is a source reader, not a sandbox. It sees a command that the code spells out. Code written to hide a spawn from a source reader can hide from this: `getattr(os, "sys" + "tem")(cmd)` reads as nothing at all. Closing that needs interception inside the eval kernels, which is a change to OMP rather than to a plugin. The gap this closes is the one that shows up in practice, where an agent blocked at bash rewrites the same command in Python and runs it.
+
 ## Safety model
 
 1. The plugin can only **add** friction: it blocks, or asks. It never bypasses the native gate and never runs a command itself.
 2. Static rules stay authoritative below the critical and env checks. `deny` and `prompt` pattern rules, and narrow `allow` rules, are otherwise honored untouched; the plugin reads `bash.patterns` with the same tokenizer (`tokenizeShellSegments`) and the same allow-rule shell-control guard as the builtin, so it agrees with the native gate about which rule matches. "Narrow" means breadth, not spelling: `**` and `* *` are blanket rules and are classified like `*`. Native pattern decisions outrank non-deny `tools.approval.bash` policies; the plugin mirrors that precedence.
 3. Fail-closed: a command over 2,000 characters is blocked outright. An `env` override, classifier error/timeout, and malformed verdict raise a permission request when a UI exists and **block** when headless. An unexpected plugin throw always blocks. A command the gate could not judge is never silently auto-run.
 4. Verdict parsing is anchored to the start of the reply, so a model that reasons aloud and mentions `SAFE` mid-answer cannot produce a SAFE verdict. Injection is addressed separately: command and cwd are JSON data between per-call random delimiters, and the prompt ends with a mechanical scan — text addressing the reviewer, naming a verdict, claiming a part is an inert example or already approved, or imitating the delimiter makes the verdict UNSAFE. That is a measured mitigation, not a guarantee: see the model table for how much of it survives per model.
-5. Session-scoped cache keyed by (session, native-resolved working directory, `env`, `pty`, timeout, async, command) — every execution-affecting input. Classifier verdicts never cross sessions, directories, environments, or time/execution modes; only the current session's entries are dropped at its boundaries.
+5. Session-scoped cache keyed by (session, native-resolved working directory, `env`, `pty`, timeout, async, command) — every execution-affecting input. Eval spawns cache under their own key (session, cwd, language, extracted command). Classifier verdicts never cross sessions, directories, environments, or time/execution modes; only the current session's entries are dropped at its boundaries.
 6. When settings cannot be read (an SDK or isolated session with no global settings singleton), the plugin honors no static rules and classifies everything rather than blocking every bash call.
 
 ## What it does not cover
 
-- **Only the `bash` tool.** `eval`, `hub` (`op: "start"`) and every other exec-tier tool still auto-run under `yolo`, unclassified. An attacker who can choose the tool can choose one of those.
+- **Tools other than `bash` and `eval`.** `hub` (`op: "start"`) and every other exec-tier tool still auto-run under `yolo`, unclassified. An attacker who can choose the tool can choose one of those.
+- **Spawns an eval cell hides from a source reader.** The eval gate reads the code it is given; a command built by string arithmetic or reflection is invisible to it. See [eval spawns](#eval-spawns).
 - **Another `tool_call` handler can revise input after this handler.** OMP gives every handler the original input and applies the last revision afterward; this API provides no post-revision gate. A later extension can therefore invalidate this classifier's judgment.
 - **Internal-URL cwd values.** Native bash expands `skill://`, `agent://`, `artifact://`, `memory://`, `rule://`, and `local://` cwd values using session-only router state unavailable to extensions. The plugin blocks those cwd forms rather than mislabel the execution directory or fail open; use the resolved filesystem path instead.
 - **The contents of what a command runs.** `npm test`, `make`, and dependency installs are judged as the routine commands they are; the classifier does not read `package.json` scripts or install hooks, so a hostile repository's own test script is not inspected.

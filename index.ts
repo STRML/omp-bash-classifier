@@ -6,9 +6,17 @@
  * anything risky raises a real permission request instead of executing
  * silently. Trivial commands still run with no plugin prompt.
  *
- * Scope: this gates the `bash` tool only. `eval`, `hub` (`op: "start"`) and any
- * other exec-tier tool still auto-run under `yolo` — the guarantees below are
- * about bash, not about the session as a whole.
+ * The same gate covers the subprocess spawns inside `eval`. `tools.approval.eval`
+ * is one switch over the whole tool while the backends hand submitted code an
+ * unrestricted `subprocess` / `child_process`, so an `allow` there is a standing
+ * bypass: a blocked command is rerun from a Python or JS cell. The eval half
+ * reads spawns out of the submitted source (see "eval spawn extraction") and
+ * routes each extracted command through this same precedence. It is a source
+ * reader, not a sandbox — a command assembled at runtime asks rather than runs.
+ *
+ * Scope: `hub` (`op: "start"`) and any other exec-tier tool still auto-run under
+ * `yolo` — the guarantees below are about bash and eval spawns, not about the
+ * session as a whole.
  *
  * Design:
  *   - `tool_call` interceptor, NOT tool shadowing. The native bash tool keeps
@@ -587,6 +595,551 @@ export function matchModerateRiskTokens(command: string): string[] {
 	return [...flags].sort();
 }
 
+// ---------------------------------------------------------------------------
+// eval spawn extraction
+//
+// `tools.approval.eval` is one switch over the whole tool, and the eval
+// backends hand submitted code an unrestricted `subprocess` / `child_process`.
+// An agent blocked at the bash gate can rerun the same command from inside
+// eval and this plugin never sees it. This section reads the submitted code,
+// pulls out every spawn whose command is written as a literal, and routes
+// those command strings through the same gate bash commands go through.
+//
+// Stated plainly: this is a source reader, not a sandbox. It sees a command
+// spelled out in the code. A command assembled at runtime reads as an OPAQUE
+// site and raises a permission request rather than passing, but code written
+// to hide a spawn from a source reader can hide from this. Interception inside
+// the eval kernels is the version that cannot be evaded; this is the version
+// that fits in a plugin.
+// ---------------------------------------------------------------------------
+
+export type EvalLanguageToken = "py" | "js" | "rb" | "jl";
+
+/** How a callee's arguments spell out the command it runs. */
+type SpawnArgShape =
+	/** One argument holds it all: a shell string, or an argv list. */
+	| "single"
+	/** (file, argv[]) — child_process.spawn, os.execv. */
+	| "argvPair"
+	/** Successive string arguments are the argv — os.execl, Open3.capture3. */
+	| "variadic";
+
+export interface EvalSpawnSite {
+	/** Spawn expression that produced the site, e.g. `subprocess.run`. */
+	callee: string;
+	/**
+	 * Reconstructed shell command, or undefined when the argument is not a
+	 * literal this reader can resolve — a variable, an interpolated string, a
+	 * list built at runtime. An undefined command is an OPAQUE site: it raises
+	 * a permission request and never auto-runs.
+	 */
+	command?: string;
+}
+
+interface LiteralString {
+	kind: "string";
+	value: string;
+	/** An f-string / `${}` / `#{}` hole: the runtime value is not this text. */
+	interpolated: boolean;
+	end: number;
+}
+interface LiteralList {
+	kind: "list";
+	items: LiteralNode[];
+	end: number;
+}
+interface LiteralOther {
+	kind: "other";
+	end: number;
+}
+type LiteralNode = LiteralString | LiteralList | LiteralOther;
+
+const EVAL_LANGUAGE_TOKENS: ReadonlySet<string> = new Set(["py", "js", "rb", "jl"]);
+
+/**
+ * Normalize the eval tool's `language` field. The host schema is
+ * `'py' | 'js' | 'rb' | 'jl'` and the field is optional; an absent language
+ * runs the JavaScript backend (eval.ts formatApprovalDetails calls it
+ * "javascript (default)"), so an unreadable value reads as `js` at the call
+ * site rather than skipping the gate.
+ */
+export function normalizeEvalLanguage(value: unknown): EvalLanguageToken | undefined {
+	if (typeof value !== "string") return undefined;
+	const lowered = value.trim().toLowerCase();
+	return EVAL_LANGUAGE_TOKENS.has(lowered) ? (lowered as EvalLanguageToken) : undefined;
+}
+
+// Escapes worth decoding: the classifier should see the command the shell
+// would see, so `\"` and `\\` must not survive into the judged text. An
+// unlisted escape keeps its literal character, which is what every one of
+// these languages does for unknown escapes anyway.
+const SIMPLE_ESCAPES: Record<string, string> = {
+	n: "\n",
+	t: "\t",
+	r: "\r",
+	"0": "\0",
+	"\\": "\\",
+	"'": "'",
+	'"': '"',
+	"`": "`",
+	$: "$",
+};
+
+function escapeRegExp(value: string): string {
+	return value.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+}
+
+function skipSpace(text: string, start: number): number {
+	let i = start;
+	while (i < text.length && /\s/u.test(text[i])) i += 1;
+	return i;
+}
+
+/**
+ * Advance past a quoted run starting at `start`, returning the index after the
+ * closing quote (-1 when unterminated). Triple quotes are recognized for every
+ * dialect: only Python writes them, and a lone `"""` elsewhere reads as an
+ * empty string followed by a quote, which this treats the same way.
+ */
+function skipQuoted(text: string, start: number): number {
+	const quote = text[start];
+	const triple = quote.repeat(3);
+	const delim = text.startsWith(triple, start) ? triple : quote;
+	let i = start + delim.length;
+	while (i < text.length) {
+		if (text[i] === "\\") {
+			i += 2;
+			continue;
+		}
+		if (text.startsWith(delim, i)) return i + delim.length;
+		i += 1;
+	}
+	return -1;
+}
+
+/**
+ * Read a string literal at `start`. Returns undefined when the position does
+ * not open one, which is how a caller learns the argument is an expression.
+ */
+function readStringLiteral(text: string, start: number, language: EvalLanguageToken): LiteralString | undefined {
+	let i = start;
+	let raw = false;
+	let fstring = false;
+	if (language === "py") {
+		// Python string prefixes (r, b, u, f and their pairs) sit against the
+		// quote. Any other letter run is an identifier, not a literal.
+		const prefix = /^[A-Za-z]{1,3}(?=['"])/u.exec(text.slice(i));
+		if (prefix) {
+			const flags = prefix[0].toLowerCase();
+			if (!/^[rbuf]+$/u.test(flags)) return undefined;
+			raw = flags.includes("r");
+			fstring = flags.includes("f");
+			i += prefix[0].length;
+		}
+	}
+	const quote = text[i];
+	const backtickIsString = language === "js";
+	if (quote !== "'" && quote !== '"' && !(quote === "`" && backtickIsString)) return undefined;
+	const triple = quote.repeat(3);
+	const delim = language === "py" && text.startsWith(triple, i) ? triple : quote;
+	i += delim.length;
+	let value = "";
+	while (i < text.length) {
+		const ch = text[i];
+		if (ch === "\\") {
+			const next = text[i + 1];
+			if (next === undefined) return undefined;
+			// A raw string keeps the backslash but the quote still does not end
+			// the literal, so consume both characters either way.
+			value += raw ? ch + next : (SIMPLE_ESCAPES[next] ?? next);
+			i += 2;
+			continue;
+		}
+		if (text.startsWith(delim, i)) {
+			return { kind: "string", value, interpolated: hasInterpolation(value, quote, language, fstring), end: i + delim.length };
+		}
+		value += ch;
+		i += 1;
+	}
+	return undefined;
+}
+
+/**
+ * Does the literal carry a runtime hole? A hole means the judged text is not
+ * the executed text, so the site is opaque rather than classifiable. `{{` is
+ * Python's escaped brace and is not a hole.
+ */
+function hasInterpolation(value: string, quote: string, language: EvalLanguageToken, fstring: boolean): boolean {
+	if (fstring) return /\{(?!\{)/u.test(value);
+	if (quote === "`") return /\$\{/u.test(value);
+	if (quote !== '"') return false;
+	if (language === "rb") return /#\{/u.test(value);
+	if (language === "jl") return /\$[A-Za-z_(]/u.test(value);
+	return false;
+}
+
+/**
+ * Advance past one argument that is not a literal, stopping at the comma or
+ * closing bracket that ends it. Nesting and quoting are tracked so a comma
+ * inside `f(a, b)` or `"a,b"` does not end the argument early.
+ */
+function skipToArgumentEnd(text: string, start: number): number {
+	let depth = 0;
+	let i = start;
+	while (i < text.length) {
+		const ch = text[i];
+		if (ch === "'" || ch === '"' || ch === "`") {
+			const end = skipQuoted(text, i);
+			if (end === -1) return text.length;
+			i = end;
+			continue;
+		}
+		if (ch === "(" || ch === "[" || ch === "{") depth += 1;
+		else if (ch === ")" || ch === "]" || ch === "}") {
+			if (depth === 0) return i;
+			depth -= 1;
+		} else if (ch === "," && depth === 0) return i;
+		i += 1;
+	}
+	return i;
+}
+
+function readLiteralNode(text: string, start: number, language: EvalLanguageToken): LiteralNode {
+	const i = skipSpace(text, start);
+	if (i >= text.length) return { kind: "other", end: i };
+	if (text[i] === "[") {
+		const items: LiteralNode[] = [];
+		let j = i + 1;
+		for (;;) {
+			j = skipSpace(text, j);
+			if (j >= text.length) return { kind: "other", end: j };
+			if (text[j] === "]") return { kind: "list", items, end: j + 1 };
+			const item = readLiteralNode(text, j, language);
+			items.push(item);
+			j = skipSpace(text, item.end);
+			if (text[j] === ",") {
+				j += 1;
+				continue;
+			}
+			if (text[j] === "]") return { kind: "list", items, end: j + 1 };
+			return { kind: "other", end: j };
+		}
+	}
+	const str = readStringLiteral(text, i, language);
+	if (str) return str;
+	return { kind: "other", end: skipToArgumentEnd(text, i) };
+}
+
+// A word the shell would read back unchanged needs no quoting; everything else
+// is single-quoted so the reconstructed command means what the argv meant.
+const SHELL_SAFE_WORD_RE = /^[\w@%+=:,./-]+$/u;
+
+function shellJoin(parts: string[]): string {
+	return parts
+		.map(part => (SHELL_SAFE_WORD_RE.test(part) && part !== "" ? part : `'${part.replace(/'/gu, "'\\''")}'`))
+		.join(" ");
+}
+
+function literalWords(list: LiteralList): string[] | undefined {
+	const words: string[] = [];
+	for (const item of list.items) {
+		if (item.kind !== "string" || item.interpolated) return undefined;
+		words.push(item.value);
+	}
+	return words;
+}
+
+/**
+ * Reconstruct the shell command a spawn call would run, or undefined when any
+ * part of it is not spelled out in the source. Partial reconstruction is never
+ * returned: a command whose tail is a variable is judged as opaque, not as the
+ * half that happens to be readable.
+ */
+function commandFromArguments(argsText: string, language: EvalLanguageToken, shape: SpawnArgShape): string | undefined {
+	const first = readLiteralNode(argsText, 0, language);
+	if (first.kind === "list") {
+		const words = literalWords(first);
+		return words && words.length > 0 ? shellJoin(words) : undefined;
+	}
+	if (first.kind !== "string" || first.interpolated) return undefined;
+
+	if (shape === "single") return first.value;
+
+	if (shape === "argvPair") {
+		const comma = skipSpace(argsText, first.end);
+		if (argsText[comma] !== ",") return first.value;
+		const second = readLiteralNode(argsText, comma + 1, language);
+		// A second argument that is not an argv list is an options object or a
+		// callback; the file name alone is then the command.
+		if (second.kind !== "list") return first.value;
+		const words = literalWords(second);
+		if (!words) return undefined;
+		// argv[0] repeats the program by convention (`spawn("bash", ["bash", …])`);
+		// keep it out of the reconstruction when it does.
+		const rest = words[0] === first.value || words[0] === first.value.split("/").pop() ? words.slice(1) : words;
+		return shellJoin([first.value, ...rest]);
+	}
+
+	// variadic: every remaining argument must be a plain string, or the argv is
+	// only partly known and the site is opaque.
+	const words = [first.value];
+	let i = skipSpace(argsText, first.end);
+	while (i < argsText.length) {
+		if (argsText[i] !== ",") return undefined;
+		const next = readLiteralNode(argsText, i + 1, language);
+		if (next.kind !== "string" || next.interpolated) return undefined;
+		words.push(next.value);
+		i = skipSpace(argsText, next.end);
+	}
+	return shellJoin(words);
+}
+
+/**
+ * Read the argument text of a call whose `(` is at `openParen`, returning the
+ * text between the parens. Undefined when the call is unterminated in this
+ * cell — an unbalanced call is reported as an opaque site by the caller.
+ */
+function readCallArguments(code: string, openParen: number): { text: string; end: number } | undefined {
+	let depth = 0;
+	let i = openParen;
+	while (i < code.length) {
+		const ch = code[i];
+		if (ch === "'" || ch === '"' || ch === "`") {
+			const end = skipQuoted(code, i);
+			if (end === -1) return undefined;
+			i = end;
+			continue;
+		}
+		if (ch === "(" || ch === "[" || ch === "{") depth += 1;
+		else if (ch === ")" || ch === "]" || ch === "}") {
+			depth -= 1;
+			if (depth === 0) return { text: code.slice(openParen + 1, i), end: i + 1 };
+		}
+		i += 1;
+	}
+	return undefined;
+}
+
+// --- callee tables ---------------------------------------------------------
+
+const PY_SUBPROCESS_MEMBERS: Record<string, SpawnArgShape> = {
+	run: "single",
+	Popen: "single",
+	call: "single",
+	check_call: "single",
+	check_output: "single",
+	getoutput: "single",
+	getstatusoutput: "single",
+};
+
+const PY_OS_MEMBERS: Record<string, SpawnArgShape> = {
+	system: "single",
+	popen: "single",
+	execv: "argvPair",
+	execve: "argvPair",
+	execvp: "argvPair",
+	execvpe: "argvPair",
+	spawnv: "argvPair",
+	spawnve: "argvPair",
+	spawnvp: "argvPair",
+	spawnvpe: "argvPair",
+	execl: "variadic",
+	execle: "variadic",
+	execlp: "variadic",
+	spawnl: "variadic",
+	spawnle: "variadic",
+	spawnlp: "variadic",
+};
+
+const CHILD_PROCESS_MEMBERS: Record<string, SpawnArgShape> = {
+	exec: "single",
+	execSync: "single",
+	execFile: "argvPair",
+	execFileSync: "argvPair",
+	spawn: "argvPair",
+	spawnSync: "argvPair",
+	fork: "argvPair",
+};
+
+const RUBY_MEMBERS: Record<string, SpawnArgShape> = {
+	system: "variadic",
+	exec: "variadic",
+	spawn: "variadic",
+	"IO.popen": "single",
+	"Open3.capture2": "variadic",
+	"Open3.capture2e": "variadic",
+	"Open3.capture3": "variadic",
+	"Open3.popen2": "variadic",
+	"Open3.popen2e": "variadic",
+	"Open3.popen3": "variadic",
+};
+
+/** Collect the module alias names a cell bound for an import, if any. */
+function matchAll(code: string, pattern: RegExp): RegExpMatchArray[] {
+	return [...code.matchAll(pattern)];
+}
+
+/** Parse `{ a, b as c }` / `{ a, b: c }` destructuring into local names. */
+function destructuredNames(body: string): Array<{ imported: string; local: string }> {
+	const names: Array<{ imported: string; local: string }> = [];
+	for (const part of body.split(",")) {
+		const trimmed = part.trim();
+		if (trimmed === "") continue;
+		const aliased = /^([A-Za-z_$][\w$]*)\s*(?::|\bas\b)\s*([A-Za-z_$][\w$]*)$/u.exec(trimmed);
+		if (aliased) {
+			names.push({ imported: aliased[1], local: aliased[2] });
+			continue;
+		}
+		if (/^[A-Za-z_$][\w$]*$/u.test(trimmed)) names.push({ imported: trimmed, local: trimmed });
+	}
+	return names;
+}
+
+function pythonCallees(code: string): Map<string, SpawnArgShape> {
+	const callees = new Map<string, SpawnArgShape>();
+	const addMembers = (alias: string, members: Record<string, SpawnArgShape>): void => {
+		for (const [member, shape] of Object.entries(members)) callees.set(`${alias}.${member}`, shape);
+	};
+	addMembers("subprocess", PY_SUBPROCESS_MEMBERS);
+	addMembers("os", PY_OS_MEMBERS);
+	callees.set("asyncio.create_subprocess_shell", "single");
+	callees.set("asyncio.create_subprocess_exec", "variadic");
+	callees.set("pty.spawn", "single");
+
+	for (const m of matchAll(code, /\bimport\s+(subprocess|os|asyncio|pty)\s+as\s+([A-Za-z_]\w*)/gu)) {
+		if (m[1] === "subprocess") addMembers(m[2], PY_SUBPROCESS_MEMBERS);
+		else if (m[1] === "os") addMembers(m[2], PY_OS_MEMBERS);
+		else if (m[1] === "asyncio") {
+			callees.set(`${m[2]}.create_subprocess_shell`, "single");
+			callees.set(`${m[2]}.create_subprocess_exec`, "variadic");
+		} else callees.set(`${m[2]}.spawn`, "single");
+	}
+	// `from subprocess import run, Popen as P` binds bare names.
+	for (const m of matchAll(code, /\bfrom\s+(subprocess|os)\s+import\s+([^\n#]+)/gu)) {
+		const members = m[1] === "subprocess" ? PY_SUBPROCESS_MEMBERS : PY_OS_MEMBERS;
+		for (const { imported, local } of destructuredNames(m[2].replace(/[()]/gu, ""))) {
+			const shape = members[imported];
+			if (shape) callees.set(local, shape);
+		}
+	}
+	return callees;
+}
+
+function javascriptCallees(code: string): Map<string, SpawnArgShape> {
+	const callees = new Map<string, SpawnArgShape>();
+	callees.set("Bun.spawn", "single");
+	callees.set("Bun.spawnSync", "single");
+	const addMembers = (alias: string): void => {
+		for (const [member, shape] of Object.entries(CHILD_PROCESS_MEMBERS)) callees.set(`${alias}.${member}`, shape);
+	};
+	const CP = String.raw`['"](?:node:)?child_process['"]`;
+	for (const m of matchAll(code, new RegExp(String.raw`\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*require\(\s*${CP}\s*\)`, "gu"))) {
+		addMembers(m[1]);
+	}
+	for (const m of matchAll(code, new RegExp(String.raw`\bimport\s+(?:\*\s+as\s+)?([A-Za-z_$][\w$]*)\s*(?:,[^]*?)?\bfrom\s*${CP}`, "gu"))) {
+		addMembers(m[1]);
+	}
+	for (const m of matchAll(code, new RegExp(String.raw`\b(?:const|let|var)\s*\{([^}]*)\}\s*=\s*require\(\s*${CP}\s*\)`, "gu"))) {
+		for (const { imported, local } of destructuredNames(m[1])) {
+			const shape = CHILD_PROCESS_MEMBERS[imported];
+			if (shape) callees.set(local, shape);
+		}
+	}
+	for (const m of matchAll(code, new RegExp(String.raw`\bimport\s*\{([^}]*)\}\s*from\s*${CP}`, "gu"))) {
+		for (const { imported, local } of destructuredNames(m[1])) {
+			const shape = CHILD_PROCESS_MEMBERS[imported];
+			if (shape) callees.set(local, shape);
+		}
+	}
+	// `await import("node:child_process")` bound to a name.
+	for (const m of matchAll(code, new RegExp(String.raw`\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*await\s+import\(\s*${CP}\s*\)`, "gu"))) {
+		addMembers(m[1]);
+	}
+	return callees;
+}
+
+function rubyCallees(): Map<string, SpawnArgShape> {
+	return new Map(Object.entries(RUBY_MEMBERS));
+}
+
+function juliaCallees(): Map<string, SpawnArgShape> {
+	// Julia's spawn arguments are backtick command literals, read separately.
+	return new Map();
+}
+
+function spawnCallees(code: string, language: EvalLanguageToken): Map<string, SpawnArgShape> {
+	if (language === "py") return pythonCallees(code);
+	if (language === "js") return javascriptCallees(code);
+	if (language === "rb") return rubyCallees();
+	return juliaCallees();
+}
+
+/**
+ * Command literals written with backticks or `%x{}`. Ruby and Julia spell
+ * commands this way, and a JS cell reaches the shell through a tagged `$`
+ * template (Bun's shell, zx). A JS backtick that is NOT `$`-tagged is an
+ * ordinary template string and is left alone.
+ */
+function commandLiteralSites(code: string, language: EvalLanguageToken): EvalSpawnSite[] {
+	const sites: EvalSpawnSite[] = [];
+	const push = (callee: string, raw: string, holePattern: RegExp): void => {
+		sites.push(holePattern.test(raw) ? { callee } : { callee, command: raw.trim() });
+	};
+	if (language === "js") {
+		for (const m of matchAll(code, /(?:\bBun\s*\.\s*\$|(?:^|[^\w$.])\$)\s*`([^`]*)`/gu)) push("$`…`", m[1], /\$\{/u);
+		return sites;
+	}
+	if (language === "rb") {
+		for (const m of matchAll(code, /`([^`]*)`/gu)) push("`…`", m[1], /#\{/u);
+		for (const m of matchAll(code, /%x[{(\[]([^}\)\]]*)[})\]]/gu)) push("%x{…}", m[1], /#\{/u);
+		return sites;
+	}
+	if (language === "jl") {
+		for (const m of matchAll(code, /`([^`]*)`/gu)) push("`…`", m[1], /\$[A-Za-z_(]/u);
+		return sites;
+	}
+	return sites;
+}
+
+/**
+ * Every spawn the submitted code performs, as a command string where the
+ * source spells one out and as an opaque site where it does not. An empty
+ * result means the cell starts no subprocess this reader can see, which is the
+ * common case and costs no model call.
+ */
+export function extractEvalSpawnSites(code: string, language: EvalLanguageToken): EvalSpawnSite[] {
+	const sites: EvalSpawnSite[] = [];
+	for (const [name, shape] of spawnCallees(code, language)) {
+		// A leading word/dot boundary keeps `mysubprocess.run` and `obj.system`
+		// from matching a bare or aliased callee name.
+		const calleeRe = new RegExp(String.raw`(?:^|[^\w$.])${escapeRegExp(name)}\s*\(`, "gu");
+		for (const match of matchAll(code, calleeRe)) {
+			const openParen = (match.index ?? 0) + match[0].length - 1;
+			const args = readCallArguments(code, openParen);
+			if (!args) {
+				sites.push({ callee: name });
+				continue;
+			}
+			const command = commandFromArguments(args.text, language, shape);
+			sites.push(command === undefined ? { callee: name } : { callee: name, command });
+		}
+	}
+	sites.push(...commandLiteralSites(code, language));
+	return sites;
+}
+
+/**
+ * Drop every cached judgement when the effective classifier config changes.
+ * A verdict is only as good as the configuration it was made under, so both
+ * gates run this before reading the cache.
+ */
+function syncConfigSignature(config: ClassifierConfig): void {
+	const signature = [config.enabled, config.model, config.timeoutMs, config.maxCommandLength].join("|");
+	if (signature === classifierConfigSignature) return;
+	cache.clear();
+	classifierConfigSignature = signature;
+}
+
 function sessionCache(sessionId: string): Map<string, Judgement> {
 	let scoped = cache.get(sessionId);
 	if (!scoped) {
@@ -689,6 +1242,7 @@ export default function (pi: ExtensionAPI) {
 	interface HostPolicy {
 		rules: BashApprovalPatternRule[];
 		bashPolicy: "allow" | "deny" | "prompt" | undefined;
+		evalPolicy: "allow" | "deny" | "prompt" | undefined;
 	}
 
 	/**
@@ -704,16 +1258,17 @@ export default function (pi: ExtensionAPI) {
 			return {
 				rules: parseBashApprovalPatternRules(settings.get("bash.patterns")),
 				bashPolicy: normalizeUserPolicy(userPolicies.bash),
+				evalPolicy: normalizeUserPolicy(userPolicies.eval),
 			};
 		} catch (err) {
 			if (!settingsWarned) {
 				settingsWarned = true;
 				pi.logger.warn(
 					`bash-classifier: settings unreadable (${err instanceof Error ? err.message : String(err)}); ` +
-						`classifying every bash command and honoring no static rules`,
+						`classifying every bash command and eval spawn, honoring no static rules`,
 				);
 			}
-			return { rules: [], bashPolicy: undefined };
+			return { rules: [], bashPolicy: undefined, evalPolicy: undefined };
 		}
 	};
 
@@ -804,17 +1359,28 @@ export default function (pi: ExtensionAPI) {
 		},
 		headline: string,
 		reason: string,
+		spawn?: { language: EvalLanguageToken; callee: string },
 	): Promise<{ block: true; reason: string } | undefined> => {
 		const detail = reason ? `${headline}: ${reason}` : headline;
 		if (!ctx.hasUI) return { block: true, reason: `${detail} (headless, blocked)` };
-		const execution = {
-			command: target.command,
-			workingDirectory: target.cwd,
-			envKeys: target.envKeys,
-			pty: target.pty,
-			timeoutSeconds: target.timeout ?? "default",
-			async: target.async,
-		};
+		// An eval spawn has no pty/async/timeout of its own — those belong to the
+		// bash tool. Show what identifies the spawn instead: the command, where
+		// it would run, and the call in the submitted code that starts it.
+		const execution = spawn
+			? {
+					command: target.command,
+					workingDirectory: target.cwd,
+					evalLanguage: spawn.language,
+					spawnedBy: spawn.callee,
+				}
+			: {
+					command: target.command,
+					workingDirectory: target.cwd,
+					envKeys: target.envKeys,
+					pty: target.pty,
+					timeoutSeconds: target.timeout ?? "default",
+					async: target.async,
+				};
 		// The TUI renders confirm messages as Markdown. Prefix every JSON line
 		// with four spaces so Markdown treats the whole record as a verbatim code
 		// block: `<!-- … -->`, emphasis, backticks, and newlines in the command
@@ -824,23 +1390,193 @@ export default function (pi: ExtensionAPI) {
 			.map(line => `    ${line}`)
 			.join("\n");
 		const approved = await ctx.ui.confirm(
-			`Run bash command? — ${detail}`,
+			spawn ? `Run eval spawn? — ${detail}` : `Run bash command? — ${detail}`,
 			`Execution details (JSON):\n\n${verbatimExecution}`,
 		);
 		return approved ? undefined : { block: true, reason: `${detail} — denied by user` };
 	};
 
+	/**
+	 * Gate the `eval` tool's subprocess spawns.
+	 *
+	 * `tools.approval.eval` is one allow/deny/prompt switch over the whole tool
+	 * while the backends hand submitted code an unrestricted `subprocess` /
+	 * `child_process`, so an `allow` there is a standing bypass of the bash
+	 * gate: an agent blocked at bash reruns the same command from inside eval.
+	 * This reads the spawns out of the submitted code and puts each command
+	 * through the same precedence bash commands go through.
+	 *
+	 * Two differences from the bash gate, both from the same cause — no native
+	 * per-command gate stands behind this one:
+	 *   - a `deny`/`prompt` bash pattern rule is ENFORCED here rather than left
+	 *     to the host, which would run the spawn without consulting it;
+	 *   - a spawn whose command is built at runtime raises a permission request
+	 *     instead of passing. It is unjudgeable, and it is the shape an evasion
+	 *     takes.
+	 * Code that spawns nothing returns before any model call, so ordinary eval
+	 * work is untouched.
+	 */
+	const gateEval = async (
+		event: { input?: Record<string, unknown> },
+		ctx: ExtensionContext,
+	): Promise<{ block: true; reason: string } | undefined> => {
+		const code = typeof event.input?.code === "string" ? event.input.code : "";
+		if (code.trim() === "") return;
+		// The host's language field is optional and an absent one runs the JS
+		// backend (eval.ts), so an unreadable value reads as js rather than
+		// skipping the gate.
+		const language = normalizeEvalLanguage(event.input?.language) ?? "js";
+		const config = readClassifierConfig();
+		syncConfigSignature(config);
+
+		try {
+			const policy = readHostPolicy();
+			// A user `deny` on eval blocks the tool natively; nothing to add.
+			if (policy.evalPolicy === "deny") return;
+
+			const sites = extractEvalSpawnSites(code, language);
+			if (sites.length === 0) return;
+
+			const scoped = sessionCache(ctx.sessionManager.getSessionId());
+			const resolvedModel = resolveClassifierModel(ctx);
+			for (const site of sites) {
+				const spawn = { language, callee: site.callee };
+				const target = {
+					command: site.command ?? `${site.callee}(…)`,
+					cwd: ctx.cwd,
+					envKeys: [] as string[],
+					pty: false,
+					timeout: undefined,
+					async: false,
+				};
+
+				if (site.command === undefined) {
+					const blocked = await requestPermission(
+						ctx,
+						target,
+						"opaque eval spawn",
+						`${site.callee} builds its command at runtime; not classifiable`,
+						spawn,
+					);
+					if (blocked) return blocked;
+					continue;
+				}
+				const command = site.command;
+
+				// Neither the classifier nor a permission dialog may approve
+				// unseen suffix text. Bounds the command, not the cell: eval code
+				// is legitimately long, and only the spawn is being judged.
+				if (command.length > config.maxCommandLength) {
+					return {
+						block: true,
+						reason:
+							`eval spawn blocked: ${command.length} chars exceeds the ` +
+							`${config.maxCommandLength}-character review limit`,
+					};
+				}
+
+				if (CRITICAL_BASH_PATTERNS.some(pattern => pattern.test(command))) {
+					const blocked = await requestPermission(
+						ctx,
+						target,
+						"critical pattern",
+						"matches a built-in dangerous-command pattern",
+						spawn,
+					);
+					if (blocked) return blocked;
+					continue;
+				}
+
+				const rule = policy.rules.find(candidate => bashApprovalRuleMatches(command, candidate));
+				if (rule?.approval === "deny") {
+					return { block: true, reason: `eval spawn blocked by bash pattern: ${rule.match}` };
+				}
+				if (rule?.approval === "prompt") {
+					const blocked = await requestPermission(
+						ctx,
+						target,
+						"prompt required by bash pattern",
+						rule.match,
+						spawn,
+					);
+					if (blocked) return blocked;
+					continue;
+				}
+				// A narrow allow rule is an explicit decision about this command
+				// string; a blanket `*` is the "run everything" setting and gets
+				// classified like anything else.
+				if (rule?.approval === "allow" && !isBlanketPattern(rule.match)) continue;
+
+				// enabled=false turns OFF model classification only; the critical
+				// check and the static rules above stay enforced.
+				if (!config.enabled) continue;
+
+				const cacheKey = JSON.stringify([resolvedModel?.id ?? "(none)", ctx.cwd, "eval", language, command]);
+				const cached = scoped.get(cacheKey);
+				let classifyError = "";
+				const judgement =
+					cached ??
+					(await classify(ctx, command, ctx.cwd, resolvedModel, config.timeoutMs).catch((err: unknown) => {
+						classifyError = err instanceof Error ? err.message : String(err);
+						pi.logger.warn(`bash-classifier: eval spawn classify failed: ${classifyError}`);
+						return undefined;
+					}));
+				if (!judgement) {
+					const blocked = await requestPermission(
+						ctx,
+						target,
+						"unclassified",
+						classifyError ? `classifier unavailable: ${truncated(classifyError, 160)}` : "classifier unavailable",
+						spawn,
+					);
+					if (blocked) return blocked;
+					continue;
+				}
+				if (!cached && judgement.verdict !== "PARSE_ERROR") remember(scoped, cacheKey, judgement);
+
+				if (judgement.verdict === "SAFE") {
+					const flags = matchModerateRiskTokens(command);
+					if (flags.length === 0) continue;
+					const blocked = await requestPermission(
+						ctx,
+						target,
+						"flagged for approval",
+						`classifier-safe but flags: ${flags.join(", ")}`,
+						spawn,
+					);
+					if (blocked) return blocked;
+					continue;
+				}
+				const verdict = judgement.verdict;
+				const detail =
+					verdict === "UNSAFE"
+						? "classified unsafe"
+						: verdict === "PARSE_ERROR"
+							? "classifier parse error"
+							: "classifier unsure";
+				if (verdict === "PARSE_ERROR") {
+					pi.logger.warn(`bash-classifier: unparseable reply: ${judgement.rawReply ?? "(none)"}`);
+				}
+				const blocked = await requestPermission(ctx, target, detail, judgement.reason, spawn);
+				if (blocked) return blocked;
+			}
+			return;
+		} catch (err) {
+			// Unexpected plugin error: fail closed rather than run code on a path
+			// we cannot vouch for.
+			pi.logger.error(`bash-classifier: ${err instanceof Error ? err.message : String(err)}`);
+			return { block: true, reason: "eval spawn classifier failed; code not run" };
+		}
+	};
+
 	pi.on("tool_call", async (event, ctx) => {
+		if (event.toolName === "eval") return await gateEval(event, ctx);
 		if (event.toolName !== "bash") return;
 		const command = typeof event.input?.command === "string" ? event.input.command : "";
 		if (command.trim() === "") return;
 
 		const config = readClassifierConfig();
-		const configSignature = [config.enabled, config.model, config.timeoutMs, config.maxCommandLength].join("|");
-		if (configSignature !== classifierConfigSignature) {
-			cache.clear();
-			classifierConfigSignature = configSignature;
-		}
+		syncConfigSignature(config);
 
 		// Universal bound, before every static-rule/critical/env branch: neither
 		// the classifier nor a permission dialog may approve unseen suffix text.
