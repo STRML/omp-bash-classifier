@@ -1127,7 +1127,7 @@ export function matchModerateRiskTokens(command: string): string[] {
 	}
 
 	const flagIfRisk = (rawWord: string): boolean => {
-		const w = rawWord.toLowerCase().replace(/['"]/gu, "");
+		const w = commandBasename(rawWord.toLowerCase());
 		if (w === "mkfs" || w.startsWith("mkfs.")) {
 			flags.add("mkfs");
 			return true;
@@ -1156,11 +1156,11 @@ export function matchModerateRiskTokens(command: string): string[] {
 		// parse each wrapper's option grammar (env -u, xargs -n 2, nice 5, ...),
 		// scan the WHOLE segment for a risk token: over-flagging is the safe
 		// direction, and option grammars are exactly where evasions hide.
-		if (WRAPPER_COMMANDS.has(words[0])) {
+		if (WRAPPER_COMMANDS.has(commandBasename(words[0]))) {
 			for (const w of words) flagIfRisk(w);
 			continue;
 		}
-		const verb = words[0];
+		const verb = commandBasename(words[0]);
 
 		if (verb === "mkfs" || verb.startsWith("mkfs.")) {
 			flags.add("mkfs");
