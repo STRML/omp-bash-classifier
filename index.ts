@@ -695,71 +695,200 @@ const GIT_VALUE_OPTIONS = new Set(["-c", "-C", "--git-dir", "--work-tree", "--na
 // stdout. `curl -fsSL https://api.example/x | jq .` is a read, and prompting
 // for it every time is what trains a user to approve without looking.
 //
-// So the direct-invocation case is decided by the invocation itself. The verbs
-// stay in MODERATE_RISK_TOKENS on purpose: the wrapper (`xargs curl`), `find
-// -exec`, and command-substitution scans all consult that set, and over-flagging
-// is the safe direction in exactly those places.
+// The clearing rule is an ALLOWLIST, in both directions, because the thing on
+// the other side of a mistake here is remote code execution. A denylist of
+// shell names does not hold: `| python3 -`, `| env bash`, `| xargs sh -c` and
+// `| FOO=1 sh` all execute what they are fed and none of them is spelled
+// "sh". So a fetch clears only when every stage downstream of it is a
+// recognized read-only consumer, and anything unrecognized prompts.
 //
-// The two tools have opposite defaults, and the rules mirror that rather than
-// pretending they are the same:
-//   curl  writes to stdout unless told otherwise -> flag on a write/upload flag
-//   wget  writes a file unless told otherwise    -> flag unless stdout is explicit
+// The verbs stay in MODERATE_RISK_TOKENS on purpose: the wrapper (`xargs
+// curl`), `find -exec`, and command-substitution scans all consult that set,
+// and over-flagging is the safe direction in exactly those places.
 // ---------------------------------------------------------------------------
 
 /**
- * curl short flags that write to, or read from, the local disk. CASE MATTERS
- * and is the whole point of reading the raw token rather than the lowercased
- * one: `-K` reads a config that can set an output path while `-k` only skips
- * TLS verification, and `-D` dumps headers to a file while `-d` is a POST body.
+ * Commands that consume stdin and cannot execute it or write a file. A fetch
+ * piped only into these is still a read. Deliberately short: `tee` writes,
+ * `awk` can `print > "/file"`, `sed -i` edits in place, and every interpreter
+ * runs what it is given, so none of them are here.
  */
-/**
- * A shell named as a DOWNSTREAM segment executes whatever is piped into it, so
- * `<anything> | sh` runs code the gate never saw. CRITICAL_BASH_PATTERNS already
- * blocks the `curl … | sh` spelling outright; this is the general case behind
- * it, and it is what makes narrowing curl/wget safe: the reason a read-only
- * fetch can stop prompting is that the shape which turns a fetch into execution
- * is caught here instead of by flagging every curl.
- */
-const STDIN_EXECUTING_SHELLS = new Set(["sh", "bash", "zsh", "fish", "dash", "ksh", "csh", "tcsh"]);
+const READ_ONLY_PIPE_CONSUMERS = new Set([
+	"jq", "yq", "head", "tail", "cat", "wc", "grep", "rg", "egrep", "fgrep",
+	"sort", "uniq", "cut", "tr", "column", "less", "more", "nl", "rev", "tac",
+	"strings", "xxd", "od", "fold", "expand", "unexpand", "pr", "diff", "cmp",
+]);
 
-const CURL_LOCAL_FILE_SHORT_FLAGS = "oOTKDcC";
+/**
+ * curl short flags that read from, or write to, the local disk. CASE MATTERS
+ * and is why this reads the raw token rather than the lowercased one: `-K`
+ * reads a config that can set an output path while `-k` only skips TLS
+ * verification, and `-D` dumps headers to a file while `-d` is a POST body.
+ * `b`/`E` are here because they read a local cookie jar and client certificate.
+ */
+const CURL_LOCAL_FILE_SHORT_FLAGS = "oOTKDcCbE";
 
 const CURL_LOCAL_FILE_LONG_FLAGS = new Set([
 	"--output", "--output-dir", "--remote-name", "--remote-name-all", "--upload-file",
-	"--config", "--create-dirs", "--dump-header", "--cookie-jar", "--trace",
-	"--trace-ascii", "--trace-config",
+	"--config", "--create-dirs", "--dump-header", "--cookie-jar", "--cookie",
+	"--cert", "--key", "--trace", "--trace-ascii", "--trace-config", "--post-file",
+	"--netrc-file", "--etag-save", "--etag-compare",
 ]);
+
+/** wget flags that read or write a local file regardless of where output goes. */
+const WGET_LOCAL_FILE_FLAGS = new Set([
+	"--post-file", "--input-file", "--output-file", "--append-output", "--load-cookies",
+	"--save-cookies", "--certificate", "--private-key", "--warc-file", "--config",
+	"--directory-prefix", "-P", "-i", "-o", "-a", "-B",
+]);
+
+/**
+ * Things that execute what is piped into them. This one IS a denylist, and that
+ * is sound here because it only ever ADDS a flag: an entry we forgot leaves
+ * behavior exactly as it is today, whereas a gap in the clearing allowlist above
+ * would let remote code run silently. Same words, opposite failure modes.
+ */
+const STDIN_EXECUTING_INTERPRETERS = new Set([
+	"sh", "bash", "zsh", "fish", "dash", "ksh", "csh", "tcsh",
+	"python", "python2", "python3", "perl", "ruby", "node", "deno", "bun",
+	"php", "lua", "tclsh", "osascript", "rscript", "julia",
+]);
+
+/** Assignments and wrappers sit between a pipe and the command it really runs. */
+function effectiveStageVerbs(stage: string): string[] {
+	const verbs: string[] = [];
+	for (const segment of tokenizeShellSegments(stage)) {
+		for (const raw of segment) {
+			const word = raw.toLowerCase();
+			// FOO=1 sh, env sh, nohup bash, xargs sh -c
+			if (/^[a-z_][a-z0-9_]*=/u.test(word)) continue;
+			if (WRAPPER_COMMANDS.has(word)) continue;
+			if (word.startsWith("-")) continue;
+			verbs.push(word);
+			break;
+		}
+	}
+	return verbs;
+}
+
+/** A word carrying a redirect (`>x`, `>>x`, `2>&1`, or a bare `>`). */
+function wordCarriesRedirect(word: string): boolean {
+	return word.includes(">");
+}
+
+/**
+ * Split a command into pipe stages, quote-aware. `tokenizeShellSegments` cannot
+ * do this: it splits on `;`, `&&`, `&`, `()` and newline exactly as it splits on
+ * `|`, so "segment index > 0" reads `cd /tmp && bash x` as piped-into and
+ * prompts for it. Only a real `|` feeds one command's output to another.
+ */
+function splitPipeStages(command: string): string[] {
+	const stages: string[] = [];
+	let buffer = "";
+	let quote: "'" | '"' | undefined;
+	for (let i = 0; i < command.length; i++) {
+		const ch = command[i];
+		if (quote) {
+			if (ch === "\\" && quote === '"' && i + 1 < command.length) {
+				buffer += ch + command[i + 1];
+				i++;
+				continue;
+			}
+			if (ch === quote) quote = undefined;
+			buffer += ch;
+			continue;
+		}
+		if (ch === "'" || ch === '"') {
+			quote = ch;
+			buffer += ch;
+			continue;
+		}
+		if (ch === "\\" && i + 1 < command.length) {
+			buffer += ch + command[i + 1];
+			i++;
+			continue;
+		}
+		if (ch === "|") {
+			// `||` is a control operator, not a pipe.
+			if (command[i + 1] === "|") {
+				buffer += "||";
+				i++;
+				continue;
+			}
+			stages.push(buffer);
+			buffer = "";
+			continue;
+		}
+		buffer += ch;
+	}
+	stages.push(buffer);
+	return stages;
+}
+
+/** Leading words of every command in a pipe stage (a stage may hold `a && b`). */
+function stageLeadingWords(stage: string): string[] {
+	return tokenizeShellSegments(stage)
+		.filter(segment => segment.length > 0)
+		.map(segment => segment[0].toLowerCase());
+}
+
+/**
+ * True when everything downstream of the first pipe is a recognized read-only
+ * consumer. Unknown downstream commands are NOT cleared: that is the allowlist,
+ * and it is what makes clearing a fetch defensible.
+ */
+function downstreamIsReadOnly(command: string): boolean {
+	const stages = splitPipeStages(command);
+	for (let i = 1; i < stages.length; i++) {
+		const words = stageLeadingWords(stages[i]);
+		if (words.length === 0) return false;
+		for (const word of words) {
+			if (!READ_ONLY_PIPE_CONSUMERS.has(word)) return false;
+		}
+	}
+	return true;
+}
 
 /** True when this curl/wget invocation can read or write a local file. */
 function networkFetchTouchesDisk(verb: string, rawWords: string[]): boolean {
 	const args = rawWords.slice(1);
+	// A redirect writes the response to disk just as surely as -o does, and the
+	// tokenizer has no redirect operator so it fuses into a word.
+	if (rawWords.some(wordCarriesRedirect)) return true;
+
 	if (verb === "curl") {
 		for (const arg of args) {
-			// `@file` is how -d/-F/-T name a local file to send.
-			if (arg.startsWith("@")) return true;
+			// `@file` names a local file to send. It can lead the token (`-T
+			// @f`) or follow a `=` (`-F name=@/etc/passwd`, `--data=@f`).
+			if (arg.startsWith("@") || arg.includes("=@")) return true;
 			if (arg.startsWith("--")) {
 				if (CURL_LOCAL_FILE_LONG_FLAGS.has(arg.split("=", 1)[0])) return true;
 				continue;
 			}
 			if (!arg.startsWith("-") || arg === "-") continue;
-			// A short bundle: -fsSL is clean, -sO is not.
 			for (const ch of arg.slice(1)) {
 				if (CURL_LOCAL_FILE_SHORT_FLAGS.includes(ch)) return true;
 			}
 		}
 		return false;
 	}
-	// wget downloads to a file by default, so silence has to be earned.
+
+	// wget downloads to a file by default, so silence has to be earned. Scan
+	// every argument before deciding: an explicit stdout flag does not undo a
+	// `--post-file` later in the same command.
+	let stdout = false;
 	for (let i = 0; i < args.length; i++) {
 		const arg = args[i];
-		if (arg === "--spider") return false;
-		if (arg === "--output-document=-") return false;
-		if (arg === "--output-document" && args[i + 1] === "-") return false;
-		// -O- and -qO- write to stdout; -O and -qO take the next word.
-		if (/^-[a-zA-Z]*O-$/u.test(arg)) return false;
-		if (/^-[a-zA-Z]*O$/u.test(arg) && args[i + 1] === "-") return false;
+		const bare = arg.split("=", 1)[0];
+		if (arg.startsWith("@") || arg.includes("=@")) return true;
+		if (WGET_LOCAL_FILE_FLAGS.has(bare)) return true;
+		if (arg === "--spider") stdout = true;
+		else if (arg === "--output-document=-") stdout = true;
+		else if (arg === "--output-document" && args[i + 1] === "-") stdout = true;
+		else if (/^-[a-zA-Z]*O-$/u.test(arg)) stdout = true;
+		else if (/^-[a-zA-Z]*O$/u.test(arg) && args[i + 1] === "-") stdout = true;
 	}
-	return true;
+	return !stdout;
 }
 
 export function matchModerateRiskTokens(command: string): string[] {
@@ -770,12 +899,18 @@ export function matchModerateRiskTokens(command: string): string[] {
 	const segments = tokenizeShellSegments(normalized);
 	const flags = new Set<string>();
 
-	// A fetch feeding a shell is an execution, not a read, however read-only the
-	// fetch looks on its own. Computed over the whole command because the fetch
-	// and the shell are different segments.
-	const pipesIntoShell = segments.some(
-		(segment, index) => index > 0 && segment.length > 0 && STDIN_EXECUTING_SHELLS.has(segment[0].toLowerCase()),
-	);
+	// Whether a fetch may clear is decided over the WHOLE command, because the
+	// fetch and whatever consumes it are different stages.
+	const downstreamSafe = downstreamIsReadOnly(normalized);
+
+	// Anything fed into an interpreter is executing code the gate never saw.
+	// Independent of the fetch rules: `cat ./installer | sh` has no curl in it.
+	const pipeStages = splitPipeStages(normalized);
+	for (let i = 1; i < pipeStages.length; i++) {
+		for (const verb of effectiveStageVerbs(pipeStages[i])) {
+			if (STDIN_EXECUTING_INTERPRETERS.has(verb)) flags.add(`| ${verb}`);
+		}
+	}
 
 	const flagIfRisk = (rawWord: string): boolean => {
 		const w = rawWord.toLowerCase().replace(/['"]/gu, "");
@@ -790,8 +925,7 @@ export function matchModerateRiskTokens(command: string): string[] {
 		return false;
 	};
 
-	for (let segmentIndex = 0; segmentIndex < segments.length; segmentIndex++) {
-		const segment = segments[segmentIndex];
+	for (const segment of segments) {
 		if (segment.length === 0) continue;
 		const words = segment.map(w => w.toLowerCase());
 
@@ -804,11 +938,6 @@ export function matchModerateRiskTokens(command: string): string[] {
 			continue;
 		}
 		const verb = words[0];
-
-		// A shell that is not the first segment is being fed on stdin.
-		if (segmentIndex > 0 && STDIN_EXECUTING_SHELLS.has(verb)) {
-			flags.add(`| ${verb}`);
-		}
 
 		if (verb === "mkfs" || verb.startsWith("mkfs.")) {
 			flags.add("mkfs");
@@ -823,7 +952,7 @@ export function matchModerateRiskTokens(command: string): string[] {
 		// `segment`, not `words`: the lowercased copy loses -K from -k and -D
 		// from -d, which is exactly the distinction being made.
 		if (verb === "curl" || verb === "wget") {
-			if (pipesIntoShell || networkFetchTouchesDisk(verb, segment)) flags.add(verb);
+			if (!downstreamSafe || networkFetchTouchesDisk(verb, segment)) flags.add(verb);
 			continue;
 		}
 		if (MODERATE_RISK_TOKENS.has(verb)) {
