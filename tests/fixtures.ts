@@ -228,6 +228,7 @@ export interface CtxOptions {
 
 export function makeCtx(options: CtxOptions = {}): ExtensionContext {
 	const confirmCalls: string[][] = [];
+	const notifyCalls: string[][] = [];
 	const ctx = {
 		cwd: options.cwd ?? "/workspace",
 		sessionManager: { getSessionId: () => options.sessionId ?? "session-1" },
@@ -236,6 +237,9 @@ export function makeCtx(options: CtxOptions = {}): ExtensionContext {
 			confirm: async (title: string, message: string) => {
 				confirmCalls.push([title, message]);
 				return options.confirmResult ?? false;
+			},
+			notify: (message: string, type = "info") => {
+				notifyCalls.push([message, type]);
 			},
 		},
 		// Mirrors the host resolver contract: an empty selector is the caller's
@@ -255,11 +259,16 @@ export function makeCtx(options: CtxOptions = {}): ExtensionContext {
 		modelRegistry: { resolver: () => undefined },
 	} as unknown as ExtensionContext;
 	Object.defineProperty(ctx, "confirmCalls", { value: confirmCalls });
+	Object.defineProperty(ctx, "notifyCalls", { value: notifyCalls });
 	return ctx;
 }
 
 export function confirmCalls(ctx: ExtensionContext): string[][] {
 	return (ctx as unknown as { confirmCalls: string[][] }).confirmCalls;
+}
+
+export function notifyCalls(ctx: ExtensionContext): string[][] {
+	return (ctx as unknown as { notifyCalls: string[][] }).notifyCalls;
 }
 
 export function makeSettings(patterns: unknown[], bashPolicy?: string): Record<string, unknown> {
@@ -278,6 +287,36 @@ let testConfigPath: string | undefined;
 // tests: machine state (a live /classifier edit) would silently flip defaults
 // and fail the suite. Force the env override before the plugin first reads it.
 process.env.OMP_BASH_CLASSIFIER_CONFIG = useTempConfigFile();
+
+let testLockPath: string | undefined;
+
+// Same reasoning as the config file above, and it bites harder: the real
+// lockfile records whether the developer running the suite has the plugin
+// disabled, so without this the stale-disable notice fires (or does not) based
+// on machine state. Default to a path that does not exist, which reads as
+// "not disabled".
+process.env.OMP_PLUGINS_LOCK = lockfilePathForTests();
+
+function lockfilePathForTests(): string {
+	if (!testLockPath) {
+		testLockPath = path.join(os.tmpdir(), `omp-classifier-test-lock-${process.pid}.json`);
+	}
+	return testLockPath;
+}
+
+/** Write a host lockfile the plugin will read. */
+export function writeLockfile(raw: Record<string, unknown>): void {
+	fs.writeFileSync(lockfilePathForTests(), JSON.stringify(raw));
+}
+
+/** Remove the host lockfile, so the plugin sees no lockfile at all. */
+export function removeLockfile(): void {
+	try {
+		fs.unlinkSync(lockfilePathForTests());
+	} catch {
+		// absent is fine
+	}
+}
 
 /** Point the plugin's config file at a fresh temp path (per test file). */
 export function useTempConfigFile(): string {

@@ -79,6 +79,10 @@ const cache = new Map<string, Map<string, Judgement>>();
 // cached judgements, so `/classifier model x` cannot reuse a SAFE verdict made
 // by (or under the policy of) a different configuration.
 let classifierConfigSignature = "";
+
+/** Sessions already told that the host lockfile disabled us after we bound.
+ *  Per session, so one warning per session and not one per bash call. */
+const staleDisableWarned = new Set<string>();
 const CACHE_CAP = 500;
 // Classifier timeout is config-driven (config.timeoutMs, default 15_000).
 
@@ -336,6 +340,43 @@ function writeClassifierConfig(patch: Record<string, unknown>): ClassifierConfig
 	fs.writeFileSync(classifierConfigPath(), `${JSON.stringify(next, null, 2)}\n`);
 	classifierConfigCache = undefined;
 	return next;
+}
+
+// ---------------------------------------------------------------------------
+// Host lockfile
+//
+// `omp plugin disable` rewrites omp-plugins.lock.json, but OMP binds a plugin's
+// interceptors at session start and does not unbind them when that file
+// changes. A session that was already running keeps classifying, which reads as
+// the plugin ignoring its own setting. We cannot honor the flag ourselves: a
+// project-scope lockfile may legitimately re-enable a plugin the user-scope one
+// disables, and reproducing OMP's scope resolution here would couple us to the
+// host's internal layout. So we say so, and point at the fix that works without
+// losing the session.
+// ---------------------------------------------------------------------------
+
+const PLUGIN_NAME = "omp-bash-classifier";
+
+function pluginLockfilePath(): string {
+	return process.env.OMP_PLUGINS_LOCK ?? path.join(os.homedir(), ".omp", "plugins", "omp-plugins.lock.json");
+}
+
+/**
+ * True when the user-scope lockfile says this plugin is disabled. A missing,
+ * unreadable, or malformed lockfile reads as "not disabled". This drives a
+ * notice, never a gate, so guessing wrong must stay silent rather than nag.
+ */
+function lockfileDisablesPlugin(): boolean {
+	try {
+		const raw = JSON.parse(fs.readFileSync(pluginLockfilePath(), "utf8")) as Record<string, unknown>;
+		const plugins = raw.plugins;
+		if (!plugins || typeof plugins !== "object") return false;
+		const entry = (plugins as Record<string, unknown>)[PLUGIN_NAME];
+		if (!entry || typeof entry !== "object") return false;
+		return (entry as Record<string, unknown>).enabled === false;
+	} catch {
+		return false;
+	}
 }
 
 function formatClassifierConfig(config: ClassifierConfig): string {
@@ -842,6 +883,18 @@ export default function (pi: ExtensionAPI) {
 			classifierConfigSignature = configSignature;
 		}
 
+		const sessionId = ctx.sessionManager.getSessionId();
+		if (!staleDisableWarned.has(sessionId) && lockfileDisablesPlugin()) {
+			staleDisableWarned.add(sessionId);
+			const notice =
+				`${PLUGIN_NAME} is disabled in ${pluginLockfilePath()} but still bound to this session. ` +
+				"Restart OMP to unload it, or run /classifier enabled false to stop classifying now.";
+			// Headless runs have nobody to read a toast, and this file's one rule
+			// for touching the UI is to check hasUI first (see requestPermission).
+			if (ctx.hasUI) ctx.ui.notify(notice, "warning");
+			else pi.logger.warn(`bash-classifier: ${notice}`);
+		}
+
 		// Universal bound, before every static-rule/critical/env branch: neither
 		// the classifier nor a permission dialog may approve unseen suffix text.
 		if (command.length > config.maxCommandLength) {
@@ -1016,7 +1069,9 @@ export default function (pi: ExtensionAPI) {
 	// is shared across concurrent sessions; clearing the whole cache on one
 	// subagent's start/shutdown invalidates another session's cached verdicts.
 	const dropCurrent = (_event: unknown, ctx: ExtensionContext) => {
-		cache.delete(ctx.sessionManager.getSessionId());
+		const sessionId = ctx.sessionManager.getSessionId();
+		cache.delete(sessionId);
+		staleDisableWarned.delete(sessionId);
 	};
 	pi.on("session_start", dropCurrent);
 	pi.on("session_before_switch", dropCurrent);
