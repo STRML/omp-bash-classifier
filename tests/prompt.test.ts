@@ -6,6 +6,7 @@
 import { beforeEach, describe, expect, test } from "bun:test";
 import {
 	confirmCalls,
+	dialogText,
 	fire,
 	loadPlugin,
 	makeCtx,
@@ -28,7 +29,7 @@ async function prompt(command: string, input: Record<string, unknown> = {}, cwd 
 	await fire("tool_call", makeEvent(command, input), ctx);
 	const calls = confirmCalls(ctx);
 	expect(calls).toHaveLength(1);
-	return { title: calls[0][0], body: calls[0][1] };
+	return { title: calls[0][0], body: calls[0][1], dialog: dialogText(ctx) };
 }
 
 describe("title", () => {
@@ -47,7 +48,40 @@ describe("title", () => {
 describe("body", () => {
 	test("opens with the command, indented verbatim", async () => {
 		const { body } = await prompt("git log --oneline");
-		expect(body.startsWith("    git log --oneline")).toBe(true);
+		expect(body.startsWith("\n    git log --oneline")).toBe(true);
+	});
+
+	test("a blank line separates the title from the command", async () => {
+		// THE invariant. An indented code block cannot interrupt a paragraph in
+		// CommonMark, so without a blank line here the command is a lazy
+		// continuation of the title and its markdown is rendered, not shown.
+		const { dialog } = await prompt("git log --oneline");
+		const lines = dialog.split("\n");
+		expect(lines[0]).toBe("Run bash command? (classified unsafe)");
+		expect(lines[1]).toBe("");
+		expect(lines[2]).toBe("    git log --oneline");
+	});
+
+	test("an html comment cannot hide the middle of a command", async () => {
+		// Verbatim from the review: comments are stripped for the terminal, so a
+		// rendered version of this displays `echo " "` and runs the deletion.
+		const command = 'echo "<!-- ok" ; rm -rf ~/data ; echo "-->"';
+		const { dialog } = await prompt(command);
+		const lines = dialog.split("\n");
+		expect(lines[1]).toBe("");
+		expect(lines[2]).toBe(`    ${command}`);
+	});
+
+	test("control characters are escaped, not sent to the terminal", async () => {
+		const { dialog } = await prompt("echo \u001b[2J\u001b[Hgotcha");
+		expect(dialog).not.toContain("\u001b");
+		expect(dialog).toContain("\\x1b[2J");
+	});
+
+	test("a bare carriage return cannot overwrite the line", async () => {
+		const { dialog } = await prompt("echo safe\rrm -rf ~/data");
+		expect(dialog).not.toContain("\r");
+		expect(dialog).toContain("\\x0d");
 	});
 
 	test("markdown in the command cannot escape the code block", async () => {
@@ -83,6 +117,17 @@ describe("details are omitted at their defaults", () => {
 
 		const different = await prompt("git log", { cwd: "/elsewhere" }, "/workspace");
 		expect(different.body).toContain("working directory: /elsewhere");
+	});
+
+	test("a trailing slash is not a different directory", async () => {
+		const trailing = await prompt("git log", { cwd: "/workspace/" }, "/workspace");
+		expect(trailing.body).not.toContain("working directory");
+	});
+
+	test("timeout 0 disables the deadline, so it does not read as 0s", async () => {
+		const { body } = await prompt("git log", { timeout: 0 });
+		expect(body).toContain("timeout: none (no deadline)");
+		expect(body).not.toContain("timeout: 0s");
 	});
 
 	test("non-defaults are printed when set", async () => {

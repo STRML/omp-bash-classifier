@@ -101,6 +101,39 @@ interface BashApprovalPatternRule {
 // classify (and prompt for) commands the user already decided about.
 // ---------------------------------------------------------------------------
 
+/**
+ * C0 controls and DEL, minus tab and newline. The old dialog body ran the
+ * command through JSON.stringify, which incidentally escaped these; rendering
+ * raw does not. A command carrying `\x1b[2J\x1b[H`, an SGR run, or a bare
+ * carriage return can repaint or overwrite the approval dialog while still
+ * executing in full, so they are shown as escapes rather than sent to the
+ * terminal.
+ */
+const DIALOG_CONTROL_CHARS = /[\u0000-\u0008\u000B-\u001F\u007F]/gu;
+
+function escapeControlChars(text: string): string {
+	return text.replace(DIALOG_CONTROL_CHARS, ch => `\\x${(ch.codePointAt(0) ?? 0).toString(16).padStart(2, "0")}`);
+}
+
+/** Four-space indent, so Markdown renders the span verbatim. */
+function verbatim(text: string): string {
+	return escapeControlChars(text)
+		.split("\n")
+		.map(line => `    ${line}`)
+		.join("\n");
+}
+
+/** Trailing-slash-insensitive directory comparison. Root stays "/". */
+function samePath(a: string, b: string | undefined): boolean {
+	const strip = (value: string | undefined): string => {
+		if (!value) return "";
+		const trimmed = value.trim();
+		if (trimmed.length > 1 && trimmed.endsWith("/")) return trimmed.slice(0, -1);
+		return trimmed;
+	};
+	return strip(a) === strip(b);
+}
+
 function normalizeBashApprovalPattern(value: string): string {
 	return value.trim().replace(/\s+/gu, " ");
 }
@@ -937,13 +970,21 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	/**
-	 * The TUI renders confirm messages as Markdown, so every span that this
-	 * process did not author is indented four spaces and becomes a verbatim code
-	 * block. That keeps `<!-- … -->`, emphasis, backticks and newlines visible
-	 * instead of changing or disappearing in the dialog. It applies to the
-	 * classifier's reason as much as to the command: the reason is model-written
-	 * text, and rendering it as live Markdown would hand a classifier reply
-	 * control over the dialog the user is reading.
+	 * The TUI renders confirm messages as Markdown, so every span this process
+	 * did not author is indented four spaces to become a verbatim code block.
+	 * That keeps `<!-- … -->`, emphasis, backticks and newlines visible instead
+	 * of changing or disappearing in the dialog. It covers the classifier's
+	 * reason as much as the command: the reason is model-written text, and
+	 * rendering it live would hand a classifier reply control over the dialog the
+	 * user is reading.
+	 *
+	 * The body MUST start with a blank line. The host joins the two arguments as
+	 * `${title}\n${message}` (extension-ui-controller.ts:947), and in CommonMark
+	 * an indented code block cannot interrupt a paragraph, so without the blank
+	 * line the command becomes a lazy continuation of the title and its Markdown
+	 * renders. That is not cosmetic. HTML comments are stripped for the terminal,
+	 * so `echo "<!-- ok" ; rm -rf ~/data ; echo "-->"` would DISPLAY as
+	 * `echo " "` while running the deletion.
 	 *
 	 * Only fields that deviate from the default are shown. `envKeys: []`,
 	 * `pty: false` and `async: false` on every prompt are noise that pushes the
@@ -961,26 +1002,31 @@ export default function (pi: ExtensionAPI) {
 		reason: string,
 		sessionCwd: string | undefined,
 	): string => {
-		const verbatim = (text: string): string =>
-			text
-				.split("\n")
-				.map(line => `    ${line}`)
-				.join("\n");
-
 		const sections = [verbatim(target.command)];
 		if (reason.trim() !== "") sections.push(`Reason:\n\n${verbatim(reason)}`);
 
 		const details: string[] = [];
-		// The working directory is worth a line only when it is not the one the
-		// user is already looking at.
-		if (target.cwd && target.cwd !== sessionCwd) details.push(`working directory: ${target.cwd}`);
-		if (target.timeout !== undefined) details.push(`timeout: ${target.timeout}s`);
+		// Worth a line only when it is not the directory the user is already in.
+		// Compared normalized, or a caller passing "/workspace/" in a session at
+		// "/workspace" prints a line saying the cwd is the cwd, which is exactly
+		// the noise this is meant to remove.
+		if (target.cwd && samePath(target.cwd, sessionCwd)) {
+			// same directory: say nothing
+		} else if (target.cwd) {
+			details.push(`working directory: ${target.cwd}`);
+		}
+		// 0 disables the deadline (host schema, tools/bash.ts), so "0s" would
+		// read as the exact opposite of what it does.
+		if (target.timeout !== undefined) {
+			details.push(target.timeout === 0 ? "timeout: none (no deadline)" : `timeout: ${target.timeout}s`);
+		}
 		if (target.envKeys.length > 0) details.push(`env: ${target.envKeys.join(", ")}`);
 		if (target.pty) details.push("pty: true");
 		if (target.async) details.push("async: true");
 		if (details.length > 0) sections.push(`Details:\n\n${verbatim(details.join("\n"))}`);
 
-		return sections.join("\n\n");
+		// Leading newline: see the block comment above.
+		return `\n${sections.join("\n\n")}`;
 	};
 
 	/**

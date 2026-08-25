@@ -280,6 +280,18 @@ export function makeCtx(options: CtxOptions = {}): ExtensionContext {
 	return ctx;
 }
 
+/**
+ * What the TUI actually parses as Markdown. The host joins the two confirm
+ * arguments with a SINGLE newline (extension-ui-controller.ts:947) before
+ * handing the result to the Markdown component, so a test that inspects title
+ * and message separately cannot see a body that lazily continues the title
+ * paragraph. Assert against this, not against the parts.
+ */
+export function dialogText(ctx: ExtensionContext, index = 0): string {
+	const [title, message] = confirmCalls(ctx)[index];
+	return `${title}\n${message}`;
+}
+
 export function confirmCalls(ctx: ExtensionContext): string[][] {
 	return (ctx as unknown as { confirmCalls: string[][] }).confirmCalls;
 }
