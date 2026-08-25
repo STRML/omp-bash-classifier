@@ -101,6 +101,76 @@ interface BashApprovalPatternRule {
 // classify (and prompt for) commands the user already decided about.
 // ---------------------------------------------------------------------------
 
+/**
+ * Characters that must never reach the dialog raw.
+ *
+ * C0 and DEL: the old body ran the command through JSON.stringify, which
+ * incidentally escaped these; rendering raw does not. `\x1b[2J\x1b[H`, an SGR
+ * run, or a bare carriage return can repaint or overwrite the approval dialog
+ * while the command still executes in full.
+ *
+ * U+0085, U+2028, U+2029: the Markdown lexer treats these as line breaks but
+ * `verbatim` split on "\n" only, so a command containing one escaped the code
+ * block. The half before it disappeared from the token stream entirely and the
+ * half after rendered as live Markdown. `rm -rf ~/data\u2028git status` showed
+ * the user `git status` and ran the deletion. Not a regression (JSON.stringify
+ * left them raw too) but this is where the helper and its invariant live.
+ *
+ * C1 (U+0080-U+009F): the 8-bit forms of the same escapes. U+009B IS a CSI, so
+ * a raw U+009B followed by `2J` repaints the dialog on any terminal honoring
+ * 8-bit C1 in UTF-8, which is xterm's default. Escaping ESC alone leaves that
+ * open, which is why the class covers the whole range rather than U+0085 only.
+ *
+ * Bidi overrides and zero-width characters: pi-tui does not strip them, so an
+ * RLO can display a command in an order it does not execute in. U+061C is the
+ * Arabic-letter-mark sibling of the U+200E/200F pair.
+ */
+const DIALOG_UNSAFE_CHARS =
+	/[\u0000-\u0009\u000B-\u001F\u007F-\u009F\u061C\u200B-\u200F\u202A-\u202E\u2028\u2029\u2060-\u2064\u2066-\u2069\uFEFF]/gu;
+
+/**
+ * The backslash is escaped FIRST, or the encoding is not injective: a command
+ * carrying the four literal characters \x1b and one carrying a real ESC
+ * rendered identically, so the dialog could not tell the reader which of the
+ * two they were approving, and copying the displayed text got them a
+ * different command than the one that executes.
+ *
+ * U+0009 joins the class because the Markdown renderer EXPANDS tabs, so a
+ * command using them displayed as spaces and was not the command that runs.
+ * Tabs are load-bearing in the constructs worth reviewing: a <<-EOF body
+ * strips leading tabs and not spaces, and IFS, awk field separators and
+ * Makefile recipe lines all depend on them.
+ */
+function escapeControlChars(text: string): string {
+	return text.replace(/\\/gu, "\\\\").replace(DIALOG_UNSAFE_CHARS, ch => {
+		const code = ch.codePointAt(0) ?? 0;
+		return code > 0xff
+			? `\\u${code.toString(16).padStart(4, "0")}`
+			: `\\x${code.toString(16).padStart(2, "0")}`;
+	});
+}
+
+/** Four-space indent, so Markdown renders the span verbatim. */
+function verbatim(text: string): string {
+	return escapeControlChars(text)
+		.split("\n")
+		.map(line => `    ${line}`)
+		.join("\n");
+}
+
+/** Trailing-slash-insensitive directory comparison. Root stays "/". */
+function samePath(a: string, b: string | undefined): boolean {
+	// No .trim(): "/workspace " is a real and different directory on macOS and
+	// Linux, and trimming it made the dialog imply the command runs in the
+	// session cwd when it does not. Trailing-slash insensitivity only.
+	const strip = (value: string | undefined): string => {
+		if (!value) return "";
+		if (value.length > 1 && value.endsWith("/")) return value.slice(0, -1);
+		return value;
+	};
+	return strip(a) === strip(b);
+}
+
 function normalizeBashApprovalPattern(value: string): string {
 	return value.trim().replace(/\s+/gu, " ");
 }
@@ -937,6 +1007,73 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	/**
+	 * The TUI renders confirm messages as Markdown, so every span this process
+	 * did not author is indented four spaces to become a verbatim code block.
+	 * That keeps `<!-- … -->`, emphasis, backticks and newlines visible instead
+	 * of changing or disappearing in the dialog. It covers the classifier's
+	 * reason as much as the command: the reason is model-written text, and
+	 * rendering it live would hand a classifier reply control over the dialog the
+	 * user is reading.
+	 *
+	 * The body MUST start with a blank line. The host joins the two arguments as
+	 * `${title}\n${message}` (extension-ui-controller.ts:947), and in CommonMark
+	 * an indented code block cannot interrupt a paragraph, so without the blank
+	 * line the command becomes a lazy continuation of the title and its Markdown
+	 * renders. That is not cosmetic. HTML comments are stripped for the terminal,
+	 * so `echo "<!-- ok" ; rm -rf ~/data ; echo "-->"` would DISPLAY as
+	 * `echo " "` while running the deletion.
+	 *
+	 * Only fields that deviate from the default are shown. `envKeys: []`,
+	 * `pty: false` and `async: false` on every prompt are noise that pushes the
+	 * command itself out of view.
+	 */
+	const buildPermissionBody = (
+		target: {
+			command: string;
+			cwd: string;
+			envKeys: string[];
+			pty: boolean;
+			timeout: number | undefined;
+			async: boolean;
+		},
+		reason: string,
+		sessionCwd: string | undefined,
+	): string => {
+		const sections = [verbatim(target.command)];
+		if (reason.trim() !== "") sections.push(`Reason:\n\n${verbatim(reason)}`);
+
+		// Detail VALUES are model-controlled and go on lines whose labels this
+		// code authored, so a newline in one forges a line: a cwd of
+		// "/tmp/stage\ntimeout: none (no deadline)" renders as two Details rows
+		// and the second is indistinguishable from ours. escapeControlChars
+		// deliberately keeps U+000A (it is the line separator for the command
+		// itself), so detail values are JSON-encoded instead — the same
+		// treatment cwd already gets on its way into the classifier prompt.
+		const detailValue = (value: string): string => JSON.stringify(value).slice(1, -1);
+
+		const details: string[] = [];
+		// Worth a line only when it is not the directory the user is already in.
+		// Compared normalized, or a caller passing "/workspace/" in a session at
+		// "/workspace" prints a line saying the cwd is the cwd, which is exactly
+		// the noise this is meant to remove.
+		if (target.cwd && !samePath(target.cwd, sessionCwd)) {
+			details.push(`working directory: ${detailValue(target.cwd)}`);
+		}
+		// 0 disables the deadline (host schema, tools/bash.ts), so "0s" would
+		// read as the exact opposite of what it does.
+		if (target.timeout !== undefined) {
+			details.push(target.timeout === 0 ? "timeout: none (no deadline)" : `timeout: ${target.timeout}s`);
+		}
+		if (target.envKeys.length > 0) details.push(`env: ${detailValue(target.envKeys.join(", "))}`);
+		if (target.pty) details.push("pty: true");
+		if (target.async) details.push("async: true");
+		if (details.length > 0) sections.push(`Details:\n\n${verbatim(details.join("\n"))}`);
+
+		// Leading newline: see the block comment above.
+		return `\n${sections.join("\n\n")}`;
+	};
+
+	/**
 	 * Raise a real permission request. Returns the block result, or undefined to
 	 * let the command through. Headless (no UI) always blocks: there is nobody to
 	 * ask, and this path is only reached for commands the gate could not clear.
@@ -961,25 +1098,13 @@ export default function (pi: ExtensionAPI) {
 	): Promise<{ block: true; reason: string } | undefined> => {
 		const detail = reason ? `${headline}: ${reason}` : headline;
 		if (!ctx.hasUI) return { block: true, reason: `${detail} (headless, blocked)` };
-		const execution = {
-			command: target.command,
-			workingDirectory: target.cwd,
-			envKeys: target.envKeys,
-			pty: target.pty,
-			timeoutSeconds: target.timeout ?? "default",
-			async: target.async,
-		};
-		// The TUI renders confirm messages as Markdown. Prefix every JSON line
-		// with four spaces so Markdown treats the whole record as a verbatim code
-		// block: `<!-- … -->`, emphasis, backticks, and newlines in the command
-		// stay visible instead of changing or disappearing in the dialog.
-		const verbatimExecution = JSON.stringify(execution, null, 2)
-			.split("\n")
-			.map(line => `    ${line}`)
-			.join("\n");
 		const approved = await ctx.ui.confirm(
-			`Run bash command? — ${detail}`,
-			`Execution details (JSON):\n\n${verbatimExecution}`,
+			// The reason stays OUT of the title. Titles are a single truncated
+			// line, and a classifier reason is a sentence, so putting it here is
+			// what produced dialogs headed "...chained read-only inspection is…"
+			// with the command pushed below the fold.
+			`Run bash command? (${headline})`,
+			buildPermissionBody(target, reason, ctx.cwd),
 		);
 		return approved ? undefined : { block: true, reason: `${detail} — denied by user` };
 	};
