@@ -365,11 +365,14 @@ const PLUGIN_NAME = "omp-bash-classifier";
  * reads the default-profile file, stays silent under `--profile`, and in the
  * inverse case warns about a path the session never consulted.
  *
- * Importing this from pi-utils is safe where `import { settings }` is not (see
- * the header note). `settings` is a host-initialized singleton and a
- * plugin-local copy throws; the `dirs` resolver derives from `process.env` at
- * module load, which the host has already populated by the time a plugin binds,
- * so a plugin-local copy computes the same path the host wrote.
+ * There is no plugin-local copy to worry about. `legacy-pi-compat.ts` rewrites
+ * `@oh-my-pi/*` through `resolveCanonicalPiSpecifier` (the bundled virtual
+ * module in compiled mode, `Bun.resolveSync` against the host dir otherwise)
+ * precisely to avoid "pulling a duplicate copy from plugin node_modules". So
+ * this resolves to the HOST's live singleton, and even a runtime `setProfile()`
+ * is reflected. That is stronger than the header's rule about `settings` needs,
+ * not an exception to it: `settings` fails for its own reason, not because
+ * host imports are duplicated.
  *
  * `OMP_BASH_CLASSIFIER_TEST_LOCKFILE` is TEST-ONLY and deliberately not offered
  * as a user knob, unlike `OMP_BASH_CLASSIFIER_CONFIG`. That one redirects the
@@ -394,15 +397,20 @@ let lockfileCache: LockfileCache | undefined;
  * unreadable, or malformed lockfile reads as "not disabled". This drives a
  * notice, never a gate, so guessing wrong must stay silent rather than nag.
  */
-function lockfileDisablesPlugin(): boolean {
+async function lockfileDisablesPlugin(): Promise<boolean> {
 	let stat: fs.Stats;
 	try {
-		stat = fs.statSync(pluginLockfilePath());
+		// Async on purpose. This runs on every bash call, and the not-disabled
+		// case never short-circuits, so a synchronous stat would sit on the
+		// event loop for the life of the session. The comment below names NFS
+		// and bind mounts as environments to tolerate, and on a stalled network
+		// mount a sync stat can block for seconds inside a tool_call handler
+		// whose runner fails closed. A diagnostic must not be able to do that.
+		stat = await fs.promises.stat(pluginLockfilePath());
 	} catch {
-		// No lockfile at the user-scope path. This is the common case for
-		// project-scoped and dev-linked installs, and a failed statSync is the
-		// cheap half — nothing is read or parsed — so it needs no cache entry,
-		// and skipping one keeps a lockfile created later visible.
+		// No lockfile at the user-scope path: the common case for project-scoped
+		// and dev-linked installs. Nothing is read or parsed, and skipping the
+		// cache keeps a lockfile created later visible.
 		return false;
 	}
 	// Size joins mtime in the key: mtime granularity is sub-ms on APFS and ext4
@@ -413,11 +421,11 @@ function lockfileDisablesPlugin(): boolean {
 	}
 	let disabled = false;
 	try {
-		disabled = pluginEntryIsDisabled(JSON.parse(fs.readFileSync(pluginLockfilePath(), "utf8")) as Record<string, unknown>);
+		const raw = JSON.parse(await fs.promises.readFile(pluginLockfilePath(), "utf8")) as Record<string, unknown>;
+		disabled = pluginEntryIsDisabled(raw);
 	} catch {
-		// Unreadable or malformed reads as "not disabled". Cache it anyway,
-		// keyed on the same stat: without this, a malformed lockfile is read and
-		// re-parsed on every bash call for the life of the process.
+		// Unreadable or malformed reads as "not disabled". Cached anyway, keyed
+		// on the same stat, or a malformed lockfile is re-parsed on every call.
 		disabled = false;
 	}
 	lockfileCache = { mtimeMs: stat.mtimeMs, size: stat.size, disabled };
@@ -947,7 +955,7 @@ export default function (pi: ExtensionAPI) {
 		// call it rode in on.
 		try {
 			const sessionId = ctx.sessionManager.getSessionId();
-			if (config.enabled && !staleDisableWarned.has(sessionId) && lockfileDisablesPlugin()) {
+			if (!staleDisableWarned.has(sessionId) && (await lockfileDisablesPlugin())) {
 				staleDisableWarned.add(sessionId);
 				// Hedged deliberately. This reads the USER-scope lockfile only,
 				// and a project-scope lockfile shadows it (the loader's
@@ -957,10 +965,17 @@ export default function (pi: ExtensionAPI) {
 				// active plugin, and telling that user to restart would be advice
 				// that changes nothing. State what was read; do not claim what it
 				// means.
+				// `/classifier enabled false` turns off model classification ONLY.
+				// Critical patterns, the env-override check and the length bound
+				// all still run (see the early return far below), so a user who
+				// took that route and then ran `omp plugin disable` is still
+				// being gated and still deserves to know why.
+				const remedy = config.enabled
+					? "If you meant to turn it off, restart OMP to unload it, or run /classifier enabled false to stop classifying now."
+					: "Classification is already off, but critical patterns, env checks and static rules keep running until you restart OMP.";
 				const notice =
 					`${PLUGIN_NAME} is marked disabled in ${pluginLockfilePath()} while still bound to this session. ` +
-					"If you meant to turn it off, restart OMP to unload it, or run /classifier enabled false to stop " +
-					"classifying now. A project-scope lockfile can re-enable it, in which case this is expected.";
+					`${remedy} A project-scope lockfile can re-enable it, in which case this is expected.`;
 				// Headless runs have nobody to read a toast, and this file's one
 				// rule for touching the UI is to check hasUI first (see
 				// requestPermission).

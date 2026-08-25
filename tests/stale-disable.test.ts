@@ -142,14 +142,17 @@ describe("notice stays silent otherwise", () => {
 });
 
 describe("the notice defers to the plugin's own kill switch", () => {
-	test("silent once /classifier enabled false is set", async () => {
+	test("still speaks up when classification is off, because gating continues", async () => {
 		writeLockfile(DISABLED);
 		writeConfigFile({ enabled: false });
 		const ctx = makeCtx({ sessionId: "killswitch-1", hasUI: true });
 		await fire("tool_call", makeEvent("git status"), ctx);
-		// Nothing to explain: the classifier is already off, so the advice the
-		// notice would give is advice the user has taken.
-		expect(notifyCalls(ctx)).toHaveLength(0);
+		// enabled:false turns off model classification only. Critical patterns,
+		// env checks and the length bound keep running, so "disabled but still
+		// gating" is reachable in this order too and needs the same explanation.
+		expect(notifyCalls(ctx)).toHaveLength(1);
+		expect(notifyCalls(ctx)[0][0]).toContain("Classification is already off");
+		expect(notifyCalls(ctx)[0][0]).not.toContain("/classifier enabled false");
 	});
 
 	test("still warns while the classifier is running", async () => {
@@ -158,6 +161,7 @@ describe("the notice defers to the plugin's own kill switch", () => {
 		const ctx = makeCtx({ sessionId: "killswitch-2", hasUI: true });
 		await fire("tool_call", makeEvent("git status"), ctx);
 		expect(notifyCalls(ctx)).toHaveLength(1);
+		expect(notifyCalls(ctx)[0][0]).toContain("/classifier enabled false");
 	});
 });
 

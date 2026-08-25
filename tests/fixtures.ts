@@ -193,6 +193,7 @@ const handlers = new Map<string, Handler>();
 
 /** Load the plugin with a fake pi; returns a fire() bound to it. */
 export async function loadPlugin(settings: Record<string, unknown>): Promise<void> {
+	loggerWarnings.length = 0;
 	handlers.clear();
 	modelCalls.length = 0;
 	classifierThrows = false;
@@ -219,6 +220,9 @@ export const loggerWarnings: string[] = [];
 export function resetLoggerWarnings(): void {
 	loggerWarnings.length = 0;
 }
+
+// Cleared inside loadPlugin() too, which every beforeEach already calls, so a
+// new test asserting a warning count cannot pass or fail on test ordering.
 
 export async function fire(event: string, payload: unknown, ctx: ExtensionContext): Promise<unknown> {
 	const handler = handlers.get(event);
