@@ -1770,6 +1770,17 @@ export default function (pi: ExtensionAPI) {
 			// Anything that parsed caches (including UNSURE, whose cached entry
 			// keeps a nondeterministic classifier from flapping verdicts).
 			if (!cached && judgement.verdict !== "PARSE_ERROR") remember(scoped, cacheKey, judgement);
+			// Every resolved decision is logged so prompt/auto-run behavior is
+			// observable from ~/.omp/logs without watching dialogs. Verdict,
+			// the cache/reason provenance, and a truncated command; the full
+			// command is not echoed (it can carry secrets in flags). This is
+			// the choke point for both the SAFE auto-run and the prompt path,
+			// and it feeds the issue #2 eval corpus.
+			const logCommand = truncated(command.replace(/\s+/gu, " ").trim(), 120);
+			pi.logger.info(
+				`bash-classifier: verdict=${judgement.verdict}` +
+					` cached=${cached ? 1 : 0} reason="${judgement.reason}" cmd="${logCommand}"`,
+			);
 
 			if (judgement.verdict === "SAFE") {
 				// SAFE verdicts still hit a permission request when the command

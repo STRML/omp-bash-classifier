@@ -194,6 +194,7 @@ const handlers = new Map<string, Handler>();
 /** Load the plugin with a fake pi; returns a fire() bound to it. */
 export async function loadPlugin(settings: Record<string, unknown>): Promise<void> {
 	loggerWarnings.length = 0;
+	loggerInfos.length = 0;
 	handlers.clear();
 	modelCalls.length = 0;
 	classifierThrows = false;
@@ -208,6 +209,9 @@ export async function loadPlugin(settings: Record<string, unknown>): Promise<voi
 			warn: (message: string) => {
 				loggerWarnings.push(message);
 			},
+			info: (message: string) => {
+				loggerInfos.push(message);
+			},
 			error: () => {},
 		},
 	} as unknown as ExtensionAPI);
@@ -219,6 +223,12 @@ export const loggerWarnings: string[] = [];
 
 export function resetLoggerWarnings(): void {
 	loggerWarnings.length = 0;
+}
+/** Captured `pi.logger.info` messages (the classifier decision log). */
+export const loggerInfos: string[] = [];
+
+export function resetLoggerInfos(): void {
+	loggerInfos.length = 0;
 }
 
 // Cleared inside loadPlugin() too, which every beforeEach already calls, so a

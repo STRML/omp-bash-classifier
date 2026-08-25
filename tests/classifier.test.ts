@@ -15,6 +15,7 @@ import {
 	makeEvent,
 	makeSettings,
 	modelCalls,
+	loggerInfos,
 	resultText,
 	confirmCalls,
 	setClassifierReply,
@@ -45,6 +46,12 @@ describe("verdict routing", () => {
 		expect(result).toBe("ALLOWED");
 		expect(confirmCalls(ctx).length).toBe(0);
 		expect(modelCalls.length).toBe(1);
+	});
+	test("SAFE auto-run is recorded in the decision log", async () => {
+		setClassifierReply("SAFE");
+		const ctx = fresh({ hasUI: true });
+		await fire("tool_call", makeEvent("git status"), ctx);
+		expect(loggerInfos.some(m => m.includes("verdict=SAFE") && m.includes("git status"))).toBe(true);
 	});
 
 	test("UNSAFE with UI + approve runs", async () => {
