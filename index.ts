@@ -407,6 +407,14 @@ async function lockfileDisablesPlugin(): Promise<boolean> {
 	const lockPath = pluginLockfilePath();
 	let stat: fs.Stats;
 	try {
+		// Known and accepted: in the common not-disabled case the session never
+		// enters staleDisableWarned, so the leading short-circuit never fires and
+		// this stat runs once per bash call for the session's life. Caching the
+		// negative would end that, and would also end the feature — noticing a
+		// disable that happens MID-session is the entire point. The cost is one
+		// stat with no read or parse behind it, on a path that already carries
+		// readClassifierConfig's synchronous statSync.
+		//
 		// Async keeps the event loop free, which is worth having, but be clear
 		// about what it does NOT buy: the handler still parks here, and the
 		// runner bounds each tool_call at toolCallTimeoutMs and returns

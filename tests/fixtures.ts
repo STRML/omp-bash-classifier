@@ -312,6 +312,11 @@ let testLockPath: string | undefined;
 // disabled, so without this the stale-disable notice fires (or does not) based
 // on machine state. Default to a path that does not exist, which reads as
 // "not disabled".
+// The redirect is honored only under NODE_ENV=test, and bun defaults that ONLY
+// when it is not already defined — so `NODE_ENV=development bun test` left the
+// redirect inert and the suite read the developer's real lockfile. Pin it here
+// beside the redirect rather than relying on bun's default.
+process.env.NODE_ENV = "test";
 process.env.OMP_BASH_CLASSIFIER_TEST_LOCKFILE = lockfilePathForTests();
 
 function lockfilePathForTests(): string {
