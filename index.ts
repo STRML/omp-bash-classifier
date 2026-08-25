@@ -60,6 +60,7 @@ import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { CRITICAL_BASH_PATTERNS } from "@oh-my-pi/pi-coding-agent/tools/bash";
 import { resolveToCwd } from "@oh-my-pi/pi-coding-agent/tools/path-utils";
 import { extractLeadingCdTarget, tokenizeShellSegments } from "@oh-my-pi/pi-coding-agent/tools/shell-tokenize";
+import { getPluginsLockfile } from "@oh-my-pi/pi-utils";
 import { completeSimple, type Model, type TextContent, type UserMessage } from "@oh-my-pi/pi-ai";
 
 type Verdict = "SAFE" | "UNSAFE" | "UNSURE" | "PARSE_ERROR";
@@ -357,9 +358,28 @@ function writeClassifierConfig(patch: Record<string, unknown>): ClassifierConfig
 
 const PLUGIN_NAME = "omp-bash-classifier";
 
+/**
+ * Resolve the lockfile the way the host does. `OMP_PROFILE`/`PI_PROFILE`,
+ * `PI_CONFIG_DIR`, and `XDG_DATA_HOME` all move it, so a hand-built
+ * `~/.omp/plugins/...` is wrong for exactly the users this notice targets: it
+ * reads the default-profile file, stays silent under `--profile`, and in the
+ * inverse case warns about a path the session never consulted.
+ *
+ * Importing this from pi-utils is safe where `import { settings }` is not (see
+ * the header note). `settings` is a host-initialized singleton and a
+ * plugin-local copy throws; the `dirs` resolver derives from `process.env` at
+ * module load, which the host has already populated by the time a plugin binds,
+ * so a plugin-local copy computes the same path the host wrote.
+ */
 function pluginLockfilePath(): string {
-	return process.env.OMP_PLUGINS_LOCK ?? path.join(os.homedir(), ".omp", "plugins", "omp-plugins.lock.json");
+	return process.env.OMP_PLUGINS_LOCK ?? getPluginsLockfile();
 }
+
+interface LockfileCache {
+	mtimeMs: number;
+	disabled: boolean;
+}
+let lockfileCache: LockfileCache | undefined;
 
 /**
  * True when the user-scope lockfile says this plugin is disabled. A missing,
@@ -368,15 +388,29 @@ function pluginLockfilePath(): string {
  */
 function lockfileDisablesPlugin(): boolean {
 	try {
-		const raw = JSON.parse(fs.readFileSync(pluginLockfilePath(), "utf8")) as Record<string, unknown>;
-		const plugins = raw.plugins;
-		if (!plugins || typeof plugins !== "object") return false;
-		const entry = (plugins as Record<string, unknown>)[PLUGIN_NAME];
-		if (!entry || typeof entry !== "object") return false;
-		return (entry as Record<string, unknown>).enabled === false;
+		const lockPath = pluginLockfilePath();
+		// mtime-cached like readClassifierConfig above: the common answer is
+		// "not disabled", which never latches the warned-set, so an uncached
+		// read here would parse the host lockfile on every bash call for the
+		// life of the process — including on the fast paths that return
+		// without a model call, where it would dominate.
+		const stat = fs.statSync(lockPath);
+		if (lockfileCache && lockfileCache.mtimeMs === stat.mtimeMs) return lockfileCache.disabled;
+		const raw = JSON.parse(fs.readFileSync(lockPath, "utf8")) as Record<string, unknown>;
+		const disabled = pluginEntryIsDisabled(raw);
+		lockfileCache = { mtimeMs: stat.mtimeMs, disabled };
+		return disabled;
 	} catch {
 		return false;
 	}
+}
+
+function pluginEntryIsDisabled(raw: Record<string, unknown>): boolean {
+	const plugins = raw.plugins;
+	if (!plugins || typeof plugins !== "object") return false;
+	const entry = (plugins as Record<string, unknown>)[PLUGIN_NAME];
+	if (!entry || typeof entry !== "object") return false;
+	return (entry as Record<string, unknown>).enabled === false;
 }
 
 function formatClassifierConfig(config: ClassifierConfig): string {
@@ -884,15 +918,27 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		const sessionId = ctx.sessionManager.getSessionId();
-		if (!staleDisableWarned.has(sessionId) && lockfileDisablesPlugin()) {
+		// Only worth saying while the classifier is actually still running. With
+		// `/classifier enabled false` already set there is no symptom to explain,
+		// and the notice would advise a fix the user has taken.
+		if (config.enabled && !staleDisableWarned.has(sessionId) && lockfileDisablesPlugin()) {
 			staleDisableWarned.add(sessionId);
 			const notice =
 				`${PLUGIN_NAME} is disabled in ${pluginLockfilePath()} but still bound to this session. ` +
 				"Restart OMP to unload it, or run /classifier enabled false to stop classifying now.";
-			// Headless runs have nobody to read a toast, and this file's one rule
-			// for touching the UI is to check hasUI first (see requestPermission).
-			if (ctx.hasUI) ctx.ui.notify(notice, "warning");
-			else pi.logger.warn(`bash-classifier: ${notice}`);
+			// This is a diagnostic, so it must never decide the command. The
+			// handler's try/catch does not open until below, and the runner fails
+			// closed on a throw, so an unguarded toast could block the very bash
+			// call it was attached to.
+			try {
+				// Headless runs have nobody to read a toast, and this file's one
+				// rule for touching the UI is to check hasUI first (see
+				// requestPermission).
+				if (ctx.hasUI) ctx.ui.notify(notice, "warning");
+				else pi.logger.warn(`bash-classifier: ${notice}`);
+			} catch {
+				// A diagnostic that cannot be delivered is not a reason to fail.
+			}
 		}
 
 		// Universal bound, before every static-rule/critical/env branch: neither
@@ -1069,12 +1115,20 @@ export default function (pi: ExtensionAPI) {
 	// is shared across concurrent sessions; clearing the whole cache on one
 	// subagent's start/shutdown invalidates another session's cached verdicts.
 	const dropCurrent = (_event: unknown, ctx: ExtensionContext) => {
-		const sessionId = ctx.sessionManager.getSessionId();
-		cache.delete(sessionId);
-		staleDisableWarned.delete(sessionId);
+		cache.delete(ctx.sessionManager.getSessionId());
 	};
 	pi.on("session_start", dropCurrent);
 	pi.on("session_before_switch", dropCurrent);
 	pi.on("session_switch", dropCurrent);
-	pi.on("session_shutdown", dropCurrent);
+
+	// One handler per event: shutdown drops the verdict cache AND the warned
+	// flag. The warned flag deliberately does NOT follow the cache across the
+	// other boundaries — `session_before_switch` carries the OUTGOING session,
+	// so clearing it there re-arms the toast every time the user switches away
+	// and back, which is not "once per session". Only a shutdown ends one.
+	pi.on("session_shutdown", (_event: unknown, ctx: ExtensionContext) => {
+		const sessionId = ctx.sessionManager.getSessionId();
+		cache.delete(sessionId);
+		staleDisableWarned.delete(sessionId);
+	});
 }

@@ -17,6 +17,7 @@ import {
 	removeLockfile,
 	resultText,
 	setClassifierDelay,
+	writeConfigFile,
 	writeLockfile,
 } from "./fixtures";
 
@@ -79,31 +80,6 @@ describe("notice fires when the lockfile disabled us after we bound", () => {
 	});
 });
 
-describe("session boundaries re-arm the notice", () => {
-	for (const event of ["session_start", "session_before_switch", "session_switch", "session_shutdown"]) {
-		test(`${event} clears the warned flag for that session only`, async () => {
-			writeLockfile(DISABLED);
-			const warned = `rearm-${event}`;
-			const other = `other-${event}`;
-			const first = makeCtx({ sessionId: warned, hasUI: true });
-			const untouched = makeCtx({ sessionId: other, hasUI: true });
-			await fire("tool_call", makeEvent("git status"), first);
-			await fire("tool_call", makeEvent("git status"), untouched);
-			expect(notifyCalls(first)).toHaveLength(1);
-
-			await fire(event, {}, makeCtx({ sessionId: warned, hasUI: true }));
-			const afterBoundary = makeCtx({ sessionId: warned, hasUI: true });
-			await fire("tool_call", makeEvent("git status"), afterBoundary);
-			expect(notifyCalls(afterBoundary)).toHaveLength(1);
-
-			// The untouched session is still marked as warned.
-			const otherAgain = makeCtx({ sessionId: other, hasUI: true });
-			await fire("tool_call", makeEvent("git status"), otherAgain);
-			expect(notifyCalls(otherAgain)).toHaveLength(0);
-		});
-	}
-});
-
 describe("notice stays silent otherwise", () => {
 	test("no lockfile at all", async () => {
 		const ctx = makeCtx({ sessionId: "quiet-1", hasUI: true });
@@ -130,7 +106,7 @@ describe("notice stays silent otherwise", () => {
 			removeLockfile();
 			const { writeFileSync } = await import("node:fs");
 			writeFileSync(process.env.OMP_PLUGINS_LOCK as string, raw);
-			const ctx = makeCtx({ sessionId: `quiet-malformed-${raw.length}` });
+			const ctx = makeCtx({ sessionId: `quiet-malformed-${raw.length}`, hasUI: true });
 			await fire("tool_call", makeEvent("git status"), ctx);
 			expect(notifyCalls(ctx)).toHaveLength(0);
 		}
@@ -141,5 +117,78 @@ describe("notice stays silent otherwise", () => {
 		const ctx = makeCtx({ sessionId: "quiet-4", hasUI: true });
 		await fire("tool_call", makeEvent("git status"), ctx);
 		expect(notifyCalls(ctx)).toHaveLength(0);
+	});
+});
+
+describe("the notice defers to the plugin's own kill switch", () => {
+	test("silent once /classifier enabled false is set", async () => {
+		writeLockfile(DISABLED);
+		writeConfigFile({ enabled: false });
+		const ctx = makeCtx({ sessionId: "killswitch-1", hasUI: true });
+		await fire("tool_call", makeEvent("git status"), ctx);
+		// Nothing to explain: the classifier is already off, so the advice the
+		// notice would give is advice the user has taken.
+		expect(notifyCalls(ctx)).toHaveLength(0);
+	});
+
+	test("still warns while the classifier is running", async () => {
+		writeLockfile(DISABLED);
+		writeConfigFile({ enabled: true });
+		const ctx = makeCtx({ sessionId: "killswitch-2", hasUI: true });
+		await fire("tool_call", makeEvent("git status"), ctx);
+		expect(notifyCalls(ctx)).toHaveLength(1);
+	});
+});
+
+describe("once per session means once, across switches", () => {
+	test("switching away and back does not re-warn", async () => {
+		writeLockfile(DISABLED);
+		const session = "switch-stable";
+		const first = makeCtx({ sessionId: session, hasUI: true });
+		await fire("tool_call", makeEvent("git status"), first);
+		expect(notifyCalls(first)).toHaveLength(1);
+
+		// The outgoing session rides session_before_switch; clearing the warned
+		// flag there is what used to re-arm the toast on every bounce.
+		await fire("session_before_switch", {}, makeCtx({ sessionId: session }));
+		await fire("session_switch", {}, makeCtx({ sessionId: session }));
+
+		const back = makeCtx({ sessionId: session, hasUI: true });
+		await fire("tool_call", makeEvent("ls -la"), back);
+		expect(notifyCalls(back)).toHaveLength(0);
+	});
+
+	test("shutdown ends the session, so a later one warns again", async () => {
+		writeLockfile(DISABLED);
+		const session = "switch-shutdown";
+		const first = makeCtx({ sessionId: session, hasUI: true });
+		await fire("tool_call", makeEvent("git status"), first);
+		expect(notifyCalls(first)).toHaveLength(1);
+
+		await fire("session_shutdown", {}, makeCtx({ sessionId: session }));
+
+		const reborn = makeCtx({ sessionId: session, hasUI: true });
+		await fire("tool_call", makeEvent("ls -la"), reborn);
+		expect(notifyCalls(reborn)).toHaveLength(1);
+	});
+});
+
+describe("the mtime cache does not hide a lockfile change", () => {
+	test("flipping the lockfile mid-session is picked up", async () => {
+		writeLockfile(ENABLED);
+		const before = makeCtx({ sessionId: "mtime-1", hasUI: true });
+		await fire("tool_call", makeEvent("git status"), before);
+		expect(notifyCalls(before)).toHaveLength(0);
+
+		// Distinct mtime: writeLockfile rewrites the file, and the cache keys on
+		// stat().mtimeMs rather than on having read it once.
+		const { utimesSync } = await import("node:fs");
+		writeLockfile(DISABLED);
+		const later = new Date(Date.now() + 2000);
+		utimesSync(process.env.OMP_PLUGINS_LOCK as string, later, later);
+
+		const after = makeCtx({ sessionId: "mtime-2", hasUI: true });
+		await fire("tool_call", makeEvent("git status"), after);
+		expect(notifyCalls(after)).toHaveLength(1);
 	});
 });
