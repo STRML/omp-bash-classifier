@@ -55,6 +55,8 @@ This symlinks the directory into `~/.omp/plugins/node_modules/omp-bash-classifie
 
 Uninstall: `omp plugin uninstall omp-bash-classifier`.
 
+The two ways to turn the plugin off differ in when they take effect. `/classifier enabled false` applies to the very next command, because the config file is read on every `bash` call. `omp plugin disable` does not: OMP binds a plugin's interceptors when a session begins and does not unbind them when `omp-plugins.lock.json` changes, so a session that was already running keeps classifying until you restart it.
+
 ## Model used
 
 The `@tiny` model role — the role core reserves for online title/memory/classifier work — falling back to the session model when `@tiny` resolves to nothing. Single turn, reasoning disabled, 15s timeout.
