@@ -386,6 +386,7 @@ function pluginLockfilePath(): string {
 }
 
 interface LockfileCache {
+	path: string;
 	mtimeMs: number;
 	size: number;
 	disabled: boolean;
@@ -398,15 +399,19 @@ let lockfileCache: LockfileCache | undefined;
  * notice, never a gate, so guessing wrong must stay silent rather than nag.
  */
 async function lockfileDisablesPlugin(): Promise<boolean> {
+	const lockPath = pluginLockfilePath();
 	let stat: fs.Stats;
 	try {
-		// Async on purpose. This runs on every bash call, and the not-disabled
-		// case never short-circuits, so a synchronous stat would sit on the
-		// event loop for the life of the session. The comment below names NFS
-		// and bind mounts as environments to tolerate, and on a stalled network
-		// mount a sync stat can block for seconds inside a tool_call handler
-		// whose runner fails closed. A diagnostic must not be able to do that.
-		stat = await fs.promises.stat(pluginLockfilePath());
+		// Async keeps the event loop free, which is worth having, but be clear
+		// about what it does NOT buy: the handler still parks here, and the
+		// runner bounds each tool_call at toolCallTimeoutMs and returns
+		// { block: true } on timeout. On a stalled network mount this stat can
+		// still block the bash call it rode in on. The exposure is pre-existing
+		// rather than introduced — readClassifierConfig above does a
+		// synchronous statSync on the same config root on every call — so this
+		// is not the place to fix it, but the earlier claim that awaiting
+		// removed the risk was wrong.
+		stat = await fs.promises.stat(lockPath);
 	} catch {
 		// No lockfile at the user-scope path: the common case for project-scoped
 		// and dev-linked installs. Nothing is read or parsed, and skipping the
@@ -416,19 +421,27 @@ async function lockfileDisablesPlugin(): Promise<boolean> {
 	// Size joins mtime in the key: mtime granularity is sub-ms on APFS and ext4
 	// but 1-2s on NFS and some bind mounts, and a rewrite inside that window is
 	// exactly what `omp plugin disable` does.
-	if (lockfileCache && lockfileCache.mtimeMs === stat.mtimeMs && lockfileCache.size === stat.size) {
+	// The path is part of the key: it is re-resolved every call and a runtime
+	// setProfile() moves it, so without this a new profile's lockfile that
+	// happened to match on mtime and size would return the old profile's answer.
+	if (
+		lockfileCache &&
+		lockfileCache.path === lockPath &&
+		lockfileCache.mtimeMs === stat.mtimeMs &&
+		lockfileCache.size === stat.size
+	) {
 		return lockfileCache.disabled;
 	}
 	let disabled = false;
 	try {
-		const raw = JSON.parse(await fs.promises.readFile(pluginLockfilePath(), "utf8")) as Record<string, unknown>;
+		const raw = JSON.parse(await fs.promises.readFile(lockPath, "utf8")) as Record<string, unknown>;
 		disabled = pluginEntryIsDisabled(raw);
 	} catch {
 		// Unreadable or malformed reads as "not disabled". Cached anyway, keyed
 		// on the same stat, or a malformed lockfile is re-parsed on every call.
 		disabled = false;
 	}
-	lockfileCache = { mtimeMs: stat.mtimeMs, size: stat.size, disabled };
+	lockfileCache = { path: lockPath, mtimeMs: stat.mtimeMs, size: stat.size, disabled };
 	return disabled;
 }
 
@@ -955,7 +968,13 @@ export default function (pi: ExtensionAPI) {
 		// call it rode in on.
 		try {
 			const sessionId = ctx.sessionManager.getSessionId();
-			if (!staleDisableWarned.has(sessionId) && (await lockfileDisablesPlugin())) {
+			// Order matters. With `has()` first, two concurrent handlers both
+			// passed the guard before either reached `add()` and the session got
+			// two toasts — bash is `concurrency: "shared"` for non-pty calls, so
+			// one turn with two bash calls interleaves at this await. Awaiting
+			// first leaves has/add adjacent with no await between them, which is
+			// atomic on a single-threaded loop.
+			if ((await lockfileDisablesPlugin()) && !staleDisableWarned.has(sessionId)) {
 				staleDisableWarned.add(sessionId);
 				// Hedged deliberately. This reads the USER-scope lockfile only,
 				// and a project-scope lockfile shadows it (the loader's

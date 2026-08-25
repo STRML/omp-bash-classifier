@@ -5,7 +5,7 @@
  * honor the flag itself (a project-scope lockfile may legitimately re-enable a
  * plugin the user-scope one disables), so it says so once per session.
  */
-import { beforeEach, describe, expect, test } from "bun:test";
+import { afterAll, beforeEach, describe, expect, test } from "bun:test";
 import {
 	fire,
 	loadPlugin,
@@ -22,6 +22,13 @@ import {
 	writeConfigFile,
 	writeLockfile,
 } from "./fixtures";
+
+// Bun runs every file in one process and static-gate.test.ts sorts after this
+// one, so a lockfile left behind here arms a false pass for whatever anyone
+// adds next.
+afterAll(() => {
+	removeLockfile();
+});
 
 beforeEach(async () => {
 	removeConfigFile();
@@ -57,6 +64,21 @@ describe("notice fires when the lockfile disabled us after we bound", () => {
 		const ctx = makeCtx({ sessionId: "stale-2", hasUI: true });
 		await fire("tool_call", makeEvent("git status"), ctx);
 		await fire("tool_call", makeEvent("ls -la"), ctx);
+		expect(notifyCalls(ctx)).toHaveLength(1);
+	});
+
+	test("two concurrent bash calls in one session warn once, not twice", async () => {
+		// Non-pty bash is concurrency:"shared" and the agent loop starts shared
+		// tasks without awaiting the previous one, so one turn with two bash
+		// calls interleaves at the lockfile await. With the has() check ahead of
+		// that await, both handlers passed the guard and the session got two
+		// toasts.
+		writeLockfile(DISABLED);
+		const ctx = makeCtx({ sessionId: "race-1", hasUI: true });
+		await Promise.all([
+			fire("tool_call", makeEvent("git status"), ctx),
+			fire("tool_call", makeEvent("ls -la"), ctx),
+		]);
 		expect(notifyCalls(ctx)).toHaveLength(1);
 	});
 
