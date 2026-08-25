@@ -728,15 +728,37 @@ function commandBasename(word: string): string {
 	return slash === -1 ? cleaned : cleaned.slice(slash + 1);
 }
 
+/**
+ * Resolve a word to the interpreter it names, or "" if it names none.
+ *
+ * `python3.12` and `ksh93` are the ordinary Homebrew/pyenv/system spellings, so
+ * a trailing version cannot be what decides this. Variants are tried against
+ * the set rather than stripped unconditionally, which keeps the reported name
+ * exact: `python3` stays `python3` instead of collapsing to `python`.
+ */
+function interpreterName(word: string): string {
+	const base = commandBasename(word);
+	if (STDIN_EXECUTING_INTERPRETERS.has(base)) return base;
+	const withoutMinor = base.replace(/\.[\d.]+$/u, "");
+	if (STDIN_EXECUTING_INTERPRETERS.has(withoutMinor)) return withoutMinor;
+	const withoutVersion = base.replace(/[\d.]+$/u, "");
+	if (STDIN_EXECUTING_INTERPRETERS.has(withoutVersion)) return withoutVersion;
+	return "";
+}
+
 /** Downstream commands that consume stdin and cannot execute it. */
 const READ_ONLY_PIPE_CONSUMERS = new Set([
 	"jq", "yq", "head", "tail", "cat", "wc", "grep", "rg", "egrep", "fgrep",
-	"sort", "cut", "tr", "column", "less", "more", "nl", "rev", "tac",
+	"sort", "cut", "tr", "column", "nl", "rev", "tac",
 	"strings", "od", "fold",
 ]);
 
 /**
- * Consumers whose own flags can name a file to write. Per-consumer, not a
+ * Consumers whose own flags can name a file to write. `less` and `more` are not
+ * here because they are not in the consumer set at all: `-O`/`-o` are the short
+ * spellings of --LOG-FILE/--log-file, and a pager on a tty additionally offers
+ * `!`, `|` and `v` shell escapes, so "consumes stdin and cannot execute it" was
+ * never true of them. Per-consumer, not a
  * blanket `-o` prefix test: `grep -o` and `rg -o` are --only-matching and
  * read-only, and `curl … | grep -o …` is one of the shapes this change exists
  * to stop prompting for.
@@ -893,14 +915,19 @@ function stdinExecutingInterpreters(stage: string): string[] {
 	}
 	if (i >= segment.length) return [];
 
-	const verb = commandBasename(segment[i]);
-	if (!STDIN_EXECUTING_INTERPRETERS.has(verb)) return [];
+	const verb = interpreterName(segment[i]);
+	if (!verb) return [];
 	const rest = segment.slice(i + 1);
 	// Inline code executes regardless of what else is on the line. The builtin
 	// INLINE_CODE_INTERPRETERS covers -c/-e for python/bash/sh/perl only, which
 	// left node, deno, bun, ruby, php and the rest with no inline-code path.
 	if (rest.some(word => /^-{1,2}(c|e|E|eval|command)$/u.test(word))) return [verb];
-	// An interpreter given a script runs the script; the pipe is just data.
+	// `-` and `-s` say the program comes from stdin, and any operand after one
+	// of them is an ARGUMENT ($1), not a script. `cat ./installer | sh -s foo`
+	// executes the pipe.
+	const stdinMarker = rest.findIndex(word => word === "-" || word === "-s");
+	if (stdinMarker !== -1) return [verb];
+	// Otherwise an interpreter given a script runs the script; the pipe is data.
 	const hasScriptOperand = rest.some(word => !word.startsWith("-") && word !== "-");
 	return hasScriptOperand ? [] : [verb];
 }
@@ -994,8 +1021,10 @@ function isPlainReadOnlyFetch(command: string): boolean {
 		const args = words.slice(1);
 
 		if (i === 0) {
-			if (verb !== "curl" && verb !== "wget") return false;
-			const allowed = verb === "curl" ? CURL_READ_ONLY_FLAGS : WGET_READ_ONLY_FLAGS;
+			// Basename, so `/usr/bin/curl -o ~/.bashrc` is still a curl.
+			const fetch = commandBasename(verb);
+			if (fetch !== "curl" && fetch !== "wget") return false;
+			const allowed = fetch === "curl" ? CURL_READ_ONLY_FLAGS : WGET_READ_ONLY_FLAGS;
 			// wget writes a file unless stdout is explicit; --spider downloads
 			// nothing at all, so it satisfies the same requirement.
 			// Decided positionally inside the loop, never by scanning the array:
@@ -1039,8 +1068,15 @@ function isPlainReadOnlyFetch(command: string): boolean {
 		const writeFlag = CONSUMER_WRITE_FLAGS[verb];
 		if (writeFlag && args.some(arg => writeFlag.test(arg))) return false;
 		for (const arg of args) {
-			if (!arg.startsWith("--")) continue;
-			if (!CONSUMER_SAFE_LONG_FLAGS.has(arg.split("=", 1)[0])) return false;
+			if (arg === "--") continue; // POSIX end-of-options, not a flag
+			if (arg.startsWith("--")) {
+				if (!CONSUMER_SAFE_LONG_FLAGS.has(arg.split("=", 1)[0])) return false;
+				continue;
+			}
+			// Short flags are governed by CONSUMER_WRITE_FLAGS per consumer, not
+			// by a blanket list: `grep -o` and `rg -o` are --only-matching and
+			// read-only while `sort -o` writes, so the same letter means
+			// opposite things and only the per-consumer map can tell them apart.
 		}
 	}
 	return true;
@@ -1108,8 +1144,8 @@ export function matchModerateRiskTokens(command: string): string[] {
 		// which re-tokenizes the raw command and lowercases only the leading
 		// word, so flag case survives: -K names a config file while -k only
 		// skips TLS verification.
-		if (verb === "curl" || verb === "wget") {
-			if (!plainReadOnlyFetch) flags.add(verb);
+		if (commandBasename(verb) === "curl" || commandBasename(verb) === "wget") {
+			if (!plainReadOnlyFetch) flags.add(commandBasename(verb));
 			continue;
 		}
 		if (MODERATE_RISK_TOKENS.has(verb)) {
