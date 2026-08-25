@@ -937,6 +937,53 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	/**
+	 * The TUI renders confirm messages as Markdown, so every span that this
+	 * process did not author is indented four spaces and becomes a verbatim code
+	 * block. That keeps `<!-- … -->`, emphasis, backticks and newlines visible
+	 * instead of changing or disappearing in the dialog. It applies to the
+	 * classifier's reason as much as to the command: the reason is model-written
+	 * text, and rendering it as live Markdown would hand a classifier reply
+	 * control over the dialog the user is reading.
+	 *
+	 * Only fields that deviate from the default are shown. `envKeys: []`,
+	 * `pty: false` and `async: false` on every prompt are noise that pushes the
+	 * command itself out of view.
+	 */
+	const buildPermissionBody = (
+		target: {
+			command: string;
+			cwd: string;
+			envKeys: string[];
+			pty: boolean;
+			timeout: number | undefined;
+			async: boolean;
+		},
+		reason: string,
+		sessionCwd: string | undefined,
+	): string => {
+		const verbatim = (text: string): string =>
+			text
+				.split("\n")
+				.map(line => `    ${line}`)
+				.join("\n");
+
+		const sections = [verbatim(target.command)];
+		if (reason.trim() !== "") sections.push(`Reason:\n\n${verbatim(reason)}`);
+
+		const details: string[] = [];
+		// The working directory is worth a line only when it is not the one the
+		// user is already looking at.
+		if (target.cwd && target.cwd !== sessionCwd) details.push(`working directory: ${target.cwd}`);
+		if (target.timeout !== undefined) details.push(`timeout: ${target.timeout}s`);
+		if (target.envKeys.length > 0) details.push(`env: ${target.envKeys.join(", ")}`);
+		if (target.pty) details.push("pty: true");
+		if (target.async) details.push("async: true");
+		if (details.length > 0) sections.push(`Details:\n\n${verbatim(details.join("\n"))}`);
+
+		return sections.join("\n\n");
+	};
+
+	/**
 	 * Raise a real permission request. Returns the block result, or undefined to
 	 * let the command through. Headless (no UI) always blocks: there is nobody to
 	 * ask, and this path is only reached for commands the gate could not clear.
@@ -961,25 +1008,13 @@ export default function (pi: ExtensionAPI) {
 	): Promise<{ block: true; reason: string } | undefined> => {
 		const detail = reason ? `${headline}: ${reason}` : headline;
 		if (!ctx.hasUI) return { block: true, reason: `${detail} (headless, blocked)` };
-		const execution = {
-			command: target.command,
-			workingDirectory: target.cwd,
-			envKeys: target.envKeys,
-			pty: target.pty,
-			timeoutSeconds: target.timeout ?? "default",
-			async: target.async,
-		};
-		// The TUI renders confirm messages as Markdown. Prefix every JSON line
-		// with four spaces so Markdown treats the whole record as a verbatim code
-		// block: `<!-- … -->`, emphasis, backticks, and newlines in the command
-		// stay visible instead of changing or disappearing in the dialog.
-		const verbatimExecution = JSON.stringify(execution, null, 2)
-			.split("\n")
-			.map(line => `    ${line}`)
-			.join("\n");
 		const approved = await ctx.ui.confirm(
-			`Run bash command? — ${detail}`,
-			`Execution details (JSON):\n\n${verbatimExecution}`,
+			// The reason stays OUT of the title. Titles are a single truncated
+			// line, and a classifier reason is a sentence, so putting it here is
+			// what produced dialogs headed "...chained read-only inspection is…"
+			// with the command pushed below the fold.
+			`Run bash command? (${headline})`,
+			buildPermissionBody(target, reason, ctx.cwd),
 		);
 		return approved ? undefined : { block: true, reason: `${detail} — denied by user` };
 	};
