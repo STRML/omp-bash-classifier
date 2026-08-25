@@ -193,6 +193,7 @@ const handlers = new Map<string, Handler>();
 
 /** Load the plugin with a fake pi; returns a fire() bound to it. */
 export async function loadPlugin(settings: Record<string, unknown>): Promise<void> {
+	loggerWarnings.length = 0;
 	handlers.clear();
 	modelCalls.length = 0;
 	classifierThrows = false;
@@ -203,9 +204,25 @@ export async function loadPlugin(settings: Record<string, unknown>): Promise<voi
 			handlers.set(event, handler);
 		},
 		registerCommand: () => {},
-		logger: { warn: () => {}, error: () => {} },
+		logger: {
+			warn: (message: string) => {
+				loggerWarnings.push(message);
+			},
+			error: () => {},
+		},
 	} as unknown as ExtensionAPI);
 }
+
+/** Captured `pi.logger.warn` messages. The headless notice path writes here
+ *  rather than to ctx.ui, so without this it cannot be asserted at all. */
+export const loggerWarnings: string[] = [];
+
+export function resetLoggerWarnings(): void {
+	loggerWarnings.length = 0;
+}
+
+// Cleared inside loadPlugin() too, which every beforeEach already calls, so a
+// new test asserting a warning count cannot pass or fail on test ordering.
 
 export async function fire(event: string, payload: unknown, ctx: ExtensionContext): Promise<unknown> {
 	const handler = handlers.get(event);
@@ -228,6 +245,7 @@ export interface CtxOptions {
 
 export function makeCtx(options: CtxOptions = {}): ExtensionContext {
 	const confirmCalls: string[][] = [];
+	const notifyCalls: string[][] = [];
 	const ctx = {
 		cwd: options.cwd ?? "/workspace",
 		sessionManager: { getSessionId: () => options.sessionId ?? "session-1" },
@@ -236,6 +254,9 @@ export function makeCtx(options: CtxOptions = {}): ExtensionContext {
 			confirm: async (title: string, message: string) => {
 				confirmCalls.push([title, message]);
 				return options.confirmResult ?? false;
+			},
+			notify: (message: string, type = "info") => {
+				notifyCalls.push([message, type]);
 			},
 		},
 		// Mirrors the host resolver contract: an empty selector is the caller's
@@ -255,11 +276,16 @@ export function makeCtx(options: CtxOptions = {}): ExtensionContext {
 		modelRegistry: { resolver: () => undefined },
 	} as unknown as ExtensionContext;
 	Object.defineProperty(ctx, "confirmCalls", { value: confirmCalls });
+	Object.defineProperty(ctx, "notifyCalls", { value: notifyCalls });
 	return ctx;
 }
 
 export function confirmCalls(ctx: ExtensionContext): string[][] {
 	return (ctx as unknown as { confirmCalls: string[][] }).confirmCalls;
+}
+
+export function notifyCalls(ctx: ExtensionContext): string[][] {
+	return (ctx as unknown as { notifyCalls: string[][] }).notifyCalls;
 }
 
 export function makeSettings(patterns: unknown[], bashPolicy?: string): Record<string, unknown> {
@@ -278,6 +304,56 @@ let testConfigPath: string | undefined;
 // tests: machine state (a live /classifier edit) would silently flip defaults
 // and fail the suite. Force the env override before the plugin first reads it.
 process.env.OMP_BASH_CLASSIFIER_CONFIG = useTempConfigFile();
+
+let testLockPath: string | undefined;
+
+// Same reasoning as the config file above, and it bites harder: the real
+// lockfile records whether the developer running the suite has the plugin
+// disabled, so without this the stale-disable notice fires (or does not) based
+// on machine state. Default to a path that does not exist, which reads as
+// "not disabled".
+// The redirect is honored only under NODE_ENV=test, and bun defaults that ONLY
+// when it is not already defined — so `NODE_ENV=development bun test` left the
+// redirect inert and the suite read the developer's real lockfile. Pin it here
+// beside the redirect rather than relying on bun's default.
+process.env.NODE_ENV = "test";
+process.env.OMP_BASH_CLASSIFIER_TEST_LOCKFILE = lockfilePathForTests();
+
+function lockfilePathForTests(): string {
+	if (!testLockPath) {
+		// PID alone collides across reruns, and the file outlives the process, so
+		// the next run inheriting it would believe the plugin is disabled — the
+		// machine-state dependence this indirection exists to remove.
+		const suffix = Math.random().toString(36).slice(2, 10);
+		testLockPath = path.join(os.tmpdir(), `omp-classifier-test-lock-${process.pid}-${suffix}.json`);
+	}
+	return testLockPath;
+}
+
+/** Write a host lockfile the plugin will read. */
+export function writeLockfile(raw: Record<string, unknown>): void {
+	fs.writeFileSync(lockfilePathForTests(), JSON.stringify(raw));
+}
+
+// The file outlives the process, so a rerun could inherit a lockfile saying the
+// plugin is disabled. The random suffix above makes that collision unlikely; this
+// makes it impossible.
+process.on("exit", () => {
+	try {
+		if (testLockPath) fs.unlinkSync(testLockPath);
+	} catch {
+		// already gone
+	}
+});
+
+/** Remove the host lockfile, so the plugin sees no lockfile at all. */
+export function removeLockfile(): void {
+	try {
+		fs.unlinkSync(lockfilePathForTests());
+	} catch {
+		// absent is fine
+	}
+}
 
 /** Point the plugin's config file at a fresh temp path (per test file). */
 export function useTempConfigFile(): string {

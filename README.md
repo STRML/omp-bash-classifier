@@ -57,6 +57,8 @@ Uninstall: `omp plugin uninstall omp-bash-classifier`.
 
 The two ways to turn the plugin off differ in when they take effect. `/classifier enabled false` applies to the very next command, because the config file is read on every `bash` call. `omp plugin disable` does not: OMP binds a plugin's interceptors when a session begins and does not unbind them when `omp-plugins.lock.json` changes, so a session that was already running keeps classifying until you restart it.
 
+The plugin notices `omp plugin disable` specifically, and says so once per session, because the symptom otherwise reads as the plugin ignoring its own setting. It reads both scopes — the project lockfile under the nearest `.omp`/`.git` anchor, then the user one — because a project-only install is disabled by writing the project lockfile, and reading only the user scope meant that user got silence. It still cannot act on what it reads: a project-scope lockfile may legitimately re-enable a plugin the user-scope one disables, so the notice reports which file said what and leaves the decision alone. `omp plugin uninstall` is not covered: it deletes the lockfile entry rather than setting `enabled: false`, and an absent entry is indistinguishable from the normal state of a project-scoped or dev-linked install, so warning on it would fire constantly for people who are not affected.
+
 ## Model used
 
 The `@tiny` model role — the role core reserves for online title/memory/classifier work — falling back to the session model when `@tiny` resolves to nothing. Single turn, reasoning disabled, 15s timeout.

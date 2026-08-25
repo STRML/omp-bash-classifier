@@ -60,6 +60,7 @@ import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { CRITICAL_BASH_PATTERNS } from "@oh-my-pi/pi-coding-agent/tools/bash";
 import { resolveToCwd } from "@oh-my-pi/pi-coding-agent/tools/path-utils";
 import { extractLeadingCdTarget, tokenizeShellSegments } from "@oh-my-pi/pi-coding-agent/tools/shell-tokenize";
+import { getPluginsLockfile } from "@oh-my-pi/pi-utils";
 import { completeSimple, type Model, type TextContent, type UserMessage } from "@oh-my-pi/pi-ai";
 
 type Verdict = "SAFE" | "UNSAFE" | "UNSURE" | "PARSE_ERROR";
@@ -79,6 +80,10 @@ const cache = new Map<string, Map<string, Judgement>>();
 // cached judgements, so `/classifier model x` cannot reuse a SAFE verdict made
 // by (or under the policy of) a different configuration.
 let classifierConfigSignature = "";
+
+/** Sessions already told that the host lockfile disabled us after we bound.
+ *  Per session, so one warning per session and not one per bash call. */
+const staleDisableWarned = new Set<string>();
 const CACHE_CAP = 500;
 // Classifier timeout is config-driven (config.timeoutMs, default 15_000).
 
@@ -336,6 +341,155 @@ function writeClassifierConfig(patch: Record<string, unknown>): ClassifierConfig
 	fs.writeFileSync(classifierConfigPath(), `${JSON.stringify(next, null, 2)}\n`);
 	classifierConfigCache = undefined;
 	return next;
+}
+
+// ---------------------------------------------------------------------------
+// Host lockfile
+//
+// `omp plugin disable` rewrites omp-plugins.lock.json, but OMP binds a plugin's
+// interceptors at session start and does not unbind them when that file
+// changes. A session that was already running keeps classifying, which reads as
+// the plugin ignoring its own setting. We cannot honor the flag ourselves: a
+// project-scope lockfile may legitimately re-enable a plugin the user-scope one
+// disables, and reproducing OMP's scope resolution here would couple us to the
+// host's internal layout. So we say so, and point at the fix that works without
+// losing the session.
+// ---------------------------------------------------------------------------
+
+const PLUGIN_NAME = "omp-bash-classifier";
+
+/**
+ * Resolve the lockfile the way the host does. `OMP_PROFILE`/`PI_PROFILE`,
+ * `PI_CONFIG_DIR`, and `XDG_DATA_HOME` all move it, so a hand-built
+ * `~/.omp/plugins/...` is wrong for exactly the users this notice targets: it
+ * reads the default-profile file, stays silent under `--profile`, and in the
+ * inverse case warns about a path the session never consulted.
+ *
+ * There is no plugin-local copy to worry about. `legacy-pi-compat.ts` rewrites
+ * `@oh-my-pi/*` through `resolveCanonicalPiSpecifier` (the bundled virtual
+ * module in compiled mode, `Bun.resolveSync` against the host dir otherwise)
+ * precisely to avoid "pulling a duplicate copy from plugin node_modules". So
+ * this resolves to the HOST's live singleton, and even a runtime `setProfile()`
+ * is reflected. That is stronger than the header's rule about `settings` needs,
+ * not an exception to it: `settings` fails for its own reason, not because
+ * host imports are duplicated.
+ *
+ * `OMP_BASH_CLASSIFIER_TEST_LOCKFILE` is TEST-ONLY, and now enforced as such
+ * rather than merely documented: it is honored only under `NODE_ENV=test`,
+ * which bun sets for `bun test`. Documented-only was not enough, because a
+ * stray export in a real session redirects the read and produces the exact
+ * failure this function exists to prevent — a notice naming a path the session
+ * never consulted. Contrast `OMP_BASH_CLASSIFIER_CONFIG`, a legitimate user
+ * knob: that redirects the plugin's OWN file, where the plugin is the sole
+ * reader. This redirects a read of a HOST file the plugin only observes.
+ */
+function pluginLockfilePath(): string {
+	if (process.env.NODE_ENV === "test" && process.env.OMP_BASH_CLASSIFIER_TEST_LOCKFILE) {
+		return process.env.OMP_BASH_CLASSIFIER_TEST_LOCKFILE;
+	}
+	return getPluginsLockfile();
+}
+
+interface LockfileCache {
+	mtimeMs: number;
+	size: number;
+	disabled: boolean;
+}
+const lockfileCaches = new Map<string, LockfileCache>();
+
+/** Which lockfile answered, so the notice can name the file it actually read. */
+interface LockfileVerdict {
+	disabled: boolean;
+	path: string;
+}
+
+/**
+ * Walk up from cwd for the project anchor the host uses (a directory holding
+ * `.omp` or `.git`) and return that scope's lockfile path.
+ *
+ * Without this the notice had a false negative exactly where it hurts: a
+ * project-only install is disabled by `MarketplaceManager.setPluginEnabled`
+ * writing `<projectRoot>/.omp/plugins/omp-plugins.lock.json`, which
+ * `getPluginsLockfile()` never returns, so the user got silence.
+ */
+function projectLockfilePath(cwd: string | undefined): string | undefined {
+	if (!cwd) return undefined;
+	let dir = path.resolve(cwd);
+	for (;;) {
+		if (fs.existsSync(path.join(dir, ".omp")) || fs.existsSync(path.join(dir, ".git"))) {
+			return path.join(dir, ".omp", "plugins", "omp-plugins.lock.json");
+		}
+		const parent = path.dirname(dir);
+		if (parent === dir) return undefined;
+		dir = parent;
+	}
+}
+
+/** Read one lockfile. Missing, unreadable or malformed reads as "not disabled". */
+async function lockfileSaysDisabled(lockPath: string): Promise<boolean> {
+	let stat: fs.Stats;
+	try {
+		// Known and accepted: in the common not-disabled case the session never
+		// enters staleDisableWarned, so the leading short-circuit never fires
+		// and this stat runs once per bash call for the session's life. Caching
+		// the negative would end that, and would also end the feature — noticing
+		// a disable that happens MID-session is the entire point.
+		//
+		// Async keeps the event loop free, but be clear about what it does NOT
+		// buy: the handler still parks here, and the runner bounds each
+		// tool_call and returns { block: true } on timeout, so on a stalled
+		// mount this can still block the bash call it rode in on. That exposure
+		// is pre-existing — readClassifierConfig statSyncs the same config root
+		// on every call — so this is not the place to fix it.
+		stat = await fs.promises.stat(lockPath);
+	} catch {
+		// Nothing read or parsed, and skipping the cache keeps a lockfile
+		// created later visible.
+		return false;
+	}
+	// Size and path join mtime in the key: mtime granularity is 1-2s on NFS and
+	// some bind mounts and a rewrite inside that window is exactly what
+	// `omp plugin disable` does, and the path can move under setProfile().
+	const cached = lockfileCaches.get(lockPath);
+	if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
+		return cached.disabled;
+	}
+	let disabled = false;
+	try {
+		disabled = pluginEntryIsDisabled(JSON.parse(await fs.promises.readFile(lockPath, "utf8")) as Record<string, unknown>);
+	} catch {
+		// Cached anyway, keyed on the same stat, or a malformed lockfile is
+		// re-parsed on every bash call.
+		disabled = false;
+	}
+	lockfileCaches.set(lockPath, { mtimeMs: stat.mtimeMs, size: stat.size, disabled });
+	return disabled;
+}
+
+/**
+ * Both scopes. The host reads a project lockfile when one exists and lets it
+ * shadow the user one, so checking only the user scope meant a project-scope
+ * disable produced silence — the exact symptom this notice exists to explain.
+ * Project is checked first because that is the one that would be in force.
+ */
+async function lockfileDisablesPlugin(cwd: string | undefined): Promise<LockfileVerdict> {
+	const projectPath = projectLockfilePath(cwd);
+	if (projectPath && (await lockfileSaysDisabled(projectPath))) {
+		return { disabled: true, path: projectPath };
+	}
+	const userPath = pluginLockfilePath();
+	return { disabled: await lockfileSaysDisabled(userPath), path: userPath };
+}
+
+function pluginEntryIsDisabled(raw: Record<string, unknown>): boolean {
+	const plugins = raw.plugins;
+	if (!plugins || typeof plugins !== "object") return false;
+	const entry = (plugins as Record<string, unknown>)[PLUGIN_NAME];
+	if (!entry || typeof entry !== "object") return false;
+	// Matches the host, which does `if (runtimeState && !runtimeState.enabled)`
+	// with no default for `enabled`. A hand-edited entry that omits it, or
+	// sets 0, is disabled as far as the loader is concerned.
+	return !(entry as Record<string, unknown>).enabled;
 }
 
 function formatClassifierConfig(config: ClassifierConfig): string {
@@ -842,6 +996,67 @@ export default function (pi: ExtensionAPI) {
 			classifierConfigSignature = configSignature;
 		}
 
+		// Fires whenever the lockfile says disabled, INCLUDING when
+		// `/classifier enabled false` is already set — that flag turns off model
+		// classification only, and the checks above it keep gating, so there is
+		// still a symptom to explain. The remedy sentence changes instead; see
+		// below. Do not add a `config.enabled` guard here: it would delete a
+		// supported case.
+		//
+		// The whole block is guarded because it is a diagnostic and must never
+		// decide the command. The handler's own try/catch does not open until
+		// below, and the runner fails closed on a throw, so an unguarded
+		// getSessionId(), notify() or logger.warn() could block the very bash
+		// call it rode in on.
+		try {
+			const sessionId = ctx.sessionManager.getSessionId();
+			// Checked on BOTH sides of the await, for two different reasons.
+			// Before: an already-warned session must not keep paying a stat on
+			// every bash call to re-deliver a notice it already got. After: with
+			// only the leading check, two concurrent handlers both passed it
+			// before either reached `add()` and the session got two toasts —
+			// non-pty bash is `concurrency: "shared"`, so one turn with two bash
+			// calls interleaves right here. The trailing has/add pair has no
+			// await between its halves, which is atomic on a single-threaded
+			// loop.
+			const verdict = !staleDisableWarned.has(sessionId)
+				? await lockfileDisablesPlugin(ctx.cwd)
+				: { disabled: false, path: "" };
+			if (verdict.disabled && !staleDisableWarned.has(sessionId)) {
+				// Claimed only AFTER delivery. Marking first meant a throwing
+				// notify silently burned the session's one notice. The has/add
+				// pair still has no await between its halves, so the race guard
+				// stays atomic.
+				// Hedged deliberately. This reads the USER-scope lockfile only,
+				// and a project-scope lockfile shadows it (the loader's
+				// loadEnabledPlugins: "Project entries shadow user entries with
+				// the same package name"). A stale user-scope `enabled: false`
+				// under a project that re-enables the plugin is a legitimately
+				// active plugin, and telling that user to restart would be advice
+				// that changes nothing. State what was read; do not claim what it
+				// means.
+				// `/classifier enabled false` turns off model classification ONLY.
+				// Critical patterns, the env-override check and the length bound
+				// all still run (see the early return far below), so a user who
+				// took that route and then ran `omp plugin disable` is still
+				// being gated and still deserves to know why.
+				const remedy = config.enabled
+					? "If you meant to turn it off, restart OMP to unload it, or run /classifier enabled false to stop classifying now."
+					: "Classification is already off, but critical patterns, env checks and static rules keep running until you restart OMP.";
+				const notice =
+					`${PLUGIN_NAME} is marked disabled in ${verdict.path} while still bound to this session. ` +
+					`${remedy} A project-scope lockfile can re-enable it, in which case this is expected.`;
+				// Headless runs have nobody to read a toast, and this file's one
+				// rule for touching the UI is to check hasUI first (see
+				// requestPermission).
+				if (ctx.hasUI) ctx.ui.notify(notice, "warning");
+				else pi.logger.warn(`bash-classifier: ${notice}`);
+				staleDisableWarned.add(sessionId);
+			}
+		} catch {
+			// A diagnostic that cannot be delivered is not a reason to fail.
+		}
+
 		// Universal bound, before every static-rule/critical/env branch: neither
 		// the classifier nor a permission dialog may approve unseen suffix text.
 		if (command.length > config.maxCommandLength) {
@@ -1021,5 +1236,22 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", dropCurrent);
 	pi.on("session_before_switch", dropCurrent);
 	pi.on("session_switch", dropCurrent);
-	pi.on("session_shutdown", dropCurrent);
+
+	// One handler per event: shutdown drops the verdict cache AND the warned
+	// flag. The warned flag deliberately does NOT follow the cache across the
+	// other boundaries — `session_before_switch` carries the OUTGOING session,
+	// so clearing it there re-arms the toast every time the user switches away
+	// and back, which is not "once per session".
+	//
+	// Be accurate about what the shutdown handler buys: the host emits
+	// session_shutdown from AgentSession#doDispose, which is process exit, and
+	// newSession() never disposes. So this delete reclaims nothing mid-process.
+	// What actually makes a new session warn again is that a new session mints a
+	// new id. The set grows one small entry per warned session for the life of
+	// the process, which is bounded by how many sessions one process opens.
+	pi.on("session_shutdown", (_event: unknown, ctx: ExtensionContext) => {
+		const sessionId = ctx.sessionManager.getSessionId();
+		cache.delete(sessionId);
+		staleDisableWarned.delete(sessionId);
+	});
 }
