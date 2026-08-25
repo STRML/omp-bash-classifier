@@ -94,8 +94,10 @@ describe("python extraction", () => {
 		expect(await commands(`import subprocess as sp\nsp.check_output(["ls", "-la"])`, "py")).toEqual(["ls -la"]);
 	});
 
-	test("os.execl reads its variadic argv", async () => {
-		expect(await commands(`os.execl("/bin/sh", "sh", "-c", "id")`, "py")).toEqual([`/bin/sh sh -c id`]);
+	test("os.execl reads its variadic argv without the mandatory argv[0] repeat", async () => {
+		// execl requires the program name twice by API contract, so echoing it
+		// back would show the human a command no shell would parse the same way.
+		expect(await commands(`os.execl("/bin/sh", "sh", "-c", "id")`, "py")).toEqual([`/bin/sh -c id`]);
 	});
 
 	test("a variadic call with a computed tail is opaque", async () => {
@@ -403,5 +405,90 @@ describe("partial-literal and hidden-callee regressions", () => {
 		setClassifierReply("SAFE");
 		await gate(`subprocess.run(["git", "log"])\nsubprocess.run(["git", "log"])`, "py");
 		expect(modelCalls.length).toBe(1);
+	});
+});
+
+describe("second-review regressions", () => {
+	test("a regex literal does not blank the spawn that follows it", async () => {
+		// `/["']/` is not a string. Reading it as one blanked everything up to
+		// the next quote in the cell, so the spawn after it vanished and the
+		// gate saw a cell that spawns nothing.
+		const multiline = `const cp=require("child_process");\nconst parts=line.split(/["']/);\ncp.execSync("ls -l");`;
+		expect(await commands(multiline, "js")).toEqual(["ls -l"]);
+		const oneLine = `let _=/['"]/;const{execSync}=require("child_process");execSync('id')`;
+		expect(await commands(oneLine, "js")).toEqual(["id"]);
+	});
+
+	test("division is not mistaken for a regex literal", async () => {
+		const code = `const t = 10 / 2; const cp = require("child_process"); cp.execSync("id")`;
+		expect(await commands(code, "js")).toEqual(["id"]);
+	});
+
+	test.each([["PY"], ["Py"], [" py"], ["zz"], [undefined]])(
+		"language %p resolves to js, exactly as the host resolves it",
+		async value => {
+			const { normalizeEvalLanguage } = await import("../index.ts");
+			expect(normalizeEvalLanguage(value)).toBe("js");
+		},
+	);
+
+	test("an off-case language is scanned with the backend the host will run", async () => {
+		// The host compares byte-for-byte, so "PY" runs the JS backend. Scanning
+		// it with the Python tables would find nothing and pass the cell through.
+		const result = await gate(`require("child_process").execSync("rm -rf /")`, "PY");
+		expect(result).toContain("critical pattern");
+	});
+
+	test("a deny rule outranks a critical pattern", async () => {
+		// The user configured this command to never run; it must not come back
+		// as an approvable dialog.
+		await loadPlugin(makeSettings([{ match: "rm -rf *", approval: "deny" }]));
+		const result = await gate(`subprocess.run("rm -rf /")`, "py");
+		expect(result).toContain("blocked by bash pattern");
+		expect(result).not.toContain("critical pattern");
+	});
+
+	test("tools.approval.bash deny blocks an eval spawn", async () => {
+		await loadPlugin(makeSettings([], "deny"));
+		const result = await gate(`subprocess.run(["git", "log"])`, "py");
+		expect(result).toContain("tools.approval.bash: deny");
+		expect(modelCalls.length).toBe(0);
+	});
+
+	test.each([
+		[`const run = require("child_process").execSync;\nrun("id");`, "js", "inline require assigned"],
+		[`import cp from "node:child_process";\nconst r = cp.execSync;\nr("id");`, "js", "namespace member assigned"],
+		[`import subprocess\nrun = subprocess.run\nrun("id", shell=True)`, "py", "python rebind"],
+		[`await promisify(exec)("id")`, "js", "promisify called inline"],
+		[`const execAsync = promisify(exec);\nexecAsync("id")`, "js", "promisify assigned"],
+	])("a spawn bound to a variable is still a spawn (%#: %s)", async (code, lang) => {
+		expect(await commands(code, lang as "py" | "js")).toEqual(["id"]);
+	});
+
+	test("a star import binds the spawn names", async () => {
+		expect(await commands(`from subprocess import *\nrun(["git", "status"])`, "py")).toEqual(["git status"]);
+	});
+
+	test.each([
+		[`asyncio.create_subprocess_exec("git", "log", stdout=asyncio.subprocess.PIPE)`, "py"],
+		[`system("git log", exception: true)`, "rb"],
+	])("a trailing keyword argument does not make a literal argv opaque (%#)", async (code, lang) => {
+		// Reporting these as opaque told the human the command was built at
+		// runtime, which is false, and hid the command from the dialog.
+		expect(await commands(code, lang as "py" | "rb")).toEqual(["git log"]);
+	});
+
+	test("a non-keyword argument in the argv is still opaque", async () => {
+		expect(await commands(`system("bash", "-c", cmd)`, "rb")).toEqual([undefined]);
+	});
+
+	test("the posix_spawn family is read", async () => {
+		const code = `os.posix_spawn("/bin/sh", ["sh", "-c", "id"], os.environ)`;
+		expect(await commands(code, "py")).toEqual([`/bin/sh -c id`]);
+	});
+
+	test("a backtick inside a string is not a command literal", async () => {
+		expect(await sites('puts "run `ls` now"', "rb")).toEqual([]);
+		expect(await commands("out = `git status`", "rb")).toEqual(["git status"]);
 	});
 });

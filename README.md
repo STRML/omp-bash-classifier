@@ -38,14 +38,20 @@ What it reads, per backend:
 
 | Backend | Spawn forms read |
 | --- | --- |
-| `py` | `subprocess.run/Popen/call/check_call/check_output/getoutput/getstatusoutput`, `os.system/popen/exec*/spawn*`, `asyncio.create_subprocess_*`, `pty.spawn`, including `import subprocess as sp` aliases and `from subprocess import run` bare names |
-| `js` | `child_process` `exec/execSync/execFile/execFileSync/spawn/spawnSync/fork` under any import or require binding, `Bun.spawn`, `Bun.spawnSync`, and `` $`…` `` shell templates |
+| `py` | `subprocess.run/Popen/call/check_call/check_output/getoutput/getstatusoutput`, `os.system/popen/exec*/spawn*/posix_spawn*`, `asyncio.create_subprocess_*`, `pty.spawn`, including `import subprocess as sp` aliases, `from subprocess import run` bare names, and `from subprocess import *` |
+| `js` | `child_process` `exec/execSync/execFile/execFileSync/spawn/spawnSync/fork` under any import or require binding, the inline `require("child_process").execSync(…)` chain, `Bun.spawn`, `Bun.spawnSync`, `promisify(exec)`, and `` $`…` `` shell templates |
 | `rb` | `` `…` ``, `%x{…}`, `system`, `exec`, `spawn`, `IO.popen`, `Open3.*` |
 | `jl` | `` `…` `` command literals |
 
 An argv list is reconstructed into a shell command with quoting preserved, so `subprocess.run(["bash", "-c", "rm -rf x"])` is judged as `bash -c 'rm -rf x'` rather than as the word `bash`. A lone argument is passed through unquoted, because a single argument is already a shell command line and quoting it would hide its verb from the destructive-token check.
 
-Comments and string interiors are masked before the scan, so a commented-out spawn or a callee named inside a string does not raise a dialog for a cell that spawns nothing.
+A spawn bound to a variable (`const run = require("child_process").execSync`) is followed to its binding, because that is ordinary code rather than evasion.
+
+Comments and string interiors are masked before the scan, so a commented-out spawn or a callee named inside a string does not raise a dialog for a cell that spawns nothing. The mask also knows what is *not* a string: a JavaScript regex literal holds quote characters (`split(/["']/)`), and reading one as a string would blank the rest of the cell and hide every spawn after it.
+
+The `language` field is resolved byte-for-byte the way the host resolves it, so anything that is not exactly `py`, `rb`, or `jl` is scanned as JavaScript. Reading `"PY"` as Python while the host runs the cell on the JS backend would gate the wrong language and find nothing at all.
+
+Precedence matches the bash gate: `deny` outranks a critical pattern, which outranks `allow` and `prompt`. A command a `deny` rule covers is blocked outright rather than offered as an approvable dialog, and `tools.approval.bash: deny` covers eval spawns too.
 
 Two rules differ from the bash gate, both because no native per-command gate stands behind this one:
 

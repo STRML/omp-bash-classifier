@@ -654,19 +654,18 @@ interface LiteralOther {
 }
 type LiteralNode = LiteralString | LiteralList | LiteralOther;
 
-const EVAL_LANGUAGE_TOKENS: ReadonlySet<string> = new Set(["py", "js", "rb", "jl"]);
-
 /**
- * Normalize the eval tool's `language` field. The host schema is
- * `'py' | 'js' | 'rb' | 'jl'` and the field is optional; an absent language
- * runs the JavaScript backend (eval.ts formatApprovalDetails calls it
- * "javascript (default)"), so an unreadable value reads as `js` at the call
- * site rather than skipping the gate.
+ * Resolve the eval tool's `language` field the way the HOST resolves it.
+ *
+ * The host compares byte-for-byte and runs the JavaScript backend for anything
+ * that is not exactly `py`, `rb`, or `jl` (eval.ts:409-415). Trimming or
+ * lowercasing here would scan `"PY"` with the Python tables while the host runs
+ * the cell on JS, and a JS spawn read by a Python reader produces no sites at
+ * all — a total bypass from a one-character change. Any disagreement with the
+ * host about which backend runs is a disagreement about what is being gated.
  */
-export function normalizeEvalLanguage(value: unknown): EvalLanguageToken | undefined {
-	if (typeof value !== "string") return undefined;
-	const lowered = value.trim().toLowerCase();
-	return EVAL_LANGUAGE_TOKENS.has(lowered) ? (lowered as EvalLanguageToken) : undefined;
+export function normalizeEvalLanguage(value: unknown): EvalLanguageToken {
+	return value === "py" || value === "rb" || value === "jl" ? value : "js";
 }
 
 // Escapes worth decoding: the classifier should see the command the shell
@@ -705,12 +704,20 @@ function skipQuoted(text: string, start: number): number {
 	const quote = text[start];
 	const triple = quote.repeat(3);
 	const delim = text.startsWith(triple, start) ? triple : quote;
+	// A one-character quote that never closes on its own line is not a string:
+	// it is a regex literal (`split(/["']/)`), an apostrophe, or a mis-parse.
+	// Calling it a string let one `/["']/` swallow everything up to the next
+	// quote in the cell, blanking real spawn calls out of the scan copy and
+	// hiding them from the gate entirely. Only triple quotes and backticks span
+	// lines.
+	const singleLine = delim.length === 1 && quote !== "`";
 	let i = start + delim.length;
 	while (i < text.length) {
 		if (text[i] === "\\") {
 			i += 2;
 			continue;
 		}
+		if (singleLine && text[i] === "\n") return -1;
 		if (text.startsWith(delim, i)) return i + delim.length;
 		i += 1;
 	}
@@ -878,6 +885,18 @@ function joinArgv(words: string[]): string | undefined {
 	return words.length === 1 ? words[0] : shellJoin(words);
 }
 
+/**
+ * Is the argument at this position a keyword/option argument rather than part
+ * of an argv? Python spells it `name=value` or `**opts`; Ruby spells it
+ * `name: value` or `:name => value`.
+ */
+function looksLikeKeywordArgument(argsText: string, start: number, language: EvalLanguageToken): boolean {
+	const rest = argsText.slice(skipSpace(argsText, start));
+	if (language === "py") return /^(?:\*\*|[A-Za-z_]\w*\s*=(?!=))/u.test(rest);
+	if (language === "rb") return /^(?:[A-Za-z_]\w*\s*:(?!:)|:[A-Za-z_]\w*\s*=>)/u.test(rest);
+	return false;
+}
+
 function commandFromArguments(argsText: string, language: EvalLanguageToken, shape: SpawnArgShape): string | undefined {
 	const first = readLiteralNode(argsText, 0, language);
 	if (first.kind === "list") {
@@ -909,18 +928,25 @@ function commandFromArguments(argsText: string, language: EvalLanguageToken, sha
 		return joinArgv([first.value, ...rest]);
 	}
 
-	// variadic: every remaining argument must be a plain string, or the argv is
-	// only partly known and the site is opaque.
+	// variadic: the argv is the run of leading string arguments. A trailing
+	// KEYWORD argument (`stdout=...`, `exception: true`) is an option, not argv,
+	// so the argv is still fully known and stopping there is correct. Any other
+	// non-string is part of the argv, and a partly-known argv is opaque.
 	const words = [first.value];
 	let i = skipSpace(argsText, first.end);
 	while (i < argsText.length) {
 		if (argsText[i] !== ",") return undefined;
+		if (looksLikeKeywordArgument(argsText, i + 1, language)) break;
 		const next = readLiteralNode(argsText, i + 1, language);
 		if (next.kind !== "string" || next.interpolated) return undefined;
 		words.push(next.value);
 		i = skipSpace(argsText, next.end);
 	}
-	return joinArgv(words);
+	// os.execl and the spawnl family require the program name twice by API
+	// contract, so the repeat is noise in the command shown to the human.
+	const deduped =
+		words.length >= 3 && words[1] === words[0].split("/").pop() ? [words[0], ...words.slice(2)] : words;
+	return joinArgv(deduped);
 }
 
 /**
@@ -978,6 +1004,9 @@ const PY_OS_MEMBERS: Record<string, SpawnArgShape> = {
 	spawnl: "variadic",
 	spawnle: "variadic",
 	spawnlp: "variadic",
+	spawnlpe: "variadic",
+	posix_spawn: "argvPair",
+	posix_spawnp: "argvPair",
 };
 
 const CHILD_PROCESS_MEMBERS: Record<string, SpawnArgShape> = {
@@ -1048,7 +1077,13 @@ function pythonCallees(code: string): Map<string, SpawnArgShape> {
 	// `from subprocess import run, Popen as P` binds bare names.
 	for (const m of matchAll(code, /\bfrom\s+(subprocess|os)\s+import\s+([^\n#]+)/gu)) {
 		const members = m[1] === "subprocess" ? PY_SUBPROCESS_MEMBERS : PY_OS_MEMBERS;
-		for (const { imported, local } of destructuredNames(m[2].replace(/[()]/gu, ""))) {
+		const list = m[2].replace(/[()]/gu, "");
+		// A star import binds every name, including the spawns.
+		if (/(?:^|[\s,])\*(?:$|[\s,])/u.test(list)) {
+			for (const [member, shape] of Object.entries(members)) callees.set(member, shape);
+			continue;
+		}
+		for (const { imported, local } of destructuredNames(list)) {
 			const shape = members[imported];
 			if (shape) callees.set(local, shape);
 		}
@@ -1132,6 +1167,46 @@ function commandLiteralSites(code: string, language: EvalLanguageToken): EvalSpa
 	return sites;
 }
 
+/**
+ * Skip a JavaScript regex literal at `start`, returning the index after its
+ * closing `/`, or -1 when this `/` does not open one. A regex literal holds
+ * quote characters that are NOT string delimiters (`split(/["']/)`), and
+ * reading one as a string blanked everything up to the next quote in the cell,
+ * hiding every spawn in between.
+ */
+function skipRegexLiteral(text: string, start: number): number {
+	// `//` and `/*` are comments, handled by the caller.
+	if (text[start + 1] === "/" || text[start + 1] === "*") return -1;
+	let inClass = false;
+	let i = start + 1;
+	while (i < text.length) {
+		const ch = text[i];
+		if (ch === "\\") {
+			i += 2;
+			continue;
+		}
+		// A regex literal does not span lines.
+		if (ch === "\n") return -1;
+		if (ch === "[") inClass = true;
+		else if (ch === "]") inClass = false;
+		else if (ch === "/" && !inClass) return i + 1;
+		i += 1;
+	}
+	return -1;
+}
+
+/**
+ * Can a `/` here open a regex literal rather than divide? A regex may follow an
+ * operator, an opening bracket, or a statement boundary, never a value.
+ */
+function regexLiteralAllowed(text: string, start: number): boolean {
+	for (let j = start - 1; j >= 0; j -= 1) {
+		if (/\s/u.test(text[j])) continue;
+		return "(,=:[!&|?{};+-*%~^<>".includes(text[j]);
+	}
+	return true;
+}
+
 /** Quote characters that open a string literal in each dialect. */
 function quoteChars(language: EvalLanguageToken): string[] {
 	if (language === "py") return ["'", '"'];
@@ -1159,7 +1234,13 @@ function maskComments(code: string, language: EvalLanguageToken): string {
 	while (i < code.length) {
 		if (quotes.includes(code[i])) {
 			const end = skipQuoted(code, i);
-			if (end === -1) break;
+			// Not a string after all: step over this character rather than
+			// giving up on the remainder, which would leave later comments
+			// unmasked for the rest of the cell.
+			if (end === -1) {
+				i += 1;
+				continue;
+			}
 			i = end;
 			continue;
 		}
@@ -1177,6 +1258,13 @@ function maskComments(code: string, language: EvalLanguageToken): string {
 			i = stop;
 			continue;
 		}
+		if (language === "js" && code[i] === "/" && regexLiteralAllowed(code, i)) {
+			const end = skipRegexLiteral(code, i);
+			if (end !== -1) {
+				i = end;
+				continue;
+			}
+		}
 		i += 1;
 	}
 	return out.join("");
@@ -1190,12 +1278,26 @@ function maskComments(code: string, language: EvalLanguageToken): string {
  */
 function maskStringInteriors(code: string, language: EvalLanguageToken): string {
 	const out = code.split("");
-	const quotes = quoteChars(language);
+	// Backticks are excluded on purpose. In Ruby and Julia a backtick literal IS
+	// a command and blanking it would erase what the backtick pass must read; in
+	// JS a `$`-tagged template is the same. A backtick inside an ordinary string
+	// is still blanked, because the enclosing quote is masked.
+	const quotes = quoteChars(language).filter(quote => quote !== "`");
 	let i = 0;
 	while (i < code.length) {
+		if (language === "js" && code[i] === "/" && regexLiteralAllowed(code, i)) {
+			const end = skipRegexLiteral(code, i);
+			if (end !== -1) {
+				i = end;
+				continue;
+			}
+		}
 		if (quotes.includes(code[i])) {
 			const end = skipQuoted(code, i);
-			if (end === -1) break;
+			if (end === -1) {
+				i += 1;
+				continue;
+			}
 			for (let j = i + 1; j < end - 1; j += 1) if (out[j] !== "\n") out[j] = " ";
 			i = end;
 			continue;
@@ -1257,6 +1359,40 @@ function rubyParenlessSites(code: string, scan: string): EvalSpawnSite[] {
 }
 
 /**
+ * `const run = require("child_process").execSync`, `r = cp.execSync`, and
+ * `run = subprocess.run` bind a spawn to a plain variable. Neither the import
+ * scan nor the member scan sees the later `run(...)`, and none of these is
+ * obfuscation: the first and last are ordinary code.
+ */
+function aliasedCallees(code: string, callees: Map<string, SpawnArgShape>): Map<string, SpawnArgShape> {
+	const added = new Map<string, SpawnArgShape>();
+	const assignment = (rhs: string): RegExp =>
+		new RegExp(
+			String.raw`(?:^|[^\w$.])(?:(?:const|let|var)\s+)?([A-Za-z_$][\w$]*)\s*=\s*${rhs}`,
+			"gu",
+		);
+	// Longest name first, so `cp.execSync` claims an assignment before a bare
+	// `execSync` that is a suffix of it.
+	for (const [name, shape] of [...callees.entries()].sort((a, b) => b[0].length - a[0].length)) {
+		for (const m of matchAll(code, assignment(String.raw`${escapeRegExp(name)}\s*(?:[;\n]|$)`))) {
+			if (!callees.has(m[1])) added.set(m[1], shape);
+		}
+	}
+	// The inline require chain has no bound name to alias from.
+	const chain = String.raw`(?:require|import)\(\s*${CHILD_PROCESS_MODULE}\s*\)\s*\)?\s*\.\s*([A-Za-z_$][\w$]*)`;
+	for (const m of matchAll(code, assignment(chain))) {
+		const shape = CHILD_PROCESS_MEMBERS[m[2]];
+		if (shape && !callees.has(m[1])) added.set(m[1], shape);
+	}
+	// `const execAsync = promisify(exec)` — the wrapper spawns when called.
+	for (const m of matchAll(code, assignment(String.raw`promisify\(\s*([A-Za-z_$][\w$.]*)\s*\)`))) {
+		const shape = callees.get(m[2]) ?? CHILD_PROCESS_MEMBERS[m[2].split(".").pop() ?? ""];
+		if (shape && !callees.has(m[1])) added.set(m[1], shape);
+	}
+	return added;
+}
+
+/**
  * Every spawn the submitted code performs, as a command string where the
  * source spells one out and as an opaque site where it does not. An empty
  * result means the cell starts no subprocess this reader can see, which is the
@@ -1272,7 +1408,9 @@ export function extractEvalSpawnSites(code: string, language: EvalLanguageToken)
 	// Import scanning needs string CONTENTS (the module name lives in a string),
 	// so it reads the comment-masked copy. Call sites are located in `scan`,
 	// where a callee spelled inside a string cannot match.
-	for (const [name, shape] of spawnCallees(literalScan, language)) {
+	const callees = spawnCallees(literalScan, language);
+	for (const [name, shape] of aliasedCallees(literalScan, callees)) callees.set(name, shape);
+	for (const [name, shape] of callees) {
 		// A leading word/dot boundary keeps `mysubprocess.run` and `obj.system`
 		// from matching a bare or aliased callee name.
 		const calleeRe = new RegExp(String.raw`(?:^|[^\w$.])${escapeRegExp(name)}\s*\(`, "gu");
@@ -1281,9 +1419,21 @@ export function extractEvalSpawnSites(code: string, language: EvalLanguageToken)
 			sites.push(siteAt(code, name, shape, openParen, language));
 		}
 	}
-	if (language === "js") sites.push(...inlineChildProcessSites(code, literalScan));
+	if (language === "js") {
+		sites.push(...inlineChildProcessSites(code, literalScan));
+		// `promisify(exec)("cmd")` calls the wrapped spawn directly.
+		for (const m of matchAll(scan, /\bpromisify\s*\(\s*([A-Za-z_$][\w$.]*)\s*\)\s*\(/gu)) {
+			const shape = callees.get(m[1]) ?? CHILD_PROCESS_MEMBERS[m[1].split(".").pop() ?? ""];
+			if (shape === undefined) continue;
+			sites.push(siteAt(code, `promisify(${m[1]})`, shape, (m.index ?? 0) + m[0].length - 1, language));
+		}
+	}
 	if (language === "rb") sites.push(...rubyParenlessSites(code, scan));
-	sites.push(...commandLiteralSites(literalScan, language));
+	// `scan`, not `literalScan`: a backtick inside an ordinary Ruby string is
+	// blanked there, so it stops registering as a spawn for a cell that spawns
+	// nothing. Real backtick commands survive because backticks are excluded
+	// from the string mask.
+	sites.push(...commandLiteralSites(scan, language));
 	return sites;
 }
 
@@ -1584,7 +1734,7 @@ export default function (pi: ExtensionAPI) {
 		// The host's language field is optional and an absent one runs the JS
 		// backend (eval.ts), so an unreadable value reads as js rather than
 		// skipping the gate.
-		const language = normalizeEvalLanguage(event.input?.language) ?? "js";
+		const language = normalizeEvalLanguage(event.input?.language);
 		const config = readClassifierConfig();
 		syncConfigSignature(config);
 
@@ -1636,6 +1786,23 @@ export default function (pi: ExtensionAPI) {
 					});
 					continue;
 				}
+				// Native precedence is deny > CRITICAL > allow > prompt
+				// (tools/bash.ts:557). A command matching both a user `deny` rule
+				// and a critical pattern must be BLOCKED, not offered as an
+				// approvable critical-pattern dialog: the user already decided it
+				// never runs. So the rule lookup comes first here.
+				const rule = policy.rules.find(candidate => bashApprovalRuleMatches(command, candidate));
+				if (rule?.approval === "deny") {
+					plans.push({ act: "block", reason: `eval spawn blocked by bash pattern: ${rule.match}` });
+					continue;
+				}
+				// `tools.approval.bash: deny` means bash commands do not run. An
+				// eval spawn IS a bash command, which is this feature's premise,
+				// so honor it here rather than letting eval be the way around it.
+				if (!rule && policy.bashPolicy === "deny") {
+					plans.push({ act: "block", reason: "eval spawn blocked by user policy: tools.approval.bash: deny" });
+					continue;
+				}
 				if (CRITICAL_BASH_PATTERNS.some(pattern => pattern.test(command))) {
 					plans.push({
 						act: "ask",
@@ -1644,11 +1811,6 @@ export default function (pi: ExtensionAPI) {
 						headline: "critical pattern",
 						reason: "matches a built-in dangerous-command pattern",
 					});
-					continue;
-				}
-				const rule = policy.rules.find(candidate => bashApprovalRuleMatches(command, candidate));
-				if (rule?.approval === "deny") {
-					plans.push({ act: "block", reason: `eval spawn blocked by bash pattern: ${rule.match}` });
 					continue;
 				}
 				if (rule?.approval === "prompt") {
