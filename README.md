@@ -57,7 +57,7 @@ Uninstall: `omp plugin uninstall omp-bash-classifier`.
 
 The two ways to turn the plugin off differ in when they take effect. `/classifier enabled false` applies to the very next command, because the config file is read on every `bash` call. `omp plugin disable` does not: OMP binds a plugin's interceptors when a session begins and does not unbind them when `omp-plugins.lock.json` changes, so a session that was already running keeps classifying until you restart it.
 
-The plugin notices when this has happened to you and says so once per session, because the symptom otherwise reads as the plugin ignoring its own setting. It cannot act on the lockfile itself: a project-scope lockfile may legitimately re-enable a plugin the user-scope one disables, and deciding that correctly means reproducing OMP's scope resolution inside the plugin.
+The plugin notices `omp plugin disable` specifically, and says so once per session, because the symptom otherwise reads as the plugin ignoring its own setting. It cannot act on the lockfile itself: a project-scope lockfile may legitimately re-enable a plugin the user-scope one disables, and deciding that correctly means reproducing OMP's scope resolution inside the plugin. `omp plugin uninstall` is not covered: it deletes the lockfile entry rather than setting `enabled: false`, and an absent entry is indistinguishable from the normal state of a project-scoped or dev-linked install, so warning on it would fire constantly for people who are not affected.
 
 ## Model used
 

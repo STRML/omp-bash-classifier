@@ -374,15 +374,20 @@ const PLUGIN_NAME = "omp-bash-classifier";
  * not an exception to it: `settings` fails for its own reason, not because
  * host imports are duplicated.
  *
- * `OMP_BASH_CLASSIFIER_TEST_LOCKFILE` is TEST-ONLY and deliberately not offered
- * as a user knob, unlike `OMP_BASH_CLASSIFIER_CONFIG`. That one redirects the
- * plugin's own file, where the plugin is the sole reader. This redirects a read
- * of a HOST file the plugin only observes, so a user setting it could only
- * produce the failure this function exists to prevent: a notice naming a path
- * the session never consulted.
+ * `OMP_BASH_CLASSIFIER_TEST_LOCKFILE` is TEST-ONLY, and now enforced as such
+ * rather than merely documented: it is honored only under `NODE_ENV=test`,
+ * which bun sets for `bun test`. Documented-only was not enough, because a
+ * stray export in a real session redirects the read and produces the exact
+ * failure this function exists to prevent — a notice naming a path the session
+ * never consulted. Contrast `OMP_BASH_CLASSIFIER_CONFIG`, a legitimate user
+ * knob: that redirects the plugin's OWN file, where the plugin is the sole
+ * reader. This redirects a read of a HOST file the plugin only observes.
  */
 function pluginLockfilePath(): string {
-	return process.env.OMP_BASH_CLASSIFIER_TEST_LOCKFILE ?? getPluginsLockfile();
+	if (process.env.NODE_ENV === "test" && process.env.OMP_BASH_CLASSIFIER_TEST_LOCKFILE) {
+		return process.env.OMP_BASH_CLASSIFIER_TEST_LOCKFILE;
+	}
+	return getPluginsLockfile();
 }
 
 interface LockfileCache {
@@ -968,13 +973,16 @@ export default function (pi: ExtensionAPI) {
 		// call it rode in on.
 		try {
 			const sessionId = ctx.sessionManager.getSessionId();
-			// Order matters. With `has()` first, two concurrent handlers both
-			// passed the guard before either reached `add()` and the session got
-			// two toasts — bash is `concurrency: "shared"` for non-pty calls, so
-			// one turn with two bash calls interleaves at this await. Awaiting
-			// first leaves has/add adjacent with no await between them, which is
-			// atomic on a single-threaded loop.
-			if ((await lockfileDisablesPlugin()) && !staleDisableWarned.has(sessionId)) {
+			// Checked on BOTH sides of the await, for two different reasons.
+			// Before: an already-warned session must not keep paying a stat on
+			// every bash call to re-deliver a notice it already got. After: with
+			// only the leading check, two concurrent handlers both passed it
+			// before either reached `add()` and the session got two toasts —
+			// non-pty bash is `concurrency: "shared"`, so one turn with two bash
+			// calls interleaves right here. The trailing has/add pair has no
+			// await between its halves, which is atomic on a single-threaded
+			// loop.
+			if (!staleDisableWarned.has(sessionId) && (await lockfileDisablesPlugin()) && !staleDisableWarned.has(sessionId)) {
 				staleDisableWarned.add(sessionId);
 				// Hedged deliberately. This reads the USER-scope lockfile only,
 				// and a project-scope lockfile shadows it (the loader's
