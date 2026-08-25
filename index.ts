@@ -102,17 +102,33 @@ interface BashApprovalPatternRule {
 // ---------------------------------------------------------------------------
 
 /**
- * C0 controls and DEL, minus tab and newline. The old dialog body ran the
- * command through JSON.stringify, which incidentally escaped these; rendering
- * raw does not. A command carrying `\x1b[2J\x1b[H`, an SGR run, or a bare
- * carriage return can repaint or overwrite the approval dialog while still
- * executing in full, so they are shown as escapes rather than sent to the
- * terminal.
+ * Characters that must never reach the dialog raw.
+ *
+ * C0 and DEL: the old body ran the command through JSON.stringify, which
+ * incidentally escaped these; rendering raw does not. `\x1b[2J\x1b[H`, an SGR
+ * run, or a bare carriage return can repaint or overwrite the approval dialog
+ * while the command still executes in full.
+ *
+ * U+0085, U+2028, U+2029: the Markdown lexer treats these as line breaks but
+ * `verbatim` split on "\n" only, so a command containing one escaped the code
+ * block. The half before it disappeared from the token stream entirely and the
+ * half after rendered as live Markdown. `rm -rf ~/data\u2028git status` showed
+ * the user `git status` and ran the deletion. Not a regression (JSON.stringify
+ * left them raw too) but this is where the helper and its invariant live.
+ *
+ * Bidi overrides and zero-width characters: pi-tui does not strip them, so an
+ * RLO can display a command in an order it does not execute in.
  */
-const DIALOG_CONTROL_CHARS = /[\u0000-\u0008\u000B-\u001F\u007F]/gu;
+const DIALOG_UNSAFE_CHARS =
+	/[\u0000-\u0008\u000B-\u001F\u007F\u0085\u200B-\u200F\u202A-\u202E\u2028\u2029\u2060-\u2064\u2066-\u2069\uFEFF]/gu;
 
 function escapeControlChars(text: string): string {
-	return text.replace(DIALOG_CONTROL_CHARS, ch => `\\x${(ch.codePointAt(0) ?? 0).toString(16).padStart(2, "0")}`);
+	return text.replace(DIALOG_UNSAFE_CHARS, ch => {
+		const code = ch.codePointAt(0) ?? 0;
+		return code > 0xff
+			? `\\u${code.toString(16).padStart(4, "0")}`
+			: `\\x${code.toString(16).padStart(2, "0")}`;
+	});
 }
 
 /** Four-space indent, so Markdown renders the span verbatim. */
@@ -125,11 +141,13 @@ function verbatim(text: string): string {
 
 /** Trailing-slash-insensitive directory comparison. Root stays "/". */
 function samePath(a: string, b: string | undefined): boolean {
+	// No .trim(): "/workspace " is a real and different directory on macOS and
+	// Linux, and trimming it made the dialog imply the command runs in the
+	// session cwd when it does not. Trailing-slash insensitivity only.
 	const strip = (value: string | undefined): string => {
 		if (!value) return "";
-		const trimmed = value.trim();
-		if (trimmed.length > 1 && trimmed.endsWith("/")) return trimmed.slice(0, -1);
-		return trimmed;
+		if (value.length > 1 && value.endsWith("/")) return value.slice(0, -1);
+		return value;
 	};
 	return strip(a) === strip(b);
 }

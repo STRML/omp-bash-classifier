@@ -78,6 +78,35 @@ describe("body", () => {
 		expect(dialog).toContain("\\x1b[2J");
 	});
 
+	test("unicode line separators cannot split the command out of the block", async () => {
+		// U+2028 is a line break to the Markdown lexer but not to String.split("\n"),
+		// so the half before it vanished from the dialog and the half after
+		// rendered live. Reported as: `rm -rf ~/data\u2028git status` displays
+		// only `git status`.
+		const { dialog } = await prompt("rm -rf ~/data\u2028git status --short");
+		expect(dialog).not.toContain("\u2028");
+		expect(dialog).toContain("\\u2028");
+		const lines = dialog.split("\n");
+		expect(lines[1]).toBe("");
+		expect(lines[2].startsWith("    rm -rf ~/data")).toBe(true);
+		// The destructive half is still on screen.
+		expect(lines[2]).toContain("rm -rf ~/data");
+	});
+
+	for (const [name, ch] of [["U+0085 NEL", "\u0085"], ["U+2029 paragraph separator", "\u2029"]] as const) {
+		test(`${name} is escaped too`, async () => {
+			const { dialog } = await prompt(`echo a${ch}rm -rf ~/data`);
+			expect(dialog).not.toContain(ch);
+			expect(dialog).toContain("rm -rf ~/data");
+		});
+	}
+
+	test("a bidi override cannot reorder the displayed command", async () => {
+		const { dialog } = await prompt("echo \u202Egnuj\u202C");
+		expect(dialog).not.toContain("\u202E");
+		expect(dialog).toContain("\\u202e");
+	});
+
 	test("a bare carriage return cannot overwrite the line", async () => {
 		const { dialog } = await prompt("echo safe\rrm -rf ~/data");
 		expect(dialog).not.toContain("\r");
@@ -117,6 +146,13 @@ describe("details are omitted at their defaults", () => {
 
 		const different = await prompt("git log", { cwd: "/elsewhere" }, "/workspace");
 		expect(different.body).toContain("working directory: /elsewhere");
+	});
+
+	test("a trailing space IS a different directory and must be shown", async () => {
+		// Trimming made "/workspace " compare equal to "/workspace", so the dialog
+		// implied the command ran in the session cwd when it did not.
+		const spaced = await prompt("rm -rf *", { cwd: "/workspace " }, "/workspace");
+		expect(spaced.body).toContain("working directory: /workspace ");
 	});
 
 	test("a trailing slash is not a different directory", async () => {
