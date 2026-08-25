@@ -67,6 +67,8 @@ type Verdict = "SAFE" | "UNSAFE" | "UNSURE" | "PARSE_ERROR";
 interface Judgement {
 	verdict: Verdict;
 	reason: string;
+	/** First 200 chars of the raw model reply, for diagnostics on PARSE_ERROR. */
+	rawReply?: string;
 }
 
 /** Per-session cache: sessionId -> `${cwd}\0${env}\0${pty}\0${command}` -> judgement. */
@@ -399,11 +401,22 @@ VERDICT is exactly SAFE, UNSAFE, or UNSURE.`;
  */
 function parseJudgement(reply: string): Judgement {
 	const firstLine = reply.trim().split(/\r?\n/u, 1)[0] ?? "";
-	const match = /^(SAFE|UNSAFE|UNSURE)\b[\s|:.,-]*(.*)$/iu.exec(firstLine.trim());
-	if (!match) return { verdict: "PARSE_ERROR", reason: "classifier reply was not a verdict" };
+	// Strip leading FORMATTING characters only (markdown emphasis, bullets,
+	// quotes, spaces): `**SAFE**` is a verdict, not an evasion. Anything that
+	// keeps a letter/digit before the token still fails the anchor.
+	const stripped = firstLine.replace(/^[^\w\r\n]+/u, "");
+	const match = /^(SAFE|UNSAFE|UNSURE)\b[\s|:.,-]*(.*)$/iu.exec(stripped.trim());
+	if (!match) {
+		return {
+			verdict: "PARSE_ERROR",
+			reason: "classifier reply was not a verdict",
+			rawReply: truncated(reply.replace(/\s+/gu, " ").trim(), 200),
+		};
+	}
 	return {
 		verdict: match[1].toUpperCase() as Verdict,
 		reason: truncated(match[2].trim().replace(/\s+/gu, " "), 160),
+		rawReply: truncated(reply.replace(/\s+/gu, " ").trim(), 200),
 	};
 }
 
@@ -551,11 +564,24 @@ export function matchModerateRiskTokens(command: string): string[] {
 	}
 
 	// Command substitution is outside the tokenizer's scope, so a risk verb
-	// spelled ANYWHERE in a command that contains $( or a backtick cannot be
-	// cleared by position: `echo "$(rm important)"` would otherwise auto-run.
-	if (/\$\(|`/u.test(command)) {
-		for (const token of MODERATE_RISK_TOKENS) {
-			if (new RegExp(`\\b${token}\\b`, "iu").test(normalized)) flags.add(token);
+	// inside a substitution cannot be cleared by position: `echo "$(rm
+	// important)"` would otherwise auto-run. Narrow to what the substitution
+	// actually CONTAINS — collect $(...) spans (plus an unterminated tail) and
+	// backtick spans, and flag risk verbs only inside those spans. Text outside
+	// (`grep $(git rev-parse HEAD) file`) stays on the graceful path.
+	if (/\$\(|`/u.test(normalized)) {
+		const spans: string[] = [];
+		for (const m of normalized.matchAll(/\$\(([^)]*)\)/gu)) spans.push(m[1]);
+		const dollarTail = /\$\(([^)]*)$/u.exec(normalized);
+		if (dollarTail) spans.push(dollarTail[1]);
+		for (const m of normalized.matchAll(/`([^`]*)`/gu)) spans.push(m[1]);
+		const backtickTail = /`([^`]*)$/u.exec(normalized);
+		if (backtickTail) spans.push(backtickTail[1]);
+		for (const span of spans) {
+			for (const token of MODERATE_RISK_TOKENS) {
+				if (new RegExp(`\\b${token}\\b`, "iu").test(span)) flags.add(token);
+			}
+			if (/^mkfs\b|^mkfs\./iu.test(span.trim())) flags.add("mkfs");
 		}
 	}
 	return [...flags].sort();
@@ -691,17 +717,21 @@ export default function (pi: ExtensionAPI) {
 		}
 	};
 
-	const classify = async (
-		ctx: ExtensionContext,
-		command: string,
-		cwd: string,
-	): Promise<Judgement> => {
+	const resolveClassifierModel = (ctx: ExtensionContext): Model | undefined => {
 		const config = readClassifierConfig();
 		// Explicit config.model wins; otherwise `@tiny` (the role core reserves
 		// for online classifier work, with its own fallback chain), then the
 		// session model.
-		const model: Model | undefined =
-			ctx.models?.resolve(config.model) ?? ctx.models?.resolve("@tiny") ?? ctx.model;
+		return ctx.models?.resolve(config.model) ?? ctx.models?.resolve("@tiny") ?? ctx.model;
+	};
+
+	const classify = async (
+		ctx: ExtensionContext,
+		command: string,
+		cwd: string,
+		model: Model | undefined,
+		timeoutMs: number,
+	): Promise<Judgement> => {
 		if (!model) return { verdict: "UNSURE", reason: "no model available to classify" };
 		const sessionId = ctx.sessionManager.getSessionId();
 		// Per-call random delimiter: every model-controlled field is encoded as
@@ -731,15 +761,25 @@ export default function (pi: ExtensionAPI) {
 				// inside that budget so the permission prompt still gets a chance.
 				// (`ctx.ui` dialogs pause that budget — runner.ts:147-154 — so the
 				// human is not on a clock.)
-				signal: AbortSignal.timeout(config.timeoutMs),
+				signal: AbortSignal.timeout(timeoutMs),
 			},
 		);
-		return parseJudgement(
-			msg.content
-				.filter((c): c is TextContent => c.type === "text")
-				.map(c => c.text)
-				.join(" "),
-		);
+		const text = msg.content
+			.filter((c): c is TextContent => c.type === "text")
+			.map(c => c.text)
+			.join(" ")
+			.trim();
+		// An exhausted/out-of-credit provider can resolve with NO text instead
+		// of throwing; surface that distinctly so it is not mistaken for a
+		// malformed verdict about the command.
+		if (text === "") {
+			return {
+				verdict: "PARSE_ERROR",
+				reason: "classifier model returned no content — check the model's provider credits/quota",
+				rawReply: "(empty reply)",
+			};
+		}
+		return parseJudgement(text);
 	};
 
 	/**
@@ -851,7 +891,15 @@ export default function (pi: ExtensionAPI) {
 			const scoped = sessionCache(ctx.sessionManager.getSessionId());
 			// Every execution-affecting input is part of the identity. JSON avoids
 			// collisions when a value contains whichever delimiter text we choose.
-			const cacheKey = JSON.stringify([cwd, env.key, pty, timeout, async, command]);
+			// The resolved classifier model is part of the identity: a session
+			// whose @tiny role or live model changes must not reuse a SAFE that
+			// a different model produced. Resolution is per-session state, so
+			// this lives in the per-session key rather than the global
+			// config-signature clear.
+			const resolvedModel = resolveClassifierModel(ctx);
+			const cacheKey = JSON.stringify([
+				resolvedModel?.id ?? "(none)", cwd, env.key, pty, timeout, async, command,
+			]);
 
 			// Native precedence is deny > CRITICAL > allow > prompt
 			// (tools/bash.ts:557-577): a critical hit OUTRANKS an allow or prompt
@@ -904,14 +952,22 @@ export default function (pi: ExtensionAPI) {
 			if (!config.enabled) return;
 
 			const cached = scoped.get(cacheKey);
-			const judgement = cached ?? (await classify(ctx, command, cwd).catch(() => undefined));
+			let classifyError = "";
+			const judgement = cached ?? (await classify(ctx, command, cwd, resolvedModel, config.timeoutMs).catch((err: unknown) => {
+				// Provider errors (quota exhausted, auth, HTTP failures) previously
+				// vanished into an opaque "unavailable". Keep the message so the
+				// permission dialog says WHY.
+				classifyError = err instanceof Error ? err.message : String(err);
+				pi.logger.warn(`bash-classifier: classify failed: ${classifyError}`);
+				return undefined;
+			}));
 			if (!judgement) {
 				// Classifier unavailable/timed out. Ask rather than silently run.
 				return await requestPermission(
 					ctx,
 					target,
 					"unclassified",
-					"classifier unavailable",
+					classifyError ? `classifier unavailable: ${truncated(classifyError, 160)}` : "classifier unavailable",
 				);
 			}
 			// A malformed reply is a transient failure, not a policy: do NOT
@@ -942,6 +998,11 @@ export default function (pi: ExtensionAPI) {
 					: verdict === "PARSE_ERROR"
 						? "classifier parse error"
 						: "classifier unsure";
+			if (verdict === "PARSE_ERROR") {
+				// The raw reply is the only way to tell a provider problem from a
+				// model-formatting problem; the dialog only shows the summary.
+				pi.logger.warn(`bash-classifier: unparseable reply: ${judgement.rawReply ?? "(none)"}`);
+			}
 			return await requestPermission(ctx, target, detail, judgement.reason);
 		} catch (err) {
 			// Unexpected plugin error: fail closed rather than wave the command
