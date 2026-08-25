@@ -113,15 +113,24 @@ describe("allow rules", () => {
 		expect(modelCalls.length).toBe(0);
 	});
 
-	test("a non-literal cd target is NOT stripped: cd $(evil) && git push still classifies", async () => {
+	test("a non-literal cd target is NOT stripped: cd $(evil) && git push --force still classifies", async () => {
 		await loadPlugin(makeSettings([{ match: "git push*", approval: "allow" }]));
 		// No strip -> no allow match -> classified (1 model call) -> SAFE
-		// verdict but the static git-push flag still forces a request, which
-		// fails closed headless. The important assertions: the classifier RAN
-		// and the command did NOT silently run.
-		const result = await gate("cd $(evil) && git push origin main");
+		// verdict but the static FORCE-push flag still forces a request,
+		// which fails closed headless. Assertions: classifier RAN, nothing
+		// silently ran.
+		const result = await gate("cd $(evil) && git push --force origin main");
 		expect(modelCalls.length).toBe(1);
 		expect(result).not.toBe("ALLOWED");
+	});
+
+	test("plain compound push classifies SAFE and runs with no flag prompt", async () => {
+		await loadPlugin(makeSettings([{ match: "git push*", approval: "allow" }]));
+		// `make` matches no rule -> whole line classifies; SAFE verdict and a
+		// NON-force push add no flag -> ALLOWED. This is the exact shape from
+		// the reported dialogs (compound ending in a routine push).
+		expect(await gate("make build && git push origin main")).toBe("ALLOWED");
+		expect(modelCalls.length).toBe(1);
 	});
 
 	test("compound where EVERY segment matches an allow rule runs with no model call", async () => {

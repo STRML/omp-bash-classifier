@@ -1218,8 +1218,18 @@ export function matchModerateRiskTokens(command: string): string[] {
 					continue;
 				}
 				if (sub === "") {
-					if (w === "push" || w === "reset" || w === "clean") {
+					if (w === "reset" || w === "clean") {
 						flags.add(`git ${w}`);
+					} else if (w === "push") {
+						// Plain pushes are routine developer work (the host config
+						// allows them wholesale); flag only genuine history
+						// rewrites so a steered-SAFE verdict cannot release a
+						// compound force-push silently. The bash.patterns force
+						// prompts bail on shell control, so this overlay is the
+						// only backstop for force-pushes inside compounds.
+						if (words.some(x => x === "-f" || x.startsWith("--force"))) {
+							flags.add("git push --force");
+						}
 					} else if (w === "checkout" && words.slice(k).includes("--")) {
 						flags.add("git checkout --");
 					} else if (w === "commit") {
