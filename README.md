@@ -43,12 +43,14 @@ What it reads, per backend:
 | `rb` | `` `…` ``, `%x{…}`, `system`, `exec`, `spawn`, `IO.popen`, `Open3.*` |
 | `jl` | `` `…` `` command literals |
 
-An argv list is reconstructed into a shell command with quoting preserved, so `subprocess.run(["bash", "-c", "rm -rf x"])` is judged as `bash -c 'rm -rf x'` rather than as the word `bash`.
+An argv list is reconstructed into a shell command with quoting preserved, so `subprocess.run(["bash", "-c", "rm -rf x"])` is judged as `bash -c 'rm -rf x'` rather than as the word `bash`. A lone argument is passed through unquoted, because a single argument is already a shell command line and quoting it would hide its verb from the destructive-token check.
+
+Comments and string interiors are masked before the scan, so a commented-out spawn or a callee named inside a string does not raise a dialog for a cell that spawns nothing.
 
 Two rules differ from the bash gate, both because no native per-command gate stands behind this one:
 
 - A `deny` or `prompt` rule in `bash.patterns` is enforced here rather than left to the host. The host would run the spawn without consulting it.
-- A spawn whose command is assembled at runtime (a variable, an f-string, an interpolated template) raises a permission request instead of passing. Its text is not what executes, and building the command at runtime is the shape an evasion takes.
+- A spawn whose command is not fully spelled out raises a permission request instead of passing. That covers a variable, an f-string, an interpolated template, a concatenation or `.format()` where the literal is one fragment of a larger expression, and an argv that is not a literal list (`spawn("/bin/sh", userArgs)`). A fragment is never read as the whole command, because the fragment is usually the harmless half.
 
 This is a source reader, not a sandbox. It sees a command that the code spells out. Code written to hide a spawn from a source reader can hide from this: `getattr(os, "sys" + "tem")(cmd)` reads as nothing at all. Closing that needs interception inside the eval kernels, which is a change to OMP rather than to a plugin. The gap this closes is the one that shows up in practice, where an agent blocked at bash rewrites the same command in Python and runs it.
 
