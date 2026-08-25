@@ -970,9 +970,12 @@ export default function (pi: ExtensionAPI) {
 			classifierConfigSignature = configSignature;
 		}
 
-		// Only worth saying while the classifier is actually still running. With
-		// `/classifier enabled false` already set there is no symptom to explain,
-		// and the notice would advise a fix the user has taken.
+		// Fires whenever the lockfile says disabled, INCLUDING when
+		// `/classifier enabled false` is already set — that flag turns off model
+		// classification only, and the checks above it keep gating, so there is
+		// still a symptom to explain. The remedy sentence changes instead; see
+		// below. Do not add a `config.enabled` guard here: it would delete a
+		// supported case.
 		//
 		// The whole block is guarded because it is a diagnostic and must never
 		// decide the command. The handler's own try/catch does not open until
@@ -991,7 +994,10 @@ export default function (pi: ExtensionAPI) {
 			// await between its halves, which is atomic on a single-threaded
 			// loop.
 			if (!staleDisableWarned.has(sessionId) && (await lockfileDisablesPlugin()) && !staleDisableWarned.has(sessionId)) {
-				staleDisableWarned.add(sessionId);
+				// Claimed only AFTER delivery. Marking first meant a throwing
+				// notify silently burned the session's one notice. The has/add
+				// pair still has no await between its halves, so the race guard
+				// stays atomic.
 				// Hedged deliberately. This reads the USER-scope lockfile only,
 				// and a project-scope lockfile shadows it (the loader's
 				// loadEnabledPlugins: "Project entries shadow user entries with
@@ -1016,6 +1022,7 @@ export default function (pi: ExtensionAPI) {
 				// requestPermission).
 				if (ctx.hasUI) ctx.ui.notify(notice, "warning");
 				else pi.logger.warn(`bash-classifier: ${notice}`);
+				staleDisableWarned.add(sessionId);
 			}
 		} catch {
 			// A diagnostic that cannot be delivered is not a reason to fail.
@@ -1205,7 +1212,14 @@ export default function (pi: ExtensionAPI) {
 	// flag. The warned flag deliberately does NOT follow the cache across the
 	// other boundaries — `session_before_switch` carries the OUTGOING session,
 	// so clearing it there re-arms the toast every time the user switches away
-	// and back, which is not "once per session". Only a shutdown ends one.
+	// and back, which is not "once per session".
+	//
+	// Be accurate about what the shutdown handler buys: the host emits
+	// session_shutdown from AgentSession#doDispose, which is process exit, and
+	// newSession() never disposes. So this delete reclaims nothing mid-process.
+	// What actually makes a new session warn again is that a new session mints a
+	// new id. The set grows one small entry per warned session for the life of
+	// the process, which is bounded by how many sessions one process opens.
 	pi.on("session_shutdown", (_event: unknown, ctx: ExtensionContext) => {
 		const sessionId = ctx.sessionManager.getSessionId();
 		cache.delete(sessionId);

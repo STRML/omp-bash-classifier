@@ -82,6 +82,26 @@ describe("notice fires when the lockfile disabled us after we bound", () => {
 		expect(notifyCalls(ctx)).toHaveLength(1);
 	});
 
+	test("a throwing notify does not burn the session's one notice", async () => {
+		writeLockfile(DISABLED);
+		const ctx = makeCtx({ sessionId: "throwing-ui", hasUI: true });
+		const ui = (ctx as unknown as { ui: { notify: (m: string, t?: string) => void } }).ui;
+		const real = ui.notify;
+		let thrown = false;
+		ui.notify = () => {
+			thrown = true;
+			throw new Error("ui gone");
+		};
+		await fire("tool_call", makeEvent("git status"), ctx);
+		expect(thrown).toBe(true);
+
+		// Marking the session warned before delivery meant this second call
+		// stayed silent forever.
+		ui.notify = real;
+		await fire("tool_call", makeEvent("ls -la"), ctx);
+		expect(notifyCalls(ctx)).toHaveLength(1);
+	});
+
 	test("a different session gets its own warning", async () => {
 		writeLockfile(DISABLED);
 		const first = makeCtx({ sessionId: "stale-3a", hasUI: true });
