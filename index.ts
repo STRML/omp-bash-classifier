@@ -1655,11 +1655,41 @@ export default function (pi: ExtensionAPI) {
 			// Strip a leading literal `cd <path> &&` before matching allow rules,
 			// mirroring native cwd extraction (bash.ts extracts it for cwd only).
 			// Fail-closed: extractLeadingCdTarget returns null for $(...), $var,
-			// unterminated quotes, or any non-`&&` join, so nothing non-literal
-			// is ever removed before the allow-rule match. `||`, not `??`: a
+			// unterminated quotes, or any non-`&&` join. `||`, not `??`: a
 			// degenerate empty rest must fall back to the full command.
 			const ruleCommand = extractLeadingCdTarget(command)?.rest || command;
-			const rule = policy.rules.find(candidate => bashApprovalRuleMatches(ruleCommand, candidate));
+
+			// Whole-command allow matching can never fire on a compound line:
+			// shell control bails every allow rule, so `git status && git push`
+			// always fell through to the classifier no matter how narrow the
+			// rules were. Resolve compounds per segment instead, with the same
+			// precedence the host applies to deny/prompt compounds: every
+			// segment must reach a decision; a deny/prompt on any segment wins;
+			// an allow on every segment runs silent; ANY undecided segment
+			// falls through to classification unchanged. Segments containing
+			// redirects, substitutions, or quotes-with-control never match an
+			// allow (control check first), so nothing smuggles past.
+			const segments = bashCommandSegments(ruleCommand);
+			let rule: BashApprovalPatternRule | undefined;
+			if (segments.length <= 1) {
+				rule = policy.rules.find(candidate => bashApprovalRuleMatches(ruleCommand, candidate));
+			} else {
+				const decisions = segments.map(segment =>
+					policy.rules.find(candidate =>
+						candidate.approval === "allow"
+							? !isBlanketPattern(candidate.match) &&
+								!hasBashApprovalShellControl(segment) &&
+								commandMatchesBashApprovalPattern(segment, candidate.match)
+							: commandSegmentMatchesBashApprovalPattern(segment, candidate.match),
+					),
+				);
+				if (decisions.every(decision => decision !== undefined)) {
+					rule = decisions.find(decision => decision!.approval !== "allow") ?? {
+						match: "(every compound segment matches an allow rule)",
+						approval: "allow",
+					};
+				}
+			}
 
 			// A deny rule is the one decision that outranks everything natively
 			// (tools/bash.ts:557) — the host blocks the call, nothing to add.

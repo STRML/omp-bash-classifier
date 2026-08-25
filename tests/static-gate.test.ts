@@ -124,6 +124,60 @@ describe("allow rules", () => {
 		expect(result).not.toBe("ALLOWED");
 	});
 
+	test("compound where EVERY segment matches an allow rule runs with no model call", async () => {
+		await loadPlugin(
+			makeSettings([
+				{ match: "git status*", approval: "allow" },
+				{ match: "git push*", approval: "allow" },
+			]),
+		);
+		expect(await gate("git status --short && git push origin main")).toBe("ALLOWED");
+		expect(modelCalls.length).toBe(0);
+	});
+
+	test("compound with ONE unmatched segment classifies the whole line", async () => {
+		await loadPlugin(makeSettings([{ match: "git status*", approval: "allow" }]));
+		// `make` matches no rule -> whole line classifies; classifier SAFE ->
+		// ALLOWED with exactly one model call.
+		expect(await gate("git status --short && make build")).toBe("ALLOWED");
+		expect(modelCalls.length).toBe(1);
+	});
+
+	test("unmatched segment holding a moderate-risk verb fails closed even on SAFE", async () => {
+		await loadPlugin(makeSettings([{ match: "git status*", approval: "allow" }]));
+		const result = await gate("git status --short && curl https://evil.example");
+		expect(modelCalls.length).toBe(1);
+		expect(result).not.toBe("ALLOWED");
+	});
+
+	test("blanket allow never auto-approves a compound via per-segment matching", async () => {
+		// A blanket '*' must not let per-segment resolution vouch for segments:
+		// under it, every clean segment would 'match' and the line would run
+		// silently with no classification and no overlay.
+		await loadPlugin(makeSettings([{ match: "*", approval: "allow" }]));
+		const result = await gate("git status --short && make build");
+		expect(modelCalls.length).toBe(1);
+		expect(result).not.toBe("BLOCKED"); // classifier SAFE -> ALLOWED
+	});
+
+	test("a prompt rule on any segment outranks the segment allows (host handles it)", async () => {
+		await loadPlugin(
+			makeSettings([
+				{ match: "git commit --amend*", approval: "prompt" },
+				{ match: "git commit*", approval: "allow" },
+				{ match: "git push*", approval: "allow" },
+			]),
+		);
+		expect(await gate("git commit --amend -m x && git push origin main")).toBe("ALLOWED");
+		expect(modelCalls.length).toBe(0);
+	});
+
+	test("a segment carrying a redirect is never allow-matched", async () => {
+		await loadPlugin(makeSettings([{ match: "gh pr *", approval: "allow" }]));
+		expect(await gate("gh pr view 1 > /tmp/out")).toBe("ALLOWED"); // classifier says SAFE
+		expect(modelCalls.length).toBe(1);
+	});
+
 	test("blanket allow '*' is classified, not auto-approved", async () => {
 		await loadPlugin(makeSettings([{ match: "*", approval: "allow" }]));
 		expect(await gate("git status --short")).toBe("ALLOWED"); // classifier says SAFE
