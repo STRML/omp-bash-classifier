@@ -178,6 +178,20 @@ describe("pipes are pipes; && and ; are not", () => {
 });
 
 describe("interpreters fed on stdin flag on their own", () => {
+	test("an interpreter name used as data is not an invocation", async () => {
+		// Scanning every word of a stage flagged these, adding prompts to far
+		// more commands than the fetch rules remove them from.
+		for (const command of [
+			"ps aux | grep python",
+			"ls | grep sh",
+			"git log | grep php",
+			"cat package.json | grep bun",
+			"curl -s https://x | grep -o 'node'",
+		]) {
+			expect(await flags(command)).toHaveLength(0);
+		}
+	});
+
 	test("wrappers that take a duration first do not hide the interpreter", async () => {
 		// Breaking at the first non-flag word read `timeout 5 sh` as the verb `5`.
 		expect(await flags("cat ./installer | timeout 5 sh")).toContain("| sh");

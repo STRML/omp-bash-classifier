@@ -809,28 +809,52 @@ function expandShortBundle(arg: string): string[] {
 /**
  * Interpreters in a stage that will execute what is piped into them.
  *
- * Scans the WHOLE segment rather than stopping at the first non-flag word: the
- * wrapper comment above says it outright, `env`/`nice`/`timeout`/`stdbuf` take
- * options or durations first, so breaking early read `timeout 5 sh` as the verb
- * `5` and missed the shell.
+ * Only the stage's OWN verb counts, after looking through assignments and
+ * wrappers. Scanning every word read an interpreter name used as data as an
+ * invocation, so `ps aux | grep python`, `ls | grep sh` and `git log | grep php`
+ * all prompted. That adds prompts to far more commands than this removes them
+ * from, which is the opposite of the point.
+ *
+ * Wrappers are stepped through by position rather than by breaking at the first
+ * non-flag word: `env`, `nice`, `timeout` and `stdbuf` take options or durations
+ * first, so breaking early read `timeout 5 sh` as the verb `5`.
  *
  * An interpreter with a script operand is an ordinary invocation, not a
- * stdin-executing one — `npm test | node ./scripts/parse.js` runs the file and
- * treats the pipe as data. Same convention as INLINE_CODE_INTERPRETERS above,
- * where `bash script.sh` is ordinary.
+ * stdin-executing one. `npm test | node ./scripts/parse.js` runs the file and
+ * treats the pipe as data, the same convention INLINE_CODE_INTERPRETERS uses for
+ * `bash script.sh`. `-` and `-s` name stdin and do not count as a script.
  */
 function stdinExecutingInterpreters(stage: string): string[] {
 	const found: string[] = [];
 	for (const segment of tokenizeShellSegments(stage)) {
-		for (let i = 0; i < segment.length; i++) {
-			const verb = commandBasename(segment[i]);
-			if (!STDIN_EXECUTING_INTERPRETERS.has(verb)) continue;
-			const rest = segment.slice(i + 1);
-			// `-` and `-s` name stdin; any other operand is a script to run.
-			const hasScriptOperand = rest.some(word => !word.startsWith("-") && word !== "-");
-			if (!hasScriptOperand) found.push(verb);
+		let i = 0;
+		let sawWrapper = false;
+		// Step through assignments, wrappers, and the option words and durations
+		// they carry. `nice -n 10 bash` puts the flag BETWEEN the wrapper and its
+		// value, so the numeric skip cannot be tied to the wrapper's position.
+		while (i < segment.length) {
+			const word = segment[i].toLowerCase();
+			if (/^[a-z_][a-z0-9_]*=/u.test(word) || word.startsWith("-")) {
+				i++;
+				continue;
+			}
+			if (WRAPPER_COMMANDS.has(commandBasename(word))) {
+				sawWrapper = true;
+				i++;
+				continue;
+			}
+			if (sawWrapper && /^\d+(\.\d+)?[smhd]?$/u.test(word)) {
+				i++;
+				continue;
+			}
 			break;
 		}
+		if (i >= segment.length) continue;
+		const verb = commandBasename(segment[i]);
+		if (!STDIN_EXECUTING_INTERPRETERS.has(verb)) continue;
+		const rest = segment.slice(i + 1);
+		const hasScriptOperand = rest.some(word => !word.startsWith("-") && word !== "-");
+		if (!hasScriptOperand) found.push(verb);
 	}
 	return found;
 }
