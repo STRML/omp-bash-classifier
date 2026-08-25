@@ -728,33 +728,38 @@ function commandBasename(word: string): string {
 	return slash === -1 ? cleaned : cleaned.slice(slash + 1);
 }
 
-/** Leading verb of each command in a stage, looking through assignments and wrappers. */
-function effectiveStageVerbs(stage: string): string[] {
-	const verbs: string[] = [];
-	for (const segment of tokenizeShellSegments(stage)) {
-		for (const raw of segment) {
-			const word = raw.toLowerCase();
-			if (/^[a-z_][a-z0-9_]*=/u.test(word)) continue;
-			if (WRAPPER_COMMANDS.has(commandBasename(word))) continue;
-			if (word.startsWith("-")) continue;
-			verbs.push(commandBasename(word));
-			break;
-		}
-	}
-	return verbs;
-}
-
 /** Downstream commands that consume stdin and cannot execute it. */
 const READ_ONLY_PIPE_CONSUMERS = new Set([
 	"jq", "yq", "head", "tail", "cat", "wc", "grep", "rg", "egrep", "fgrep",
-	"sort", "uniq", "cut", "tr", "column", "less", "more", "nl", "rev", "tac",
-	"strings", "xxd", "od", "fold",
+	"sort", "cut", "tr", "column", "less", "more", "nl", "rev", "tac",
+	"strings", "od", "fold",
 ]);
 
-/** curl flags that cannot name a local path. Anything not here disqualifies. */
+/**
+ * Consumers whose own flags can name a file to write. Per-consumer, not a
+ * blanket `-o` prefix test: `grep -o` and `rg -o` are --only-matching and
+ * read-only, and `curl … | grep -o …` is one of the shapes this change exists
+ * to stop prompting for.
+ *
+ * `uniq` and `xxd` are deliberately absent from the consumer set above rather
+ * than listed here: their write target is a positional OPERAND
+ * (`uniq [IN [OUT]]`, `xxd [in [out]]`), so no flag check can catch it.
+ */
+const CONSUMER_WRITE_FLAGS: Record<string, RegExp> = {
+	sort: /^(-o|--output)/u,
+	yq: /^(-i|--inplace)/u,
+	jq: /^(--rawfile|--slurpfile)/u,
+};
+
+/**
+ * curl flags that cannot name a local path. Anything not here disqualifies.
+ * `-w`/`--write-out` is absent on purpose: curl 8.3+ honors `%output{path}`
+ * inside the format string, which creates and truncates that file with no
+ * redirect involved.
+ */
 const CURL_READ_ONLY_FLAGS = new Set([
 	"-s", "-S", "-f", "-L", "-k", "-i", "-I", "-v", "-H", "-X", "-A", "-e", "-u",
-	"-x", "-m", "-G", "-r", "-N", "-4", "-6", "-g", "-#", "-d", "-w", "-b0",
+	"-x", "-m", "-G", "-r", "-N", "-4", "-6", "-g", "-#", "-d",
 	"--silent", "--show-error", "--fail", "--fail-with-body", "--location", "--insecure",
 	"--include", "--head", "--verbose", "--header", "--request", "--user-agent",
 	"--referer", "--user", "--proxy", "--max-time", "--connect-timeout", "--retry",
@@ -772,10 +777,62 @@ const WGET_READ_ONLY_FLAGS = new Set([
 	"--content-on-error", "--inet4-only", "--inet6-only", "--method", "--body-data",
 ]);
 
+/**
+ * wget short flags that take NO value. Only these may precede `O-` in a bundle.
+ *
+ * getopt hands a bundle's trailing `O-` to the FIRST value-taking flag in the
+ * prefix, so `-oO-` is `-o O-` (a log file named ./O-) and `-O` never applies.
+ * `-qO-` is safe and is the canonical stdout idiom; `-PO-` is a download to
+ * ./O-/ wearing its costume.
+ */
+const WGET_NO_VALUE_SHORT_FLAGS = "qSvcnd46NHLkKEmpr";
+
+function bundleIsWgetStdout(arg: string): boolean {
+	const match = /^-([a-zA-Z]*)O-$/u.exec(arg);
+	if (!match) return false;
+	return [...match[1]].every(ch => WGET_NO_VALUE_SHORT_FLAGS.includes(ch));
+}
+
+function bundleIsWgetStdoutSplit(arg: string, next: string | undefined): boolean {
+	if (next !== "-") return false;
+	const match = /^-([a-zA-Z]*)O$/u.exec(arg);
+	if (!match) return false;
+	return [...match[1]].every(ch => WGET_NO_VALUE_SHORT_FLAGS.includes(ch));
+}
+
 /** Short bundles like -fsSL expand to -f -s -S -L before the allowlist check. */
 function expandShortBundle(arg: string): string[] {
 	if (!arg.startsWith("-") || arg.startsWith("--") || arg === "-") return [arg];
 	return [...arg.slice(1)].map(ch => `-${ch}`);
+}
+
+/**
+ * Interpreters in a stage that will execute what is piped into them.
+ *
+ * Scans the WHOLE segment rather than stopping at the first non-flag word: the
+ * wrapper comment above says it outright, `env`/`nice`/`timeout`/`stdbuf` take
+ * options or durations first, so breaking early read `timeout 5 sh` as the verb
+ * `5` and missed the shell.
+ *
+ * An interpreter with a script operand is an ordinary invocation, not a
+ * stdin-executing one — `npm test | node ./scripts/parse.js` runs the file and
+ * treats the pipe as data. Same convention as INLINE_CODE_INTERPRETERS above,
+ * where `bash script.sh` is ordinary.
+ */
+function stdinExecutingInterpreters(stage: string): string[] {
+	const found: string[] = [];
+	for (const segment of tokenizeShellSegments(stage)) {
+		for (let i = 0; i < segment.length; i++) {
+			const verb = commandBasename(segment[i]);
+			if (!STDIN_EXECUTING_INTERPRETERS.has(verb)) continue;
+			const rest = segment.slice(i + 1);
+			// `-` and `-s` name stdin; any other operand is a script to run.
+			const hasScriptOperand = rest.some(word => !word.startsWith("-") && word !== "-");
+			if (!hasScriptOperand) found.push(verb);
+			break;
+		}
+	}
+	return found;
 }
 
 /**
@@ -856,11 +913,16 @@ function isPlainReadOnlyFetch(command: string): boolean {
 				const arg = args[k];
 				if (!arg.startsWith("-") || arg === "-") continue;
 				// wget writes a file unless stdout is explicit; curl is the reverse.
-				if (verb === "wget" && (/^-[a-zA-Z]*O-$/u.test(arg) || arg === "--output-document=-")) {
+				// `-O` must stand alone. In a bundle, getopt hands the trailing
+				// `O-` to the FIRST value-taking flag in the prefix, so `-oO-`
+				// is `-o O-` (a log file) and `-O` never applies. Honoring the
+				// bundle let `wget -PO-` clear while downloading to ./O-/.
+				if (verb === "wget" && (bundleIsWgetStdout(arg) || arg === "--output-document=-")) {
 					wgetStdout = true;
 					continue;
 				}
-				if (verb === "wget" && /^-[a-zA-Z]*O$/u.test(arg) && args[k + 1] === "-") {
+				if (verb === "wget" && (bundleIsWgetStdoutSplit(arg, args[k + 1]) || arg === "--output-document")) {
+					if (args[k + 1] !== "-") return false;
 					wgetStdout = true;
 					k++;
 					continue;
@@ -875,10 +937,8 @@ function isPlainReadOnlyFetch(command: string): boolean {
 		}
 
 		if (!READ_ONLY_PIPE_CONSUMERS.has(verb)) return false;
-		// `sort -o file` and `jq --output` write despite being read-only verbs.
-		for (const arg of args) {
-			if (/^-o/u.test(arg) || arg.startsWith("--output")) return false;
-		}
+		const writeFlag = CONSUMER_WRITE_FLAGS[verb];
+		if (writeFlag && args.some(arg => writeFlag.test(arg))) return false;
 	}
 	return true;
 }
@@ -902,9 +962,7 @@ export function matchModerateRiskTokens(command: string): string[] {
 	// no curl in it.
 	const pipeStages = splitPipeStages(normalized);
 	for (let i = 1; i < pipeStages.length; i++) {
-		for (const verb of effectiveStageVerbs(pipeStages[i])) {
-			if (STDIN_EXECUTING_INTERPRETERS.has(verb)) flags.add(`| ${verb}`);
-		}
+		for (const verb of stdinExecutingInterpreters(pipeStages[i])) flags.add(`| ${verb}`);
 	}
 
 	const flagIfRisk = (rawWord: string): boolean => {
@@ -943,9 +1001,10 @@ export function matchModerateRiskTokens(command: string): string[] {
 			if (next === "-c" || next === "-e") flags.add(`${verb} ${next}`);
 			continue;
 		}
-		// Decided by the invocation, not by the verb. See networkFetchTouchesDisk.
-		// `segment`, not `words`: the lowercased copy loses -K from -k and -D
-		// from -d, which is exactly the distinction being made.
+		// Decided by the whole command, not by the verb. See isPlainReadOnlyFetch,
+		// which re-tokenizes the raw command and lowercases only the leading
+		// word, so flag case survives: -K names a config file while -k only
+		// skips TLS verification.
 		if (verb === "curl" || verb === "wget") {
 			if (!plainReadOnlyFetch) flags.add(verb);
 			continue;
