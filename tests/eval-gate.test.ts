@@ -377,13 +377,20 @@ describe("partial-literal and hidden-callee regressions", () => {
 		expect(await commands(`system "bash", "-c", "id"`, "rb")).toEqual([`bash -c id`]);
 	});
 
-	test("a commented-out spawn is not a spawn", async () => {
-		expect(await sites(`# subprocess.run("rm -rf /")\nprint(1)`, "py")).toEqual([]);
-		expect(await sites(`// exec("rm -rf /")\nconsole.log(1)`, "js")).toEqual([]);
+	test("a commented-out spawn is still read (fail-safe)", async () => {
+		// No masking layer, so a spawn spelled in a comment cannot be hidden
+		// from the reader. It raises a prompt instead — the price of being
+		// unable to fail open.
+		expect(await commands(`# subprocess.run("rm -rf /")\nprint(1)`, "py")).toEqual(["rm -rf /"]);
+		expect(await commands(`// require("child_process").execSync("rm -rf /")\nconsole.log(1)`, "js")).toEqual([
+			"rm -rf /",
+		]);
 	});
 
-	test("a callee named inside a string is not a spawn", async () => {
-		expect(await sites(`msg = "call subprocess.run(x) here"\nprint(msg)`, "py")).toEqual([]);
+	test("a callee named inside a string is read as opaque (fail-safe)", async () => {
+		const found = await sites(`msg = "call subprocess.run(x) here"\nprint(msg)`, "py");
+		expect(found.length).toBe(1);
+		expect(found[0].command).toBeUndefined();
 	});
 
 	test("distinct spawns classify concurrently, not one after another", async () => {
@@ -487,8 +494,8 @@ describe("second-review regressions", () => {
 		expect(await commands(code, "py")).toEqual([`/bin/sh -c id`]);
 	});
 
-	test("a backtick inside a string is not a command literal", async () => {
-		expect(await sites('puts "run `ls` now"', "rb")).toEqual([]);
+	test("a backtick inside a string reads as a command (fail-safe)", async () => {
+		expect(await commands('puts "run `ls` now"', "rb")).toEqual(["ls"]);
 		expect(await commands("out = `git status`", "rb")).toEqual(["git status"]);
 	});
 });
@@ -557,6 +564,18 @@ describe("fourth-review regressions", () => {
 
 	test("a semicolon inside the command is not a statement separator", async () => {
 		expect(await commands(`system "echo a; b"`, "rb")).toEqual([`echo a; b`]);
+	});
+
+	test("a modifier after a semicolon-bearing command cuts after the string", async () => {
+		// The modifier is a cut, but not one inside the quoted command: the
+		// `awk '{print $1; exit}'`-style payload must survive whole.
+		expect(await commands(`system "echo a; b" if flag`, "rb")).toEqual([`echo a; b`]);
+	});
+
+	test("an unterminated quoted command degrades to opaque, not invisible", async () => {
+		// A quote that never closes on the line is not a string; the reader
+		// must still report a site (opaque) rather than drop the spawn.
+		expect(await commands(`system "echo a; rm -rf /`, "rb")).toEqual([undefined]);
 	});
 
 	test.each([

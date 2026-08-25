@@ -1203,81 +1203,6 @@ function commandLiteralSites(code: string, language: EvalLanguageToken): EvalSpa
 	return sites;
 }
 
-/**
- * Skip a JavaScript regex literal at `start`, returning the index after its
- * closing `/`, or -1 when this `/` does not open one. A regex literal holds
- * quote characters that are NOT string delimiters (`split(/["']/)`), and
- * reading one as a string blanked everything up to the next quote in the cell,
- * hiding every spawn in between.
- */
-function skipRegexLiteral(text: string, start: number): number {
-	// `//` and `/*` are comments, handled by the caller.
-	if (text[start + 1] === "/" || text[start + 1] === "*") return -1;
-	let inClass = false;
-	let i = start + 1;
-	while (i < text.length) {
-		const ch = text[i];
-		if (ch === "\\") {
-			i += 2;
-			continue;
-		}
-		// A regex literal does not span lines.
-		if (ch === "\n") return -1;
-		if (ch === "[") inClass = true;
-		else if (ch === "]") inClass = false;
-		else if (ch === "/" && !inClass) return i + 1;
-		i += 1;
-	}
-	return -1;
-}
-
-/**
- * Can a `/` here open a regex literal rather than divide? A regex may follow an
- * operator, an opening bracket, or a statement boundary, never a value.
- */
-function regexLiteralAllowed(text: string, start: number): boolean {
-	for (let j = start - 1; j >= 0; j -= 1) {
-		if (/\s/u.test(text[j])) continue;
-		return "(,=:[!&|?{};+-*%~^<>".includes(text[j]);
-	}
-	return true;
-}
-
-/**
- * Skip a backtick literal at `start`, returning the index after its closing
- * backtick, or -1 when it never closes. `${…}` holes are tracked (and may nest
- * further templates) so an inner backtick does not end the literal early.
- */
-function skipTemplateLiteral(text: string, start: number): number {
-	let i = start + 1;
-	while (i < text.length) {
-		const ch = text[i];
-		if (ch === "\\") {
-			i += 2;
-			continue;
-		}
-		if (ch === "`") return i + 1;
-		if (ch === "$" && text[i + 1] === "{") {
-			let depth = 1;
-			i += 2;
-			while (i < text.length && depth > 0) {
-				if (text[i] === "`") {
-					const nested = skipTemplateLiteral(text, i);
-					if (nested === -1) return -1;
-					i = nested;
-					continue;
-				}
-				if (text[i] === "{") depth += 1;
-				else if (text[i] === "}") depth -= 1;
-				i += 1;
-			}
-			continue;
-		}
-		i += 1;
-	}
-	return -1;
-}
-
 const PERCENT_X_CLOSERS: Record<string, string> = { "{": "}", "(": ")", "[": "]", "<": ">" };
 
 /** Skip Ruby's `%x{…}` command literal, honoring nested delimiters. */
@@ -1303,138 +1228,6 @@ function skipPercentX(text: string, start: number): number {
 	return -1;
 }
 
-/**
- * Step over a region that is a literal COMMAND rather than a string: a backtick
- * literal, or Ruby's `%x{…}`. Such a region may not be blanked, because its
- * text is exactly what gets judged, and may not be entered, because a quote
- * inside it would open a phantom string and swallow the next spawn. Every bug
- * in this layer has been a literal form one mask knew about and the other did
- * not, so both passes consult this single list.
- */
-function skipCommandLiteral(text: string, start: number, language: EvalLanguageToken): number {
-	if (text[start] === "`" && language !== "py") return skipTemplateLiteral(text, start);
-	if (language === "rb" && text[start] === "%") return skipPercentX(text, start);
-	return -1;
-}
-
-/** Quote characters that open a string literal in each dialect. */
-function quoteChars(language: EvalLanguageToken): string[] {
-	if (language === "py") return ["'", '"'];
-	// Julia's `'` is a char literal and a transpose operator, so treating it as
-	// a string opener would swallow ordinary code.
-	if (language === "jl") return ['"', "`"];
-	return ["'", '"', "`"];
-}
-
-/**
- * Replace comment text with spaces, preserving every offset so a position in
- * the mask is the same position in the source. Callees are located in the mask
- * and their arguments are read from the original, so a commented-out
- * `subprocess.run("rm -rf /")` stops raising a dialog for a cell that spawns
- * nothing.
- */
-function maskComments(code: string, language: EvalLanguageToken): string {
-	const out = code.split("");
-	const quotes = quoteChars(language);
-	const lineComment = language === "js" ? "//" : "#";
-	const blank = (from: number, to: number): void => {
-		for (let j = from; j < to; j += 1) if (out[j] !== "\n") out[j] = " ";
-	};
-	let i = 0;
-	while (i < code.length) {
-		const literal = skipCommandLiteral(code, i, language);
-		if (literal !== -1) {
-			i = literal;
-			continue;
-		}
-		if (quotes.includes(code[i])) {
-			const end = skipQuoted(code, i);
-			// Not a string after all: step over this character rather than
-			// giving up on the remainder, which would leave later comments
-			// unmasked for the rest of the cell.
-			if (end === -1) {
-				i += 1;
-				continue;
-			}
-			i = end;
-			continue;
-		}
-		if (language === "js" && code.startsWith("/*", i)) {
-			const close = code.indexOf("*/", i + 2);
-			const stop = close === -1 ? code.length : close + 2;
-			blank(i, stop);
-			i = stop;
-			continue;
-		}
-		if (code.startsWith(lineComment, i)) {
-			const nl = code.indexOf("\n", i);
-			const stop = nl === -1 ? code.length : nl;
-			blank(i, stop);
-			i = stop;
-			continue;
-		}
-		if (language === "js" && code[i] === "/" && regexLiteralAllowed(code, i)) {
-			const end = skipRegexLiteral(code, i);
-			if (end !== -1) {
-				i = end;
-				continue;
-			}
-		}
-		i += 1;
-	}
-	return out.join("");
-}
-
-/**
- * Blank the INTERIOR of every string literal, keeping the delimiters and every
- * offset. A `subprocess.run(` spelled inside a string is then not a callee.
- * Arguments are still read from the original text, so real command literals are
- * untouched.
- */
-function maskStringInteriors(code: string, language: EvalLanguageToken): string {
-	const out = code.split("");
-	// A backtick literal is stepped OVER: not blanked, and not entered. In Ruby
-	// and Julia it IS a command and blanking it would erase the very text the
-	// backtick pass has to judge — a masked `ssh host "rm -rf /data"` reaches
-	// the classifier as `ssh host "            "`. Entering it is just as bad:
-	// an apostrophe in `` `don't` `` would open a phantom string and swallow the
-	// next spawn. A backtick inside an ordinary string is still removed, because
-	// the enclosing quote is masked before the backtick is ever reached.
-	const quotes = quoteChars(language).filter(quote => quote !== "`");
-	const backtickIsLiteral = language !== "py";
-	let i = 0;
-	while (i < code.length) {
-		if (language === "js" && code[i] === "/" && regexLiteralAllowed(code, i)) {
-			const end = skipRegexLiteral(code, i);
-			if (end !== -1) {
-				i = end;
-				continue;
-			}
-		}
-		const literal = backtickIsLiteral ? skipCommandLiteral(code, i, language) : -1;
-		if (literal !== -1) {
-			i = literal;
-			continue;
-		}
-		if (backtickIsLiteral && code[i] === "`") {
-			i += 1;
-			continue;
-		}
-		if (quotes.includes(code[i])) {
-			const end = skipQuoted(code, i);
-			if (end === -1) {
-				i += 1;
-				continue;
-			}
-			for (let j = i + 1; j < end - 1; j += 1) if (out[j] !== "\n") out[j] = " ";
-			i = end;
-			continue;
-		}
-		i += 1;
-	}
-	return out.join("");
-}
-
 /** Read one call site whose `(` sits at `openParen` in the ORIGINAL source. */
 function siteAt(
 	code: string,
@@ -1454,13 +1247,13 @@ function siteAt(
  * `(await import("node:child_process")).execSync(…)` bind no name, so the
  * import scan never sees them. Match the chain itself.
  */
-function inlineChildProcessSites(code: string, scan: string): EvalSpawnSite[] {
+function inlineChildProcessSites(code: string): EvalSpawnSite[] {
 	const sites: EvalSpawnSite[] = [];
 	const re = new RegExp(
 		String.raw`(?:require|import)\(\s*${CHILD_PROCESS_MODULE}\s*\)\s*\)?\s*\.\s*([A-Za-z_$][\w$]*)\s*\(`,
 		"gu",
 	);
-	for (const m of matchAll(scan, re)) {
+	for (const m of matchAll(code, re)) {
 		const shape = CHILD_PROCESS_MEMBERS[m[1]];
 		if (!shape) continue;
 		const openParen = (m.index ?? 0) + m[0].length - 1;
@@ -1470,34 +1263,67 @@ function inlineChildProcessSites(code: string, scan: string): EvalSpawnSite[] {
 }
 
 /**
+ * Index of the first Ruby command terminator in `code` between `start` and
+ * `limit` and outside any quoted literal: a `;`, a `#` comment, or a trailing
+ * `if`/`unless`/`while`/`until`/`rescue` modifier. `limit` when nothing cuts.
+ *
+ * The spawn reader used to find these cuts in a string-masked copy of the
+ * cell; that mask is gone (it could hide whole spawns), so the walker skips
+ * quoted regions itself. A `;` or `#` INSIDE the quoted command string is part
+ * of the command, not a break — `system "echo a; rm -rf /"` must be judged
+ * whole, never truncated to `echo a`.
+ */
+function rubyCommandCut(code: string, start: number, limit: number): number {
+	const modifier = /^(?:if|unless|while|until|rescue)\b/u;
+	let i = start;
+	while (i < limit) {
+		const ch = code[i];
+		if (ch === "'" || ch === '"' || ch === "`") {
+			const end = skipQuoted(code, i);
+			if (end === -1 || end > limit) return limit;
+			i = end;
+			continue;
+		}
+		if (ch === "%") {
+			// `%x{…}` command literals and the other `%`-literals carry quotes,
+			// braces, and `#` that must not cut. A `%` that is not a known
+			// literal is `%` the modulo operator and cuts normally.
+			const end = skipPercentX(code, i);
+			if (end !== -1 && end <= limit) {
+				i = end;
+				continue;
+			}
+		}
+		if (ch === ";" || ch === "#") return i;
+		if (/\s/u.test(ch) && modifier.test(code.slice(i + 1, i + 12))) return i;
+		i += 1;
+	}
+	return limit;
+}
+
+/**
  * Ruby's dominant spelling omits the parentheses: `system "rm -rf x"`. The
  * named-callee scan looks for a `(`, so without this pass most of the rb table
  * never fires. Arguments run to the end of the line.
  */
-function rubyParenlessSites(literalScan: string, scan: string): EvalSpawnSite[] {
+function rubyParenlessSites(code: string): EvalSpawnSite[] {
 	const sites: EvalSpawnSite[] = [];
 	// Any argument, not just a quoted one: `system cmd` must reach the opaque
 	// branch, the way `system(cmd)` already does. The exclusions keep an
 	// assignment (`system = 5`), a comment, and the parenthesized form (handled
 	// by the named-callee pass) from matching. An explicit receiver is the same
 	// call written out.
-	for (const m of matchAll(scan, /(?:^|[^\w$.@:])((?:Kernel|self|Process)\.)?(system|exec|spawn)\s+(?![\s=;#(])/gu)) {
+	for (const m of matchAll(code, /(?:^|[^\w$.@:])((?:Kernel|self|Process)\.)?(system|exec|spawn)\s+(?![\s=;#(])/gu)) {
 		const start = (m.index ?? 0) + m[0].length;
-		const nl = scan.indexOf("\n", start);
-		const lineEnd = nl === -1 ? scan.length : nl;
-		// Find where the argument list ends in the MASKED copy, so a `;` or the
-		// word `if` inside a string cannot cut it short, then read the arguments
-		// from the comment-masked copy, where the strings are still intact. The
-		// arguments used to be read from raw source: a trailing `# comment`,
-		// `; puts 1`, or a modifier `if` then made a fully readable command
-		// report as opaque, and the dialog told the human it was built at
-		// runtime while withholding the command it was asking about.
-		const line = scan.slice(start, lineEnd);
-		const semicolon = line.indexOf(";");
-		const modifier = /\s(?:if|unless|while|until|rescue)\b/u.exec(line);
-		const cuts = [semicolon, modifier?.index ?? -1].filter(at => at !== -1);
-		const cut = cuts.length > 0 ? start + Math.min(...cuts) : lineEnd;
-		const command = commandFromArguments(literalScan.slice(start, cut), "rb", "variadic");
+		const nl = code.indexOf("\n", start);
+		const lineEnd = nl === -1 ? code.length : nl;
+		// The command runs to the first `;`, comment, or trailing modifier that
+		// sits OUTSIDE a quoted argument (`rubyCommandCut`). Without the cut, a
+		// trailing `# comment`, `; puts 1`, or `if flag` after the string made a
+		// fully readable command report as opaque, and the dialog withheld the
+		// command it was asking about.
+		const cut = rubyCommandCut(code, start, lineEnd);
+		const command = commandFromArguments(code.slice(start, cut), "rb", "variadic");
 		sites.push(command === undefined ? { callee: m[2] } : { callee: m[2], command });
 	}
 	return sites;
@@ -1545,41 +1371,37 @@ function aliasedCallees(code: string, callees: Map<string, SpawnArgShape>): Map<
  */
 export function extractEvalSpawnSites(code: string, language: EvalLanguageToken): EvalSpawnSite[] {
 	const sites: EvalSpawnSite[] = [];
-	// Two masks over the same offsets. `literalScan` hides comments, which is
-	// all the backtick pass needs. `scan` also hides string interiors, so a
-	// callee named inside a string is not mistaken for a call.
-	const literalScan = maskComments(code, language);
-	const scan = maskStringInteriors(literalScan, language);
-	// Import scanning needs string CONTENTS (the module name lives in a string),
-	// so it reads the comment-masked copy. Call sites are located in `scan`,
-	// where a callee spelled inside a string cannot match.
-	const callees = spawnCallees(literalScan, language);
-	for (const [name, shape] of aliasedCallees(literalScan, callees)) callees.set(name, shape);
+	// Everything reads the RAW source. There is deliberately no masking layer:
+	// a mask is the only thing that can REMOVE a spawn from the reader's view,
+	// and that is exactly how three of four review rounds found fail-open bugs
+	// (a misread comment/string/regex blanked spawn text, so the cell looked
+	// like it spawned nothing and passed ungated). Reading raw text makes that
+	// failure impossible by construction. The cost is that spawn text spelled
+	// inside a comment or string now raises a prompt too — fail-safe at the
+	// price of spurious prompts.
+	const callees = spawnCallees(code, language);
+	for (const [name, shape] of aliasedCallees(code, callees)) callees.set(name, shape);
 	for (const [name, shape] of callees) {
 		// A leading word/dot boundary keeps `mysubprocess.run` and `obj.system`
 		// from matching a bare or aliased callee name.
 		// `cp.execSync?.(…)` calls exactly like `cp.execSync(…)`.
 		const calleeRe = new RegExp(String.raw`(?:^|[^\w$.])${escapeRegExp(name)}\s*(?:\?\.)?\s*\(`, "gu");
-		for (const match of matchAll(scan, calleeRe)) {
+		for (const match of matchAll(code, calleeRe)) {
 			const openParen = (match.index ?? 0) + match[0].length - 1;
 			sites.push(siteAt(code, name, shape, openParen, language));
 		}
 	}
 	if (language === "js") {
-		sites.push(...inlineChildProcessSites(code, literalScan));
+		sites.push(...inlineChildProcessSites(code));
 		// `promisify(exec)("cmd")` calls the wrapped spawn directly.
-		for (const m of matchAll(scan, /\bpromisify\s*\(\s*([A-Za-z_$][\w$.]*)\s*\)\s*\(/gu)) {
+		for (const m of matchAll(code, /\bpromisify\s*\(\s*([A-Za-z_$][\w$.]*)\s*\)\s*\(/gu)) {
 			const shape = callees.get(m[1]) ?? CHILD_PROCESS_MEMBERS[m[1].split(".").pop() ?? ""];
 			if (shape === undefined) continue;
 			sites.push(siteAt(code, `promisify(${m[1]})`, shape, (m.index ?? 0) + m[0].length - 1, language));
 		}
 	}
-	if (language === "rb") sites.push(...rubyParenlessSites(literalScan, scan));
-	// `scan`, not `literalScan`: a backtick inside an ordinary Ruby string is
-	// blanked there, so it stops registering as a spawn for a cell that spawns
-	// nothing. Real backtick commands survive because backticks are excluded
-	// from the string mask.
-	sites.push(...commandLiteralSites(scan, language));
+	if (language === "rb") sites.push(...rubyParenlessSites(code));
+	sites.push(...commandLiteralSites(code, language));
 	return sites;
 }
 
