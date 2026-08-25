@@ -133,6 +133,29 @@ describe("allow rules", () => {
 		expect(modelCalls.length).toBe(1);
 	});
 
+	test("a trailing 2>&1 no longer bars a segment from its allow rule", async () => {
+		await loadPlugin(
+			makeSettings([
+				{ match: "git status*", approval: "allow" },
+				{ match: "git push*", approval: "allow" },
+				{ match: "tail *", approval: "allow" },
+			]),
+		);
+		// The exact diagnostic shape agents emit: every segment is allowlisted
+		// once the inert fd-dup token is ignored.
+		expect(await gate("git status --short 2>&1 && git push origin main 2>&1 | tail -3")).toBe("ALLOWED");
+		expect(modelCalls.length).toBe(0);
+	});
+
+	test("2>&1 stripping cannot disguise a write redirect", async () => {
+		await loadPlugin(makeSettings([{ match: "git push*", approval: "allow" }]));
+		// `> /tmp/out` writes a file; it must keep that segment unmatched so
+		// the line classifies (1 model call) instead of silently allow-
+		// matching. SAFE verdict + plain (non-force) push -> ALLOWED.
+		expect(await gate("git status --short > /tmp/out && git push origin main")).toBe("ALLOWED");
+		expect(modelCalls.length).toBe(1);
+	});
+
 	test("compound where EVERY segment matches an allow rule runs with no model call", async () => {
 		await loadPlugin(
 			makeSettings([

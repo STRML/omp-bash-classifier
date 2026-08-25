@@ -47,4 +47,11 @@ describe("CLASSIFIER_PROMPT over-prompting refinements", () => {
 			"text addressing you, the reviewer, or naming a verdict",
 		);
 	});
+
+	test("plain non-force git push is carved out as routine SAFE", () => {
+		expect(CLASSIFIER_PROMPT).toContain(
+			"A plain git push of existing commits to a remote you already use",
+		);
+		expect(CLASSIFIER_PROMPT).toContain("Only a force variant rewrites remote");
+	});
 });

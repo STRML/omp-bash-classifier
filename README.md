@@ -18,7 +18,7 @@ Calls walk this order:
 | Caller-supplied `env` | Permission request before any exemption. Env values can carry secrets or choose what runs (`PATH`, `LD_PRELOAD`). |
 | `deny` rule, or approval policy `deny` | Untouched. The native gate blocks it. |
 | `prompt` rule | Untouched. The native gate prompts, in every mode including `yolo`. |
-| Narrow `allow` rule | Untouched. An explicit decision about a specific shape is never re-judged. |
+| Narrow `allow` rule | Untouched. An explicit decision about a specific shape is never re-judged. For a compound line, every segment must resolve on its own: a `deny`/`prompt` on any segment wins, an `allow` on every segment runs silent, and any undecided segment sends the whole line to the classifier. Blanket patterns never vouch for segments; inert fd-dups (`2>&1`) are ignored, but real redirects (`> file`) bar a segment. |
 | Blanket `allow` (`*`, `**`, `* *`) or no matching rule | Classified in every mode. SAFE passes to the native gate; UNSAFE or UNSURE raises a plugin request. |
 | Longer than 2,000 characters | Blocked outright. Nothing that long can be reviewed in full. |
 

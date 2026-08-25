@@ -596,8 +596,12 @@ SAFE — routine development work, non-destructive or trivially recoverable: ins
        A read-only query of a hosted service API — gh (github) read commands and
        gh api <endpoint> GET calls, including piped into jq/head/tail — is SAFE:
        it fetches data, sends nothing local, and mirrors a browser read.
-       gh run rerun and gh run cancel with an explicit run id and no local data
-       movement are routine development work and SAFE.
+      gh run rerun and gh run cancel with an explicit run id and no local data
+      movement are routine development work and SAFE.
+      A plain git push of existing commits to a remote you already use — no
+      --force, no -f — is routine developer work and SAFE: it publishes the
+      history that is already local. Only a force variant rewrites remote
+      history and is UNSAFE.
 UNSAFE — destructive, irreversible, or exfiltrating: deleting source or untracked work,
        force push, reset --hard, history rewrite, fetching remote content and executing
        it, disk or device writes, reading credentials or private keys, sending LOCAL
@@ -1676,13 +1680,18 @@ export default function (pi: ExtensionAPI) {
 			// precedence the host applies to deny/prompt compounds: every
 			// segment must reach a decision; a deny/prompt on any segment wins;
 			// an allow on every segment runs silent; ANY undecided segment
-			// falls through to classification unchanged. Segments containing
-			// redirects, substitutions, or quotes-with-control never match an
-			// allow (control check first), so nothing smuggles past.
-			const segments = bashCommandSegments(ruleCommand);
+			// falls through to classification unchanged.
+			// Strip standalone `2>&1` for MATCHING only: it is an inert fd-dup
+			// (moves no data), and the host tokenizer splits on its `&`, which
+			// would otherwise shatter every diagnostic compound into unmatched
+			// fragments. Writes (`> file`) and substitutions keep their
+			// control characters and still bar a segment.
+			const matchCommand =
+				ruleCommand.replace(/(^|\s)2>&1(?=\s|$)/g, "").trim() || ruleCommand;
+			const segments = bashCommandSegments(matchCommand);
 			let rule: BashApprovalPatternRule | undefined;
 			if (segments.length <= 1) {
-				rule = policy.rules.find(candidate => bashApprovalRuleMatches(ruleCommand, candidate));
+				rule = policy.rules.find(candidate => bashApprovalRuleMatches(matchCommand, candidate));
 			} else {
 				const decisions = segments.map(segment =>
 					policy.rules.find(candidate =>
