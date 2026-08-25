@@ -40,10 +40,10 @@ let classifierThrows = false;
 let classifierDelayMs = 5;
 
 // The published 17.3.8 pi-ai/coding-agent pair is not mutually coherent: 30
-// names coding-agent imports are absent from the pi-ai barrel (computed via
-// tools/diff-exports.ts). The live OMP binary bundles a coherent pair; the npm
-// pair explodes on these names. The mock fakes the whole surface; the test
-// boundary is completeSimple, everything else is inert.
+// names coding-agent imports are absent from the pi-ai barrel. The live OMP
+// binary bundles a coherent pair; the npm pair explodes on these names. The
+// mock fakes the whole surface; the test boundary is completeSimple,
+// everything else is inert.
 const missingExportStub = () => undefined;
 const typeMarkerStub = "type-only-inert";
 mock.module("@oh-my-pi/pi-ai", () => ({
