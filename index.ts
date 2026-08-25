@@ -1652,7 +1652,14 @@ export default function (pi: ExtensionAPI) {
 
 		try {
 			const policy = readHostPolicy();
-			const rule = policy.rules.find(candidate => bashApprovalRuleMatches(command, candidate));
+			// Strip a leading literal `cd <path> &&` before matching allow rules,
+			// mirroring native cwd extraction (bash.ts extracts it for cwd only).
+			// Fail-closed: extractLeadingCdTarget returns null for $(...), $var,
+			// unterminated quotes, or any non-`&&` join, so nothing non-literal
+			// is ever removed before the allow-rule match. `||`, not `??`: a
+			// degenerate empty rest must fall back to the full command.
+			const ruleCommand = extractLeadingCdTarget(command)?.rest || command;
+			const rule = policy.rules.find(candidate => bashApprovalRuleMatches(ruleCommand, candidate));
 
 			// A deny rule is the one decision that outranks everything natively
 			// (tools/bash.ts:557) — the host blocks the call, nothing to add.

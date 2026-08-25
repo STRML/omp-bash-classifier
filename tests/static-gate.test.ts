@@ -107,6 +107,23 @@ describe("allow rules", () => {
 		expect(modelCalls.length).toBe(0);
 	});
 
+	test("leading literal cd is stripped before the allow match (cd X && git push)", async () => {
+		await loadPlugin(makeSettings([{ match: "git push*", approval: "allow" }]));
+		expect(await gate("cd /repo && git push origin main")).toBe("ALLOWED");
+		expect(modelCalls.length).toBe(0);
+	});
+
+	test("a non-literal cd target is NOT stripped: cd $(evil) && git push still classifies", async () => {
+		await loadPlugin(makeSettings([{ match: "git push*", approval: "allow" }]));
+		// No strip -> no allow match -> classified (1 model call) -> SAFE
+		// verdict but the static git-push flag still forces a request, which
+		// fails closed headless. The important assertions: the classifier RAN
+		// and the command did NOT silently run.
+		const result = await gate("cd $(evil) && git push origin main");
+		expect(modelCalls.length).toBe(1);
+		expect(result).not.toBe("ALLOWED");
+	});
+
 	test("blanket allow '*' is classified, not auto-approved", async () => {
 		await loadPlugin(makeSettings([{ match: "*", approval: "allow" }]));
 		expect(await gate("git status --short")).toBe("ALLOWED"); // classifier says SAFE
