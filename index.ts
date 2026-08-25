@@ -116,11 +116,17 @@ interface BashApprovalPatternRule {
  * the user `git status` and ran the deletion. Not a regression (JSON.stringify
  * left them raw too) but this is where the helper and its invariant live.
  *
+ * C1 (U+0080-U+009F): the 8-bit forms of the same escapes. U+009B IS a CSI, so
+ * a raw U+009B followed by `2J` repaints the dialog on any terminal honoring
+ * 8-bit C1 in UTF-8, which is xterm's default. Escaping ESC alone leaves that
+ * open, which is why the class covers the whole range rather than U+0085 only.
+ *
  * Bidi overrides and zero-width characters: pi-tui does not strip them, so an
- * RLO can display a command in an order it does not execute in.
+ * RLO can display a command in an order it does not execute in. U+061C is the
+ * Arabic-letter-mark sibling of the U+200E/200F pair.
  */
 const DIALOG_UNSAFE_CHARS =
-	/[\u0000-\u0008\u000B-\u001F\u007F\u0085\u200B-\u200F\u202A-\u202E\u2028\u2029\u2060-\u2064\u2066-\u2069\uFEFF]/gu;
+	/[\u0000-\u0008\u000B-\u001F\u007F-\u009F\u061C\u200B-\u200F\u202A-\u202E\u2028\u2029\u2060-\u2064\u2066-\u2069\uFEFF]/gu;
 
 function escapeControlChars(text: string): string {
 	return text.replace(DIALOG_UNSAFE_CHARS, ch => {
@@ -1028,9 +1034,7 @@ export default function (pi: ExtensionAPI) {
 		// Compared normalized, or a caller passing "/workspace/" in a session at
 		// "/workspace" prints a line saying the cwd is the cwd, which is exactly
 		// the noise this is meant to remove.
-		if (target.cwd && samePath(target.cwd, sessionCwd)) {
-			// same directory: say nothing
-		} else if (target.cwd) {
+		if (target.cwd && !samePath(target.cwd, sessionCwd)) {
 			details.push(`working directory: ${target.cwd}`);
 		}
 		// 0 disables the deadline (host schema, tools/bash.ts), so "0s" would

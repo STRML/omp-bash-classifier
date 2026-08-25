@@ -115,10 +115,21 @@ describe("body", () => {
 
 	test("markdown in the command cannot escape the code block", async () => {
 		const command = "echo '**bold** `tick` <!-- hidden -->'";
-		const { body } = await prompt(command);
-		for (const line of body.split("\n")) {
-			if (line.includes("**bold**")) expect(line.startsWith("    ")).toBe(true);
-		}
+		const { dialog } = await prompt(command);
+		const lines = dialog.split("\n");
+		// Assert presence FIRST. The previous version put its only assertion
+		// inside `if (line.includes("**bold**"))`, so dropping the command from
+		// the body entirely still passed with zero expectations run.
+		expect(lines[2]).toBe(`    ${command}`);
+		expect(lines[1]).toBe("");
+	});
+
+	test("C1 controls are escaped, not just their 7-bit ESC forms", async () => {
+		// U+009B is an 8-bit CSI: xterm honors it in UTF-8 by default, so
+		// escaping ESC alone still left the dialog repaintable.
+		const { dialog } = await prompt("echo \u009b2Jgotcha");
+		expect(dialog).not.toContain("\u009b");
+		expect(dialog).toContain("\\x9b");
 	});
 
 	test("the classifier reason is indented too, not rendered as live markdown", async () => {
