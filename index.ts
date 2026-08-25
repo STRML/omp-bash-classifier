@@ -370,13 +370,21 @@ const PLUGIN_NAME = "omp-bash-classifier";
  * plugin-local copy throws; the `dirs` resolver derives from `process.env` at
  * module load, which the host has already populated by the time a plugin binds,
  * so a plugin-local copy computes the same path the host wrote.
+ *
+ * `OMP_BASH_CLASSIFIER_TEST_LOCKFILE` is TEST-ONLY and deliberately not offered
+ * as a user knob, unlike `OMP_BASH_CLASSIFIER_CONFIG`. That one redirects the
+ * plugin's own file, where the plugin is the sole reader. This redirects a read
+ * of a HOST file the plugin only observes, so a user setting it could only
+ * produce the failure this function exists to prevent: a notice naming a path
+ * the session never consulted.
  */
 function pluginLockfilePath(): string {
-	return process.env.OMP_PLUGINS_LOCK ?? getPluginsLockfile();
+	return process.env.OMP_BASH_CLASSIFIER_TEST_LOCKFILE ?? getPluginsLockfile();
 }
 
 interface LockfileCache {
 	mtimeMs: number;
+	size: number;
 	disabled: boolean;
 }
 let lockfileCache: LockfileCache | undefined;
@@ -387,22 +395,33 @@ let lockfileCache: LockfileCache | undefined;
  * notice, never a gate, so guessing wrong must stay silent rather than nag.
  */
 function lockfileDisablesPlugin(): boolean {
+	let stat: fs.Stats;
 	try {
-		const lockPath = pluginLockfilePath();
-		// mtime-cached like readClassifierConfig above: the common answer is
-		// "not disabled", which never latches the warned-set, so an uncached
-		// read here would parse the host lockfile on every bash call for the
-		// life of the process — including on the fast paths that return
-		// without a model call, where it would dominate.
-		const stat = fs.statSync(lockPath);
-		if (lockfileCache && lockfileCache.mtimeMs === stat.mtimeMs) return lockfileCache.disabled;
-		const raw = JSON.parse(fs.readFileSync(lockPath, "utf8")) as Record<string, unknown>;
-		const disabled = pluginEntryIsDisabled(raw);
-		lockfileCache = { mtimeMs: stat.mtimeMs, disabled };
-		return disabled;
+		stat = fs.statSync(pluginLockfilePath());
 	} catch {
+		// No lockfile at the user-scope path. This is the common case for
+		// project-scoped and dev-linked installs, and a failed statSync is the
+		// cheap half — nothing is read or parsed — so it needs no cache entry,
+		// and skipping one keeps a lockfile created later visible.
 		return false;
 	}
+	// Size joins mtime in the key: mtime granularity is sub-ms on APFS and ext4
+	// but 1-2s on NFS and some bind mounts, and a rewrite inside that window is
+	// exactly what `omp plugin disable` does.
+	if (lockfileCache && lockfileCache.mtimeMs === stat.mtimeMs && lockfileCache.size === stat.size) {
+		return lockfileCache.disabled;
+	}
+	let disabled = false;
+	try {
+		disabled = pluginEntryIsDisabled(JSON.parse(fs.readFileSync(pluginLockfilePath(), "utf8")) as Record<string, unknown>);
+	} catch {
+		// Unreadable or malformed reads as "not disabled". Cache it anyway,
+		// keyed on the same stat: without this, a malformed lockfile is read and
+		// re-parsed on every bash call for the life of the process.
+		disabled = false;
+	}
+	lockfileCache = { mtimeMs: stat.mtimeMs, size: stat.size, disabled };
+	return disabled;
 }
 
 function pluginEntryIsDisabled(raw: Record<string, unknown>): boolean {
@@ -917,28 +936,39 @@ export default function (pi: ExtensionAPI) {
 			classifierConfigSignature = configSignature;
 		}
 
-		const sessionId = ctx.sessionManager.getSessionId();
 		// Only worth saying while the classifier is actually still running. With
 		// `/classifier enabled false` already set there is no symptom to explain,
 		// and the notice would advise a fix the user has taken.
-		if (config.enabled && !staleDisableWarned.has(sessionId) && lockfileDisablesPlugin()) {
-			staleDisableWarned.add(sessionId);
-			const notice =
-				`${PLUGIN_NAME} is disabled in ${pluginLockfilePath()} but still bound to this session. ` +
-				"Restart OMP to unload it, or run /classifier enabled false to stop classifying now.";
-			// This is a diagnostic, so it must never decide the command. The
-			// handler's try/catch does not open until below, and the runner fails
-			// closed on a throw, so an unguarded toast could block the very bash
-			// call it was attached to.
-			try {
+		//
+		// The whole block is guarded because it is a diagnostic and must never
+		// decide the command. The handler's own try/catch does not open until
+		// below, and the runner fails closed on a throw, so an unguarded
+		// getSessionId(), notify() or logger.warn() could block the very bash
+		// call it rode in on.
+		try {
+			const sessionId = ctx.sessionManager.getSessionId();
+			if (config.enabled && !staleDisableWarned.has(sessionId) && lockfileDisablesPlugin()) {
+				staleDisableWarned.add(sessionId);
+				// Hedged deliberately. This reads the USER-scope lockfile only,
+				// and a project-scope lockfile shadows it (the loader's
+				// loadEnabledPlugins: "Project entries shadow user entries with
+				// the same package name"). A stale user-scope `enabled: false`
+				// under a project that re-enables the plugin is a legitimately
+				// active plugin, and telling that user to restart would be advice
+				// that changes nothing. State what was read; do not claim what it
+				// means.
+				const notice =
+					`${PLUGIN_NAME} is marked disabled in ${pluginLockfilePath()} while still bound to this session. ` +
+					"If you meant to turn it off, restart OMP to unload it, or run /classifier enabled false to stop " +
+					"classifying now. A project-scope lockfile can re-enable it, in which case this is expected.";
 				// Headless runs have nobody to read a toast, and this file's one
 				// rule for touching the UI is to check hasUI first (see
 				// requestPermission).
 				if (ctx.hasUI) ctx.ui.notify(notice, "warning");
 				else pi.logger.warn(`bash-classifier: ${notice}`);
-			} catch {
-				// A diagnostic that cannot be delivered is not a reason to fail.
 			}
+		} catch {
+			// A diagnostic that cannot be delivered is not a reason to fail.
 		}
 
 		// Universal bound, before every static-rule/critical/env branch: neither

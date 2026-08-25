@@ -12,7 +12,9 @@ import {
 	makeCtx,
 	makeEvent,
 	makeSettings,
+	loggerWarnings,
 	notifyCalls,
+	resetLoggerWarnings,
 	removeConfigFile,
 	removeLockfile,
 	resultText,
@@ -42,8 +44,12 @@ describe("notice fires when the lockfile disabled us after we bound", () => {
 		const [message, level] = calls[0];
 		expect(level).toBe("warning");
 		expect(message).toContain("omp-bash-classifier");
-		expect(message).toContain("Restart OMP");
+		expect(message).toContain("restart OMP");
 		expect(message).toContain("/classifier enabled false");
+		// It reads the user-scope lockfile only, so it states what it read and
+		// does not assert that the plugin is off.
+		expect(message).toContain("marked disabled");
+		expect(message).toContain("project-scope lockfile can re-enable it");
 	});
 
 	test("second command in the same session does not warn again", async () => {
@@ -66,10 +72,25 @@ describe("notice fires when the lockfile disabled us after we bound", () => {
 
 	test("headless logs instead of notifying, and still only once", async () => {
 		writeLockfile(DISABLED);
+		resetLoggerWarnings();
 		const ctx = makeCtx({ sessionId: "stale-headless", hasUI: false });
 		await fire("tool_call", makeEvent("git status"), ctx);
 		await fire("tool_call", makeEvent("ls -la"), ctx);
 		expect(notifyCalls(ctx)).toHaveLength(0);
+		// Assert the branch that actually runs. Without this the test passes
+		// even if the logger call is deleted outright.
+		expect(loggerWarnings).toHaveLength(1);
+		expect(loggerWarnings[0]).toContain("omp-bash-classifier");
+		expect(loggerWarnings[0]).toContain("marked disabled");
+	});
+
+	test("with a UI it notifies and does NOT log", async () => {
+		writeLockfile(DISABLED);
+		resetLoggerWarnings();
+		const ctx = makeCtx({ sessionId: "stale-ui-only", hasUI: true });
+		await fire("tool_call", makeEvent("git status"), ctx);
+		expect(notifyCalls(ctx)).toHaveLength(1);
+		expect(loggerWarnings).toHaveLength(0);
 	});
 
 	test("the notice does not change what the gate decides", async () => {
@@ -105,7 +126,7 @@ describe("notice stays silent otherwise", () => {
 		for (const raw of ['{"plugins": "nope"}', "{}", "not json at all", '{"plugins":{"omp-bash-classifier":7}}']) {
 			removeLockfile();
 			const { writeFileSync } = await import("node:fs");
-			writeFileSync(process.env.OMP_PLUGINS_LOCK as string, raw);
+			writeFileSync(process.env.OMP_BASH_CLASSIFIER_TEST_LOCKFILE as string, raw);
 			const ctx = makeCtx({ sessionId: `quiet-malformed-${raw.length}`, hasUI: true });
 			await fire("tool_call", makeEvent("git status"), ctx);
 			expect(notifyCalls(ctx)).toHaveLength(0);
@@ -185,7 +206,7 @@ describe("the mtime cache does not hide a lockfile change", () => {
 		const { utimesSync } = await import("node:fs");
 		writeLockfile(DISABLED);
 		const later = new Date(Date.now() + 2000);
-		utimesSync(process.env.OMP_PLUGINS_LOCK as string, later, later);
+		utimesSync(process.env.OMP_BASH_CLASSIFIER_TEST_LOCKFILE as string, later, later);
 
 		const after = makeCtx({ sessionId: "mtime-2", hasUI: true });
 		await fire("tool_call", makeEvent("git status"), after);

@@ -203,8 +203,21 @@ export async function loadPlugin(settings: Record<string, unknown>): Promise<voi
 			handlers.set(event, handler);
 		},
 		registerCommand: () => {},
-		logger: { warn: () => {}, error: () => {} },
+		logger: {
+			warn: (message: string) => {
+				loggerWarnings.push(message);
+			},
+			error: () => {},
+		},
 	} as unknown as ExtensionAPI);
+}
+
+/** Captured `pi.logger.warn` messages. The headless notice path writes here
+ *  rather than to ctx.ui, so without this it cannot be asserted at all. */
+export const loggerWarnings: string[] = [];
+
+export function resetLoggerWarnings(): void {
+	loggerWarnings.length = 0;
 }
 
 export async function fire(event: string, payload: unknown, ctx: ExtensionContext): Promise<unknown> {
@@ -295,11 +308,15 @@ let testLockPath: string | undefined;
 // disabled, so without this the stale-disable notice fires (or does not) based
 // on machine state. Default to a path that does not exist, which reads as
 // "not disabled".
-process.env.OMP_PLUGINS_LOCK = lockfilePathForTests();
+process.env.OMP_BASH_CLASSIFIER_TEST_LOCKFILE = lockfilePathForTests();
 
 function lockfilePathForTests(): string {
 	if (!testLockPath) {
-		testLockPath = path.join(os.tmpdir(), `omp-classifier-test-lock-${process.pid}.json`);
+		// PID alone collides across reruns, and the file outlives the process, so
+		// the next run inheriting it would believe the plugin is disabled — the
+		// machine-state dependence this indirection exists to remove.
+		const suffix = Math.random().toString(36).slice(2, 10);
+		testLockPath = path.join(os.tmpdir(), `omp-classifier-test-lock-${process.pid}-${suffix}.json`);
 	}
 	return testLockPath;
 }
@@ -308,6 +325,17 @@ function lockfilePathForTests(): string {
 export function writeLockfile(raw: Record<string, unknown>): void {
 	fs.writeFileSync(lockfilePathForTests(), JSON.stringify(raw));
 }
+
+// The file outlives the process, so a rerun could inherit a lockfile saying the
+// plugin is disabled. The random suffix above makes that collision unlikely; this
+// makes it impossible.
+process.on("exit", () => {
+	try {
+		if (testLockPath) fs.unlinkSync(testLockPath);
+	} catch {
+		// already gone
+	}
+});
 
 /** Remove the host lockfile, so the plugin sees no lockfile at all. */
 export function removeLockfile(): void {
