@@ -82,11 +82,30 @@ describe("verdict routing", () => {
 		setClassifierThrows(true);
 		const headless = await gate("make build");
 		expect(headless).toContain("unclassified");
+		expect(headless).toContain("model call failed"); // underlying error surfaces
 
 		const ctx = fresh({ hasUI: true, confirmResult: true });
 		const result = resultText(await fire("tool_call", makeEvent("make test"), ctx));
 		expect(result).toBe("ALLOWED");
 		expect(confirmCalls(ctx)[0][0]).toContain("unclassified");
+	});
+
+	test("empty model reply surfaces a quota hint, not a parse complaint", async () => {
+		setClassifierReply("");
+		const result = await gate("make build");
+		expect(result).toContain("classifier parse error");
+		expect(result).toContain("provider credits/quota");
+		// Not cached: a refilled account classifies normally on the next call.
+		setClassifierReply("SAFE");
+		const second = await gate("make build");
+		expect(second).toBe("ALLOWED");
+	});
+
+	test("markdown-formatted verdicts still parse", async () => {
+		setClassifierReply("**SAFE**: temp files only");
+		expect(await gate("git status -s")).toBe("ALLOWED");
+		setClassifierReply("- UNSAFE: deletes untracked work");
+		expect(await gate("make lint")).toContain("classified unsafe");
 	});
 
 	test("no model available fails closed", async () => {
@@ -315,10 +334,17 @@ describe("matcher unit spec", () => {
 	test("benign lookalikes of the pass-3 fixes stay unflagged", async () => {
 		const { matchModerateRiskTokens } = await import("../index.ts");
 		expect(matchModerateRiskTokens("echo $(date)")).toEqual([]);
+		expect(matchModerateRiskTokens("grep $(git rev-parse HEAD) log")).toEqual([]);
+		expect(matchModerateRiskTokens("echo `date`")).toEqual([]);
 		expect(matchModerateRiskTokens("git stash push -m wip")).toEqual([]);
 		expect(matchModerateRiskTokens("git notes push")).toEqual([]);
 		expect(matchModerateRiskTokens("git commit -m 'msg'")).toEqual([]);
 		expect(matchModerateRiskTokens("git checkout -- pathspec")).toContain("git checkout --");
+		// Substitution flagging stays narrow: risk verbs INSIDE a span flag
+		// (including unterminated spans); benign spans do not.
+		expect(matchModerateRiskTokens('echo "$(rm important)"')).toContain("rm");
+		expect(matchModerateRiskTokens("echo $(rm")).toContain("rm");
+		expect(matchModerateRiskTokens("`rm -rf /tmp/x`")).toContain("rm");
 	});
 });
 

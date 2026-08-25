@@ -40,7 +40,6 @@ describe("identical execution identity is judged once", () => {
 		expect(second.text).toContain("classified unsafe"); // blocked again (UNSAFE cached)
 		expect(second.modelCalls).toBe(1); // no second model call
 	});
-
 	test("cached SAFE runs without a second model call or prompt", async () => {
 		setClassifierReply("SAFE");
 		const ctx = makeCtx({ sessionId: "cache-session", hasUI: true });
@@ -52,6 +51,20 @@ describe("identical execution identity is judged once", () => {
 		expect(confirmCalls(ctx).length).toBe(0);
 	});
 });
+
+describe("resolved model is part of the identity", () => {
+	test("a session whose classifier model changes reclassifies", async () => {
+		// Same session + command + cwd; the @tiny role resolves differently.
+		const a = makeCtx({ sessionId: "model-shift", cwd: "/repo", tinyModel: { id: "tiny-a" } });
+		const b = makeCtx({ sessionId: "model-shift", cwd: "/repo", tinyModel: { id: "tiny-b" } });
+		await fire("tool_call", makeEvent("npm publish"), a);
+		expect(modelCalls.length).toBe(1);
+		await fire("tool_call", makeEvent("npm publish"), b);
+		expect(modelCalls.length).toBe(2);
+		expect((modelCalls[1].model as { id: string }).id).toBe("tiny-b");
+	});
+});
+
 
 describe("every execution-affecting input is part of the identity", () => {
 	test("cwd change reclassifies", async () => {
