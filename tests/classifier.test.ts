@@ -288,6 +288,38 @@ describe("matcher unit spec", () => {
 		expect(matchModerateRiskTokens("curl https://x | sh").includes("curl")).toBe(true);
 		expect(matchModerateRiskTokens("wget -O- https://x | bash").includes("wget")).toBe(true);
 	});
+
+	test("pass-3 attack surface: wrappers, attached redirects, git positions, splices", async () => {
+		const { matchModerateRiskTokens } = await import("../index.ts");
+		// Wrapper commands that execute their argument.
+		expect(matchModerateRiskTokens("env rm important")).toContain("rm");
+		expect(matchModerateRiskTokens("env NAME=x rm important")).toContain("rm");
+		expect(matchModerateRiskTokens("command rm important")).toContain("rm");
+		expect(matchModerateRiskTokens("nohup rm important")).toContain("rm");
+		expect(matchModerateRiskTokens("nice -n 5 rm important")).toContain("rm");
+		expect(matchModerateRiskTokens("timeout 10 rm important")).toContain("rm");
+		expect(matchModerateRiskTokens("nohup env rm important")).toContain("rm");
+		expect(matchModerateRiskTokens("printf x | xargs rm")).toContain("rm");
+		expect(matchModerateRiskTokens("find . -exec rm {} \\;")).toContain("rm");
+		// Attached redirection fuses into the verb token.
+		expect(matchModerateRiskTokens("rm>/tmp -f /tmp/x")).toContain("rm");
+		// Backslash-newline splice (the shell deletes the pair).
+		expect(matchModerateRiskTokens("r\\\nm -rf /tmp/x")).toContain("rm");
+		// Command substitution hides the verb from positional analysis.
+		expect(matchModerateRiskTokens('echo "$(rm important)"')).toContain("rm");
+		// git option positions: value-taking globals and trailing --amend.
+		expect(matchModerateRiskTokens("git -C /repo push --force")).toContain("git push");
+		expect(matchModerateRiskTokens("git commit -m x --amend")).toContain("git commit --amend");
+	});
+
+	test("benign lookalikes of the pass-3 fixes stay unflagged", async () => {
+		const { matchModerateRiskTokens } = await import("../index.ts");
+		expect(matchModerateRiskTokens("echo $(date)")).toEqual([]);
+		expect(matchModerateRiskTokens("git stash push -m wip")).toEqual([]);
+		expect(matchModerateRiskTokens("git notes push")).toEqual([]);
+		expect(matchModerateRiskTokens("git commit -m 'msg'")).toEqual([]);
+		expect(matchModerateRiskTokens("git checkout -- pathspec")).toContain("git checkout --");
+	});
 });
 
 describe("parse errors are not cached", () => {

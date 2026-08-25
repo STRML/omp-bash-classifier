@@ -422,79 +422,141 @@ function truncated(value: string, max: number): string {
 // keeps the graceful auto-run path.
 //
 // Matching is over shell-tokenized segments (tokenizeShellSegments: quotes
-// stripped, operators split segments), NOT raw text, so an injected command
-// cannot evade the overlay by quoting a token (`r''m`), concatenating a name
-// (`r'x'm`), or interposing git global options (`git -c k=v push`). A segment
-// whose first word is itself piped (the segment list has no pipe verbs), so a
-// `|`-joined downstream command is covered by the fetch-and-execute verb set.
+// stripped, operators split segments), NOT raw text. The tokenizer does not
+// model everything a POSIX shell does, so the matcher normalizes what it can
+// and fails closed on structures it cannot: backslash-newline splices are
+// removed up front (the shell deletes them; the tokenizer keeps them), words
+// with an attached redirect (`rm>/tmp`) are checked by their pre-redirect
+// prefix, command substitution in the raw text demotes any risk verb spelled
+// anywhere in the command to a flag (`echo "$(rm x)"`), and wrapper commands
+// that execute their argument (`env`, `nohup`, `xargs`, `find -exec`) are
+// looked through to the binary they name.
 const MODERATE_RISK_TOKENS = new Set([
-	"rm", "rmdir", "unlink", "mv", "dd", "mkfs", "chmod", "chown", "chattr",
+	"rm", "rmdir", "unlink", "mv", "dd", "chmod", "chown", "chattr",
 	"truncate", "shred", "wipefs", "ddrescue", "sudo", "curl", "wget", "tee",
-	"eval", "python", "python2", "python3", "bash", "sh", "perl",
+	"eval",
 ]);
 
-export function matchModerateRiskTokens(command: string): string[] {
-	// Collapse embedded quotes so `r'x'm` and `r''m` both read as `rm`: the
-	// tokenizer strips enclosing quotes but not mid-token ones, and an injected
-	// command can split a program name with quotes the shell will concatenate.
-	const unq = (w: string) => w.toLowerCase().replace(/['"]/g, "").trim();
+// Interpreters that only matter when they execute inline code (-c/-e);
+// `bash script.sh` is an ordinary invocation.
+const INLINE_CODE_INTERPRETERS = new Set(["python", "python2", "python3", "bash", "sh", "perl"]);
 
-	const segments = tokenizeShellSegments(command);
+// Commands whose ARGUMENT is the program that runs: look through them to the
+// binary they name. env/nice/timeout/stdbuf take options or durations first.
+const WRAPPER_COMMANDS = new Set(["env", "nohup", "nice", "timeout", "stdbuf", "setsid", "command", "exec", "xargs"]);
+
+// git global options that CONSUME a value: skip the option AND its value when
+// hunting for the subcommand (`git -C /repo push` must read push, not /repo).
+const GIT_VALUE_OPTIONS = new Set(["-c", "-C", "--git-dir", "--work-tree", "--namespace", "--super-project"]);
+
+export function matchModerateRiskTokens(command: string): string[] {
+	// POSIX deletes a backslash-newline pair before word splitting; the
+	// tokenizer keeps it, which would split `rm` into r/NL/m. Remove the pairs
+	// for MATCHING purposes so the splice reads as one verb.
+	const normalized = command.replace(/\\\r?\n/gu, "");
+	const segments = tokenizeShellSegments(normalized);
 	const flags = new Set<string>();
+
+	const flagIfRisk = (rawWord: string): boolean => {
+		const w = rawWord.toLowerCase().replace(/['"]/gu, "");
+		if (w === "mkfs" || w.startsWith("mkfs.")) {
+			flags.add("mkfs");
+			return true;
+		}
+		if (MODERATE_RISK_TOKENS.has(w)) {
+			flags.add(w);
+			return true;
+		}
+		return false;
+	};
+
 	for (const segment of segments) {
 		if (segment.length === 0) continue;
-		const words = segment.map(unq);
-		const first = words[0];
-		if (first === "mkfs" || first.startsWith("mkfs.")) {
+		const words = segment.map(w => w.toLowerCase());
+
+		// Look through wrapper commands to the binary they execute. Rather than
+		// parse each wrapper's option grammar (env -u, xargs -n 2, nice 5, ...),
+		// scan the WHOLE segment for a risk token: over-flagging is the safe
+		// direction, and option grammars are exactly where evasions hide.
+		if (WRAPPER_COMMANDS.has(words[0])) {
+			for (const w of words) flagIfRisk(w);
+			continue;
+		}
+		const verb = words[0];
+
+		if (verb === "mkfs" || verb.startsWith("mkfs.")) {
 			flags.add("mkfs");
 			continue;
 		}
-		// python/bash/sh/perl with a `-c`/`-e` executing inline code. Must not
-		// also add bare `python`/`bash` (ordinary `bash script.sh` is fine).
-		if (["python", "python2", "python3", "bash", "sh", "perl"].includes(first)) {
+		if (INLINE_CODE_INTERPRETERS.has(verb)) {
 			const next = words[1];
-			if (next === "-c" || next === "-e") flags.add(`${first} ${next}`);
+			if (next === "-c" || next === "-e") flags.add(`${verb} ${next}`);
 			continue;
 		}
-		if (MODERATE_RISK_TOKENS.has(first)) {
-			flags.add(first);
+		if (MODERATE_RISK_TOKENS.has(verb)) {
+			flags.add(verb);
 			continue;
 		}
-		// git: a dangerous SUBcommand anywhere (git -c k=v push; the global -c
-		// options sit before it). The subcommand is the first word that is not a
-		// git option. `git stash push`/`git merge-base --is-ancestor` are not
-		// risks, so anchor on whether the word IS the subcommand position.
-		if (first === "git") {
-			let sub = "";
-			for (let i = 1; i < words.length; i++) {
-				const w = words[i];
-				if (w.startsWith("-")) { // global option (-c k=v, -C dir)
-					if (w === "-c") i += 1; // -c takes a key=value argument
-					continue;
-				}
-				if (sub === "") {
-					// The FIRST non-option word is the subcommand.
-					if (w === "push" || w === "reset" || w === "clean" || (w === "checkout" && words[i + 1] === "--") || (w === "commit" && words[i + 1] === "--amend")) {
-						flags.add(`git ${w}`);
-						break;
-					}
-					sub = w;
-				}
-				// Any later word is an argument to the subcommand; `git stash
-				// push`/`git notes push` are not the push risk, and only the
-				// first non-option word decides the dangerous subcommand.
+
+		// find names its program inside -exec predicates; also flag a bare risk
+		// verb appearing as a find argument (`find / -name rm` over-flags,
+		// which is the safe direction).
+		if (verb === "find") {
+			let flagged = false;
+			for (let k = 1; k < words.length && !flagged; k++) {
+				if ((words[k] === "-exec" || words[k] === "-execdir") && flagIfRisk(words[k + 1] ?? "")) flagged = true;
+			}
+			for (let k = 1; k < words.length && !flagged; k++) {
+				flagIfRisk(words[k]);
 			}
 			continue;
 		}
-		if (first === "eval") {
-			flags.add("eval");
+
+		// git: global options may consume values (-C dir, -c k=v); after those,
+		// the first remaining word is the subcommand. commit flags on --amend
+		// ANYWHERE later in the segment (`git commit -m x --amend`).
+		if (verb === "git") {
+			let sub = "";
+			for (let k = 1; k < words.length; k++) {
+				const w = words[k];
+				if (w.startsWith("-")) {
+					if (GIT_VALUE_OPTIONS.has(w)) k += 1;
+					continue;
+				}
+				if (sub === "") {
+					if (w === "push" || w === "reset" || w === "clean") {
+						flags.add(`git ${w}`);
+					} else if (w === "checkout" && words.slice(k).includes("--")) {
+						flags.add("git checkout --");
+					} else if (w === "commit") {
+						if (words.slice(k).includes("--amend")) flags.add("git commit --amend");
+					}
+					sub = w;
+				} else if (sub === "commit" && w === "--amend") {
+					flags.add("git commit --amend");
+				}
+			}
 			continue;
 		}
 	}
-	// Standalone pipe verbs that run a downstream interpreter without `-c`:
-	// `curl ... | sh` runs whatever curl fetched.
-	for (const control of ["curl", "wget"]) {
-		if (segments.some(seg => seg[0] === control)) flags.add(control);
+
+	// Words carrying an attached redirection (`rm>/tmp x`): the tokenizer has no
+	// redirect operator, so the redirect fuses into the token. Check the prefix
+	// before the first redirect character.
+	for (const segment of segments) {
+		for (const word of segment) {
+			const m = /^([^<>]+)[<>]/u.exec(word);
+			if (m) flagIfRisk(m[1]);
+		}
+	}
+
+	// Command substitution is outside the tokenizer's scope, so a risk verb
+	// spelled ANYWHERE in a command that contains $( or a backtick cannot be
+	// cleared by position: `echo "$(rm important)"` would otherwise auto-run.
+	if (/\$\(|`/u.test(command)) {
+		for (const token of MODERATE_RISK_TOKENS) {
+			if (new RegExp(`\\b${token}\\b`, "iu").test(normalized)) flags.add(token);
+		}
 	}
 	return [...flags].sort();
 }
