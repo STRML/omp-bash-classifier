@@ -126,10 +126,23 @@ interface BashApprovalPatternRule {
  * Arabic-letter-mark sibling of the U+200E/200F pair.
  */
 const DIALOG_UNSAFE_CHARS =
-	/[\u0000-\u0008\u000B-\u001F\u007F-\u009F\u061C\u200B-\u200F\u202A-\u202E\u2028\u2029\u2060-\u2064\u2066-\u2069\uFEFF]/gu;
+	/[\u0000-\u0009\u000B-\u001F\u007F-\u009F\u061C\u200B-\u200F\u202A-\u202E\u2028\u2029\u2060-\u2064\u2066-\u2069\uFEFF]/gu;
 
+/**
+ * The backslash is escaped FIRST, or the encoding is not injective: a command
+ * carrying the four literal characters \x1b and one carrying a real ESC
+ * rendered identically, so the dialog could not tell the reader which of the
+ * two they were approving, and copying the displayed text got them a
+ * different command than the one that executes.
+ *
+ * U+0009 joins the class because the Markdown renderer EXPANDS tabs, so a
+ * command using them displayed as spaces and was not the command that runs.
+ * Tabs are load-bearing in the constructs worth reviewing: a <<-EOF body
+ * strips leading tabs and not spaces, and IFS, awk field separators and
+ * Makefile recipe lines all depend on them.
+ */
 function escapeControlChars(text: string): string {
-	return text.replace(DIALOG_UNSAFE_CHARS, ch => {
+	return text.replace(/\\/gu, "\\\\").replace(DIALOG_UNSAFE_CHARS, ch => {
 		const code = ch.codePointAt(0) ?? 0;
 		return code > 0xff
 			? `\\u${code.toString(16).padStart(4, "0")}`

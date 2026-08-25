@@ -107,6 +107,24 @@ describe("body", () => {
 		expect(dialog).toContain("\\u202e");
 	});
 
+	test("tabs are escaped, because the renderer expands them", async () => {
+		// A command using tabs displayed as spaces, so the dialog showed a
+		// command that was not the one about to run.
+		const tab = String.fromCharCode(9);
+		const { dialog } = await prompt("printf a" + tab + "b");
+		expect(dialog).not.toContain(tab);
+		expect(dialog).toContain("\\x09");
+	});
+
+	test("the escape is injective, so two commands cannot look identical", async () => {
+		const esc = String.fromCharCode(27);
+		const real = await prompt("echo " + esc + "[2J");
+		const literal = await prompt("echo " + String.fromCharCode(92) + "x1b[2J");
+		expect(real.dialog).not.toBe(literal.dialog);
+		expect(real.dialog).toContain("\\x1b");
+		expect(literal.dialog).toContain("\\\\x1b");
+	});
+
 	test("a bare carriage return cannot overwrite the line", async () => {
 		const { dialog } = await prompt("echo safe\rrm -rf ~/data");
 		expect(dialog).not.toContain("\r");
