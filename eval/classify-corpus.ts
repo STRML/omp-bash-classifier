@@ -14,6 +14,11 @@
  * auto-clear. The full 30-60 command corpus is issue #2; this is the first,
  * minimal slice.
  */
+// PROVISIONAL (issue #2): this harness hand-builds a minimal `Model` and calls
+// completeSimple directly with a caller-supplied key, mirroring index.ts:1432.
+// The plugin's real classify path resolves the model via ctx.models.resolve()
+// (index.ts:1399), a host-injected registry not exported for script use. The
+// finished eval (issue #2) must boot that path; this is the first slice only.
 import { completeSimple } from "@oh-my-pi/pi-ai";
 import { CLASSIFIER_PROMPT, matchModerateRiskTokens, parseJudgement } from "../index";
 
