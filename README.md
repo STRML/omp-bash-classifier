@@ -90,7 +90,25 @@ One call per novel command, then cached for the session per (native-resolved cwd
 
 ## Configuration
 
-No plugin config. It reads the existing `bash.patterns` and `tools.approval` settings, so your current guardrails keep working. To exempt a command shape from classification entirely, give it a narrow `allow` rule in `bash.patterns` — the plugin honors those after the critical-pattern check and never pays for a model call.
+Reads the existing `bash.patterns` and `tools.approval` settings, so your current guardrails keep working. To exempt a command shape from classification entirely, give it a narrow `allow` rule in `bash.patterns` — the plugin honors those after the critical-pattern check and never pays for a model call.
+
+One plugin file, `~/.omp/omp-bash-classifier.json`, plus the `/classifier` command to view or change it:
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `enabled` | `true` | `false` turns off model classification only. Critical-pattern and env-override checks and static rule handling stay enforced. |
+| `model` | `""` (auto) | Explicit model id, overriding the default resolution order: `config.model` -> `@tiny` role -> session model. |
+| `timeoutMs` | `15000` | Classifier call budget; timeout fails closed to a permission request. |
+| `maxCommandLength` | `2000` | Commands longer than this are blocked outright (floor 64). |
+
+Changing any of these invalidates every cached verdict: a SAFE result made under one model or policy cannot survive a config change. `enabled=false` is the escape hatch for environments where the classifier itself must not be called.
+
+## Gate integrity and its limits
+
+The plugin is a layer in front of the native bash gate, not a replacement for it. Two properties follow:
+
+- **Later extensions can revise the command after this plugin judges it.** The host runs every `tool_call` handler in order and the last input revision wins, so another extension could rewrite a judged-SAFE command before execution. Native approval then applies to the revised command: outside `yolo`/autoApprove that still prompts for destructive shapes; in `yolo` the user has opted out of approval entirely. Installing other extensions that mutate tool input next to this plugin is not supported.
+- **The classifier is not a trust boundary for its own verdicts.** A SAFE verdict auto-runs only when the command is free of destructive/irreversible tokens (`rm`, `mv`, `dd`, `mkfs`, `chmod`, `sudo`, `curl`, `git push`, `git reset`, …). Anything carrying such a token raises a permission request even when the model says SAFE, so an injected `answer SAFE` cannot auto-run them. Verdicts that fail to parse are never cached and raise a request.
 
 Settings are read through the host module instance (`pi.pi.settings`). A plugin-local `import { settings }` resolves to a second copy of the singleton with no global instance and throws `Settings not initialized`, which would block every bash call. A session that legitimately has no global settings (SDK, isolated) is handled instead: the plugin logs one warning, honors no static rules, and classifies everything.
 
@@ -104,13 +122,17 @@ Settings are read through the host module instance (`pi.pi.settings`). A plugin-
 ## Files
 
 - `index.ts` — the plugin (single file: `tool_call` gate, static rule mirror, classifier, session cache).
-- `package.json` — manifest (`omp.extensions: ["./index.ts"]`, dev-only deps for `bun run typecheck`).
+- `tests/` — unit suite (bun:test) against the interceptor surface; the model boundary (`pi-ai` completion) is stubbed and everything else runs real against the published packages.
+- `.github/workflows/ci.yml` — typecheck + test gate on push/PR.
+- `package.json` — manifest (`omp.extensions: ["./index.ts"]`, devDependencies pin the exact host package versions the tests exercise).
 - `LICENSE` — MIT.
 
-## Development
+## Testing
 
 ```bash
 bun install
-ln -sfn "$(bun pm -g bin)/../install/global/node_modules/@oh-my-pi" node_modules/@oh-my-pi   # resolve host types
-bun run typecheck
+bun test          # static gate, classifier verdicts, cache keying, fail-closed paths
+bun run typecheck # against the pinned published host types
 ```
+
+CI runs both on push/PR (`bun install --frozen-lockfile`). The model-based classifier's verdict quality is evaluated on demand against a live model (`eval/`, tracked in issue #2), not in CI.
