@@ -175,11 +175,52 @@ describe("notice stays silent otherwise", () => {
 		}
 	});
 
-	test("enabled omitted from the entry is not a disable signal", async () => {
-		writeLockfile({ plugins: { "omp-bash-classifier": { version: "0.2.0" } } });
-		const ctx = makeCtx({ sessionId: "quiet-4", hasUI: true });
+	test("enabled omitted or falsy IS a disable signal, matching the host", async () => {
+		// The loader does `if (runtimeState && !runtimeState.enabled) continue`
+		// with no default, so a hand-edited entry missing the key is disabled as
+		// far as the host is concerned. Requiring === false was stricter than
+		// the thing this notice reports on.
+		for (const [label, entry] of [
+			["omitted", { version: "0.2.0" }],
+			["zero", { version: "0.2.0", enabled: 0 }],
+			["null", { version: "0.2.0", enabled: null }],
+		] as const) {
+			writeLockfile({ plugins: { "omp-bash-classifier": entry } });
+			const ctx = makeCtx({ sessionId: `host-parity-${label}`, hasUI: true });
+			await fire("tool_call", makeEvent("git status"), ctx);
+			expect(notifyCalls(ctx)).toHaveLength(1);
+		}
+	});
+});
+
+describe("a project-scope disable is not silence", () => {
+	test("a project lockfile is read, and the notice names it", async () => {
+		// MarketplaceManager picks targetScope "project" for a project-only
+		// install and writes <projectRoot>/.omp/plugins/omp-plugins.lock.json,
+		// which getPluginsLockfile() never returns. Reading only the user scope
+		// meant that user got silence.
+		const fs = await import("node:fs");
+		const os = await import("node:os");
+		const path = await import("node:path");
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "omp-proj-"));
+		const lock = path.join(root, ".omp", "plugins", "omp-plugins.lock.json");
+		fs.mkdirSync(path.dirname(lock), { recursive: true });
+		fs.writeFileSync(lock, JSON.stringify(DISABLED));
+
+		const ctx = makeCtx({ sessionId: "project-scope", hasUI: true, cwd: root });
 		await fire("tool_call", makeEvent("git status"), ctx);
-		expect(notifyCalls(ctx)).toHaveLength(0);
+		expect(notifyCalls(ctx)).toHaveLength(1);
+		expect(notifyCalls(ctx)[0][0]).toContain(lock);
+
+		fs.rmSync(root, { recursive: true, force: true });
+	});
+
+	test("no project anchor means the user scope answers", async () => {
+		writeLockfile(DISABLED);
+		const ctx = makeCtx({ sessionId: "user-scope", hasUI: true, cwd: "/" });
+		await fire("tool_call", makeEvent("git status"), ctx);
+		expect(notifyCalls(ctx)).toHaveLength(1);
+		expect(notifyCalls(ctx)[0][0]).toContain(process.env.OMP_BASH_CLASSIFIER_TEST_LOCKFILE as string);
 	});
 });
 

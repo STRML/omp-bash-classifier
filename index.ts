@@ -391,71 +391,94 @@ function pluginLockfilePath(): string {
 }
 
 interface LockfileCache {
-	path: string;
 	mtimeMs: number;
 	size: number;
 	disabled: boolean;
 }
-let lockfileCache: LockfileCache | undefined;
+const lockfileCaches = new Map<string, LockfileCache>();
+
+/** Which lockfile answered, so the notice can name the file it actually read. */
+interface LockfileVerdict {
+	disabled: boolean;
+	path: string;
+}
 
 /**
- * True when the user-scope lockfile says this plugin is disabled. A missing,
- * unreadable, or malformed lockfile reads as "not disabled". This drives a
- * notice, never a gate, so guessing wrong must stay silent rather than nag.
+ * Walk up from cwd for the project anchor the host uses (a directory holding
+ * `.omp` or `.git`) and return that scope's lockfile path.
+ *
+ * Without this the notice had a false negative exactly where it hurts: a
+ * project-only install is disabled by `MarketplaceManager.setPluginEnabled`
+ * writing `<projectRoot>/.omp/plugins/omp-plugins.lock.json`, which
+ * `getPluginsLockfile()` never returns, so the user got silence.
  */
-async function lockfileDisablesPlugin(): Promise<boolean> {
-	const lockPath = pluginLockfilePath();
+function projectLockfilePath(cwd: string | undefined): string | undefined {
+	if (!cwd) return undefined;
+	let dir = path.resolve(cwd);
+	for (;;) {
+		if (fs.existsSync(path.join(dir, ".omp")) || fs.existsSync(path.join(dir, ".git"))) {
+			return path.join(dir, ".omp", "plugins", "omp-plugins.lock.json");
+		}
+		const parent = path.dirname(dir);
+		if (parent === dir) return undefined;
+		dir = parent;
+	}
+}
+
+/** Read one lockfile. Missing, unreadable or malformed reads as "not disabled". */
+async function lockfileSaysDisabled(lockPath: string): Promise<boolean> {
 	let stat: fs.Stats;
 	try {
 		// Known and accepted: in the common not-disabled case the session never
-		// enters staleDisableWarned, so the leading short-circuit never fires and
-		// this stat runs once per bash call for the session's life. Caching the
-		// negative would end that, and would also end the feature — noticing a
-		// disable that happens MID-session is the entire point. The cost is one
-		// stat with no read or parse behind it, on a path that already carries
-		// readClassifierConfig's synchronous statSync.
+		// enters staleDisableWarned, so the leading short-circuit never fires
+		// and this stat runs once per bash call for the session's life. Caching
+		// the negative would end that, and would also end the feature — noticing
+		// a disable that happens MID-session is the entire point.
 		//
-		// Async keeps the event loop free, which is worth having, but be clear
-		// about what it does NOT buy: the handler still parks here, and the
-		// runner bounds each tool_call at toolCallTimeoutMs and returns
-		// { block: true } on timeout. On a stalled network mount this stat can
-		// still block the bash call it rode in on. The exposure is pre-existing
-		// rather than introduced — readClassifierConfig above does a
-		// synchronous statSync on the same config root on every call — so this
-		// is not the place to fix it, but the earlier claim that awaiting
-		// removed the risk was wrong.
+		// Async keeps the event loop free, but be clear about what it does NOT
+		// buy: the handler still parks here, and the runner bounds each
+		// tool_call and returns { block: true } on timeout, so on a stalled
+		// mount this can still block the bash call it rode in on. That exposure
+		// is pre-existing — readClassifierConfig statSyncs the same config root
+		// on every call — so this is not the place to fix it.
 		stat = await fs.promises.stat(lockPath);
 	} catch {
-		// No lockfile at the user-scope path: the common case for project-scoped
-		// and dev-linked installs. Nothing is read or parsed, and skipping the
-		// cache keeps a lockfile created later visible.
+		// Nothing read or parsed, and skipping the cache keeps a lockfile
+		// created later visible.
 		return false;
 	}
-	// Size joins mtime in the key: mtime granularity is sub-ms on APFS and ext4
-	// but 1-2s on NFS and some bind mounts, and a rewrite inside that window is
-	// exactly what `omp plugin disable` does.
-	// The path is part of the key: it is re-resolved every call and a runtime
-	// setProfile() moves it, so without this a new profile's lockfile that
-	// happened to match on mtime and size would return the old profile's answer.
-	if (
-		lockfileCache &&
-		lockfileCache.path === lockPath &&
-		lockfileCache.mtimeMs === stat.mtimeMs &&
-		lockfileCache.size === stat.size
-	) {
-		return lockfileCache.disabled;
+	// Size and path join mtime in the key: mtime granularity is 1-2s on NFS and
+	// some bind mounts and a rewrite inside that window is exactly what
+	// `omp plugin disable` does, and the path can move under setProfile().
+	const cached = lockfileCaches.get(lockPath);
+	if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
+		return cached.disabled;
 	}
 	let disabled = false;
 	try {
-		const raw = JSON.parse(await fs.promises.readFile(lockPath, "utf8")) as Record<string, unknown>;
-		disabled = pluginEntryIsDisabled(raw);
+		disabled = pluginEntryIsDisabled(JSON.parse(await fs.promises.readFile(lockPath, "utf8")) as Record<string, unknown>);
 	} catch {
-		// Unreadable or malformed reads as "not disabled". Cached anyway, keyed
-		// on the same stat, or a malformed lockfile is re-parsed on every call.
+		// Cached anyway, keyed on the same stat, or a malformed lockfile is
+		// re-parsed on every bash call.
 		disabled = false;
 	}
-	lockfileCache = { path: lockPath, mtimeMs: stat.mtimeMs, size: stat.size, disabled };
+	lockfileCaches.set(lockPath, { mtimeMs: stat.mtimeMs, size: stat.size, disabled });
 	return disabled;
+}
+
+/**
+ * Both scopes. The host reads a project lockfile when one exists and lets it
+ * shadow the user one, so checking only the user scope meant a project-scope
+ * disable produced silence — the exact symptom this notice exists to explain.
+ * Project is checked first because that is the one that would be in force.
+ */
+async function lockfileDisablesPlugin(cwd: string | undefined): Promise<LockfileVerdict> {
+	const projectPath = projectLockfilePath(cwd);
+	if (projectPath && (await lockfileSaysDisabled(projectPath))) {
+		return { disabled: true, path: projectPath };
+	}
+	const userPath = pluginLockfilePath();
+	return { disabled: await lockfileSaysDisabled(userPath), path: userPath };
 }
 
 function pluginEntryIsDisabled(raw: Record<string, unknown>): boolean {
@@ -463,7 +486,10 @@ function pluginEntryIsDisabled(raw: Record<string, unknown>): boolean {
 	if (!plugins || typeof plugins !== "object") return false;
 	const entry = (plugins as Record<string, unknown>)[PLUGIN_NAME];
 	if (!entry || typeof entry !== "object") return false;
-	return (entry as Record<string, unknown>).enabled === false;
+	// Matches the host, which does `if (runtimeState && !runtimeState.enabled)`
+	// with no default for `enabled`. A hand-edited entry that omits it, or
+	// sets 0, is disabled as far as the loader is concerned.
+	return !(entry as Record<string, unknown>).enabled;
 }
 
 function formatClassifierConfig(config: ClassifierConfig): string {
@@ -993,7 +1019,10 @@ export default function (pi: ExtensionAPI) {
 			// calls interleaves right here. The trailing has/add pair has no
 			// await between its halves, which is atomic on a single-threaded
 			// loop.
-			if (!staleDisableWarned.has(sessionId) && (await lockfileDisablesPlugin()) && !staleDisableWarned.has(sessionId)) {
+			const verdict = !staleDisableWarned.has(sessionId)
+				? await lockfileDisablesPlugin(ctx.cwd)
+				: { disabled: false, path: "" };
+			if (verdict.disabled && !staleDisableWarned.has(sessionId)) {
 				// Claimed only AFTER delivery. Marking first meant a throwing
 				// notify silently burned the session's one notice. The has/add
 				// pair still has no await between its halves, so the race guard
@@ -1015,7 +1044,7 @@ export default function (pi: ExtensionAPI) {
 					? "If you meant to turn it off, restart OMP to unload it, or run /classifier enabled false to stop classifying now."
 					: "Classification is already off, but critical patterns, env checks and static rules keep running until you restart OMP.";
 				const notice =
-					`${PLUGIN_NAME} is marked disabled in ${pluginLockfilePath()} while still bound to this session. ` +
+					`${PLUGIN_NAME} is marked disabled in ${verdict.path} while still bound to this session. ` +
 					`${remedy} A project-scope lockfile can re-enable it, in which case this is expected.`;
 				// Headless runs have nobody to read a toast, and this file's one
 				// rule for touching the UI is to check hasUI first (see
