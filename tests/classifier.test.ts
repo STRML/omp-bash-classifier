@@ -263,6 +263,21 @@ describe("matcher unit spec", () => {
 		}
 	});
 
+	test("an absolute path does not defeat the risk overlay", async () => {
+		// A command's identity is its basename. Matching the literal first word
+		// let `/bin/rm` and `/usr/bin/env rm` past the backstop that catches a
+		// classifier SAFE on a destructive verb.
+		const { matchModerateRiskTokens } = await import("../index.ts");
+		const cases: Array<[string, string[]]> = [
+			["/bin/rm -rf ./src", ["rm"]],
+			["/usr/bin/env rm -rf ./src", ["rm"]],
+			["/bin/sh -c 'rm -rf x'", ["sh -c"]],
+		];
+		for (const [command, expected] of cases) {
+			expect(matchModerateRiskTokens(command)).toEqual(expected);
+		}
+	});
+
 	test("leaves routine read/build/test pipelines unflagged", async () => {
 		const { matchModerateRiskTokens } = await import("../index.ts");
 		const clean: string[] = [
