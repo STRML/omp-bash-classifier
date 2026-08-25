@@ -686,6 +686,82 @@ const WRAPPER_COMMANDS = new Set(["env", "nohup", "nice", "timeout", "stdbuf", "
 // hunting for the subcommand (`git -C /repo push` must read push, not /repo).
 const GIT_VALUE_OPTIONS = new Set(["-c", "-C", "--git-dir", "--work-tree", "--namespace", "--super-project"]);
 
+// ---------------------------------------------------------------------------
+// Network fetches
+//
+// `curl` and `wget` sit in MODERATE_RISK_TOKENS, which forces a permission
+// prompt even on a SAFE verdict. That is right for the shapes that touch the
+// local disk and wrong for the overwhelmingly common one: reading a URL to
+// stdout. `curl -fsSL https://api.example/x | jq .` is a read, and prompting
+// for it every time is what trains a user to approve without looking.
+//
+// So the direct-invocation case is decided by the invocation itself. The verbs
+// stay in MODERATE_RISK_TOKENS on purpose: the wrapper (`xargs curl`), `find
+// -exec`, and command-substitution scans all consult that set, and over-flagging
+// is the safe direction in exactly those places.
+//
+// The two tools have opposite defaults, and the rules mirror that rather than
+// pretending they are the same:
+//   curl  writes to stdout unless told otherwise -> flag on a write/upload flag
+//   wget  writes a file unless told otherwise    -> flag unless stdout is explicit
+// ---------------------------------------------------------------------------
+
+/**
+ * curl short flags that write to, or read from, the local disk. CASE MATTERS
+ * and is the whole point of reading the raw token rather than the lowercased
+ * one: `-K` reads a config that can set an output path while `-k` only skips
+ * TLS verification, and `-D` dumps headers to a file while `-d` is a POST body.
+ */
+/**
+ * A shell named as a DOWNSTREAM segment executes whatever is piped into it, so
+ * `<anything> | sh` runs code the gate never saw. CRITICAL_BASH_PATTERNS already
+ * blocks the `curl … | sh` spelling outright; this is the general case behind
+ * it, and it is what makes narrowing curl/wget safe: the reason a read-only
+ * fetch can stop prompting is that the shape which turns a fetch into execution
+ * is caught here instead of by flagging every curl.
+ */
+const STDIN_EXECUTING_SHELLS = new Set(["sh", "bash", "zsh", "fish", "dash", "ksh", "csh", "tcsh"]);
+
+const CURL_LOCAL_FILE_SHORT_FLAGS = "oOTKDcC";
+
+const CURL_LOCAL_FILE_LONG_FLAGS = new Set([
+	"--output", "--output-dir", "--remote-name", "--remote-name-all", "--upload-file",
+	"--config", "--create-dirs", "--dump-header", "--cookie-jar", "--trace",
+	"--trace-ascii", "--trace-config",
+]);
+
+/** True when this curl/wget invocation can read or write a local file. */
+function networkFetchTouchesDisk(verb: string, rawWords: string[]): boolean {
+	const args = rawWords.slice(1);
+	if (verb === "curl") {
+		for (const arg of args) {
+			// `@file` is how -d/-F/-T name a local file to send.
+			if (arg.startsWith("@")) return true;
+			if (arg.startsWith("--")) {
+				if (CURL_LOCAL_FILE_LONG_FLAGS.has(arg.split("=", 1)[0])) return true;
+				continue;
+			}
+			if (!arg.startsWith("-") || arg === "-") continue;
+			// A short bundle: -fsSL is clean, -sO is not.
+			for (const ch of arg.slice(1)) {
+				if (CURL_LOCAL_FILE_SHORT_FLAGS.includes(ch)) return true;
+			}
+		}
+		return false;
+	}
+	// wget downloads to a file by default, so silence has to be earned.
+	for (let i = 0; i < args.length; i++) {
+		const arg = args[i];
+		if (arg === "--spider") return false;
+		if (arg === "--output-document=-") return false;
+		if (arg === "--output-document" && args[i + 1] === "-") return false;
+		// -O- and -qO- write to stdout; -O and -qO take the next word.
+		if (/^-[a-zA-Z]*O-$/u.test(arg)) return false;
+		if (/^-[a-zA-Z]*O$/u.test(arg) && args[i + 1] === "-") return false;
+	}
+	return true;
+}
+
 export function matchModerateRiskTokens(command: string): string[] {
 	// POSIX deletes a backslash-newline pair before word splitting; the
 	// tokenizer keeps it, which would split `rm` into r/NL/m. Remove the pairs
@@ -693,6 +769,13 @@ export function matchModerateRiskTokens(command: string): string[] {
 	const normalized = command.replace(/\\\r?\n/gu, "");
 	const segments = tokenizeShellSegments(normalized);
 	const flags = new Set<string>();
+
+	// A fetch feeding a shell is an execution, not a read, however read-only the
+	// fetch looks on its own. Computed over the whole command because the fetch
+	// and the shell are different segments.
+	const pipesIntoShell = segments.some(
+		(segment, index) => index > 0 && segment.length > 0 && STDIN_EXECUTING_SHELLS.has(segment[0].toLowerCase()),
+	);
 
 	const flagIfRisk = (rawWord: string): boolean => {
 		const w = rawWord.toLowerCase().replace(/['"]/gu, "");
@@ -707,7 +790,8 @@ export function matchModerateRiskTokens(command: string): string[] {
 		return false;
 	};
 
-	for (const segment of segments) {
+	for (let segmentIndex = 0; segmentIndex < segments.length; segmentIndex++) {
+		const segment = segments[segmentIndex];
 		if (segment.length === 0) continue;
 		const words = segment.map(w => w.toLowerCase());
 
@@ -721,6 +805,11 @@ export function matchModerateRiskTokens(command: string): string[] {
 		}
 		const verb = words[0];
 
+		// A shell that is not the first segment is being fed on stdin.
+		if (segmentIndex > 0 && STDIN_EXECUTING_SHELLS.has(verb)) {
+			flags.add(`| ${verb}`);
+		}
+
 		if (verb === "mkfs" || verb.startsWith("mkfs.")) {
 			flags.add("mkfs");
 			continue;
@@ -728,6 +817,13 @@ export function matchModerateRiskTokens(command: string): string[] {
 		if (INLINE_CODE_INTERPRETERS.has(verb)) {
 			const next = words[1];
 			if (next === "-c" || next === "-e") flags.add(`${verb} ${next}`);
+			continue;
+		}
+		// Decided by the invocation, not by the verb. See networkFetchTouchesDisk.
+		// `segment`, not `words`: the lowercased copy loses -K from -k and -D
+		// from -d, which is exactly the distinction being made.
+		if (verb === "curl" || verb === "wget") {
+			if (pipesIntoShell || networkFetchTouchesDisk(verb, segment)) flags.add(verb);
 			continue;
 		}
 		if (MODERATE_RISK_TOKENS.has(verb)) {
