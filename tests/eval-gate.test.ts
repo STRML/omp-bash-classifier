@@ -535,3 +535,68 @@ describe("third-review regressions", () => {
 		expect(await sites(`system = 5\nputs system`, "rb")).toEqual([]);
 	});
 });
+
+describe("fourth-review regressions", () => {
+	test("a %x command reaches the judge with its payload intact", async () => {
+		expect(await commands(`%x{ssh host "rm -rf /data"}`, "rb")).toEqual([`ssh host "rm -rf /data"`]);
+	});
+
+	test("a # inside %x does not erase the command", async () => {
+		// maskComments blanked to end of line and took the closing brace with
+		// it, so the site vanished entirely rather than becoming opaque.
+		expect(await commands(`%x{echo a#b}`, "rb")).toEqual(["echo a#b"]);
+	});
+
+	test.each([
+		[`system "rm -rf x" # ok`, "trailing comment"],
+		[`system "rm -rf x" if flag`, "modifier if"],
+		[`system "rm -rf x"; puts 1`, "statement separator"],
+	])("a parenless spawn reads past %s", async code => {
+		expect(await commands(code, "rb")).toEqual(["rm -rf x"]);
+	});
+
+	test("a semicolon inside the command is not a statement separator", async () => {
+		expect(await commands(`system "echo a; b"`, "rb")).toEqual([`echo a; b`]);
+	});
+
+	test.each([
+		[`Kernel.system "rm -rf x"`],
+		[`Process.spawn("rm -rf x")`],
+		[`IO::popen("rm -rf x")`],
+	])("receiver-qualified ruby spawn %#", async code => {
+		expect(await commands(code, "rb")).toEqual(["rm -rf x"]);
+	});
+
+	test.each([
+		["/bin/rm -rf ./src", ["rm"]],
+		["/usr/bin/env rm -rf ./src", ["rm"]],
+		["/bin/sh -c 'rm -rf x'", ["sh -c"]],
+	])("an absolute path does not defeat the risk overlay: %s", async (command, expected) => {
+		// A command's identity is its basename. Matching the literal word let
+		// `/bin/rm` past the backstop that catches a classifier SAFE, and the
+		// eval reader builds absolute-path commands by construction.
+		const { matchModerateRiskTokens } = await import("../index.ts");
+		expect(matchModerateRiskTokens(command)).toEqual(expected);
+	});
+
+	test.each([["git status"], ["echo hi"], ["npm test"]])("routine command %s still flags nothing", async command => {
+		const { matchModerateRiskTokens } = await import("../index.ts");
+		expect(matchModerateRiskTokens(command)).toEqual([]);
+	});
+
+	test("an absolute-path spawn built by the reader asks", async () => {
+		setClassifierReply("SAFE");
+		const result = await gate(`os.execv("/bin/rm", ["rm", "-rf", "./src"])`, "py");
+		expect(result).toContain("flagged for approval");
+		expect(result).toContain("rm");
+	});
+
+	test("tools.approval.bash prompt reaches the human for an eval spawn", async () => {
+		// The bash gate hands `prompt` back to the host. No host prompt exists
+		// for an eval spawn, so it has to be raised here.
+		await loadPlugin(makeSettings([], "prompt"));
+		const result = await gate(`subprocess.run(["git", "pull"])`, "py");
+		expect(result).toContain("tools.approval.bash: prompt");
+		expect(modelCalls.length).toBe(0);
+	});
+});

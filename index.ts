@@ -470,6 +470,20 @@ const WRAPPER_COMMANDS = new Set(["env", "nohup", "nice", "timeout", "stdbuf", "
 // hunting for the subcommand (`git -C /repo push` must read push, not /repo).
 const GIT_VALUE_OPTIONS = new Set(["-c", "-C", "--git-dir", "--work-tree", "--namespace", "--super-project"]);
 
+/**
+ * A command's identity is its basename. `/bin/rm` runs rm and `/usr/bin/env` is
+ * still env, but the matcher compared the literal word, so any absolute path
+ * walked past this whole overlay: `/bin/rm -rf ./src` flagged nothing while
+ * `rm -rf ./src` flagged `rm`. The eval reader hands over that exact shape by
+ * construction, because `os.execv("/bin/rm", …)` and `execFile("/bin/rm", …)`
+ * reconstruct an absolute path.
+ */
+function commandBasename(word: string): string {
+	const cleaned = word.replace(/['"]/gu, "");
+	const slash = cleaned.lastIndexOf("/");
+	return slash === -1 ? cleaned : cleaned.slice(slash + 1);
+}
+
 export function matchModerateRiskTokens(command: string): string[] {
 	// POSIX deletes a backslash-newline pair before word splitting; the
 	// tokenizer keeps it, which would split `rm` into r/NL/m. Remove the pairs
@@ -479,7 +493,7 @@ export function matchModerateRiskTokens(command: string): string[] {
 	const flags = new Set<string>();
 
 	const flagIfRisk = (rawWord: string): boolean => {
-		const w = rawWord.toLowerCase().replace(/['"]/gu, "");
+		const w = commandBasename(rawWord.toLowerCase());
 		if (w === "mkfs" || w.startsWith("mkfs.")) {
 			flags.add("mkfs");
 			return true;
@@ -499,11 +513,11 @@ export function matchModerateRiskTokens(command: string): string[] {
 		// parse each wrapper's option grammar (env -u, xargs -n 2, nice 5, ...),
 		// scan the WHOLE segment for a risk token: over-flagging is the safe
 		// direction, and option grammars are exactly where evasions hide.
-		if (WRAPPER_COMMANDS.has(words[0])) {
+		if (WRAPPER_COMMANDS.has(commandBasename(words[0]))) {
 			for (const w of words) flagIfRisk(w);
 			continue;
 		}
-		const verb = words[0];
+		const verb = commandBasename(words[0]);
 
 		if (verb === "mkfs" || verb.startsWith("mkfs.")) {
 			flags.add("mkfs");
@@ -1144,7 +1158,9 @@ function rubyCallees(): Map<string, SpawnArgShape> {
 		const shape = RUBY_MEMBERS[bare];
 		callees.set(`Kernel.${bare}`, shape);
 		callees.set(`self.${bare}`, shape);
+		callees.set(`Process.${bare}`, shape);
 	}
+	callees.set("IO::popen", "single");
 	return callees;
 }
 
@@ -1262,6 +1278,45 @@ function skipTemplateLiteral(text: string, start: number): number {
 	return -1;
 }
 
+const PERCENT_X_CLOSERS: Record<string, string> = { "{": "}", "(": ")", "[": "]", "<": ">" };
+
+/** Skip Ruby's `%x{…}` command literal, honoring nested delimiters. */
+function skipPercentX(text: string, start: number): number {
+	if (!text.startsWith("%x", start)) return -1;
+	const open = text[start + 2];
+	const close = PERCENT_X_CLOSERS[open];
+	if (!close) return -1;
+	let depth = 1;
+	let i = start + 3;
+	while (i < text.length) {
+		if (text[i] === "\\") {
+			i += 2;
+			continue;
+		}
+		if (text[i] === open) depth += 1;
+		else if (text[i] === close) {
+			depth -= 1;
+			if (depth === 0) return i + 1;
+		}
+		i += 1;
+	}
+	return -1;
+}
+
+/**
+ * Step over a region that is a literal COMMAND rather than a string: a backtick
+ * literal, or Ruby's `%x{…}`. Such a region may not be blanked, because its
+ * text is exactly what gets judged, and may not be entered, because a quote
+ * inside it would open a phantom string and swallow the next spawn. Every bug
+ * in this layer has been a literal form one mask knew about and the other did
+ * not, so both passes consult this single list.
+ */
+function skipCommandLiteral(text: string, start: number, language: EvalLanguageToken): number {
+	if (text[start] === "`" && language !== "py") return skipTemplateLiteral(text, start);
+	if (language === "rb" && text[start] === "%") return skipPercentX(text, start);
+	return -1;
+}
+
 /** Quote characters that open a string literal in each dialect. */
 function quoteChars(language: EvalLanguageToken): string[] {
 	if (language === "py") return ["'", '"'];
@@ -1287,6 +1342,11 @@ function maskComments(code: string, language: EvalLanguageToken): string {
 	};
 	let i = 0;
 	while (i < code.length) {
+		const literal = skipCommandLiteral(code, i, language);
+		if (literal !== -1) {
+			i = literal;
+			continue;
+		}
 		if (quotes.includes(code[i])) {
 			const end = skipQuoted(code, i);
 			// Not a string after all: step over this character rather than
@@ -1351,9 +1411,13 @@ function maskStringInteriors(code: string, language: EvalLanguageToken): string 
 				continue;
 			}
 		}
+		const literal = backtickIsLiteral ? skipCommandLiteral(code, i, language) : -1;
+		if (literal !== -1) {
+			i = literal;
+			continue;
+		}
 		if (backtickIsLiteral && code[i] === "`") {
-			const end = skipTemplateLiteral(code, i);
-			i = end === -1 ? i + 1 : end;
+			i += 1;
 			continue;
 		}
 		if (quotes.includes(code[i])) {
@@ -1410,18 +1474,31 @@ function inlineChildProcessSites(code: string, scan: string): EvalSpawnSite[] {
  * named-callee scan looks for a `(`, so without this pass most of the rb table
  * never fires. Arguments run to the end of the line.
  */
-function rubyParenlessSites(code: string, scan: string): EvalSpawnSite[] {
+function rubyParenlessSites(literalScan: string, scan: string): EvalSpawnSite[] {
 	const sites: EvalSpawnSite[] = [];
 	// Any argument, not just a quoted one: `system cmd` must reach the opaque
 	// branch, the way `system(cmd)` already does. The exclusions keep an
 	// assignment (`system = 5`), a comment, and the parenthesized form (handled
-	// by the named-callee pass) from matching.
-	for (const m of matchAll(scan, /(?:^|[^\w$.@:])(system|exec|spawn)\s+(?![\s=;#(])/gu)) {
+	// by the named-callee pass) from matching. An explicit receiver is the same
+	// call written out.
+	for (const m of matchAll(scan, /(?:^|[^\w$.@:])((?:Kernel|self|Process)\.)?(system|exec|spawn)\s+(?![\s=;#(])/gu)) {
 		const start = (m.index ?? 0) + m[0].length;
-		const nl = code.indexOf("\n", start);
-		const argsText = code.slice(start, nl === -1 ? code.length : nl);
-		const command = commandFromArguments(argsText, "rb", "variadic");
-		sites.push(command === undefined ? { callee: m[1] } : { callee: m[1], command });
+		const nl = scan.indexOf("\n", start);
+		const lineEnd = nl === -1 ? scan.length : nl;
+		// Find where the argument list ends in the MASKED copy, so a `;` or the
+		// word `if` inside a string cannot cut it short, then read the arguments
+		// from the comment-masked copy, where the strings are still intact. The
+		// arguments used to be read from raw source: a trailing `# comment`,
+		// `; puts 1`, or a modifier `if` then made a fully readable command
+		// report as opaque, and the dialog told the human it was built at
+		// runtime while withholding the command it was asking about.
+		const line = scan.slice(start, lineEnd);
+		const semicolon = line.indexOf(";");
+		const modifier = /\s(?:if|unless|while|until|rescue)\b/u.exec(line);
+		const cuts = [semicolon, modifier?.index ?? -1].filter(at => at !== -1);
+		const cut = cuts.length > 0 ? start + Math.min(...cuts) : lineEnd;
+		const command = commandFromArguments(literalScan.slice(start, cut), "rb", "variadic");
+		sites.push(command === undefined ? { callee: m[2] } : { callee: m[2], command });
 	}
 	return sites;
 }
@@ -1497,7 +1574,7 @@ export function extractEvalSpawnSites(code: string, language: EvalLanguageToken)
 			sites.push(siteAt(code, `promisify(${m[1]})`, shape, (m.index ?? 0) + m[0].length - 1, language));
 		}
 	}
-	if (language === "rb") sites.push(...rubyParenlessSites(code, scan));
+	if (language === "rb") sites.push(...rubyParenlessSites(literalScan, scan));
 	// `scan`, not `literalScan`: a backtick inside an ordinary Ruby string is
 	// blanked there, so it stops registering as a spawn for a cell that spawns
 	// nothing. Real backtick commands survive because backticks are excluded
@@ -1585,7 +1662,10 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 				const next = writeClassifierConfig({ enabled: value === "true" });
-				notify(`classifier enabled=${next.enabled}. Critical, env, and static-rule checks stay active either way.`);
+				notify(
+					`classifier enabled=${next.enabled}. Critical, env, and static-rule checks stay active either way, ` +
+						`and an eval spawn whose command is not spelled out still asks.`,
+				);
 				return;
 			}
 			if (key === "model") {
@@ -1870,6 +1950,20 @@ export default function (pi: ExtensionAPI) {
 				// so honor it here rather than letting eval be the way around it.
 				if (!rule && policy.bashPolicy === "deny") {
 					plans.push({ act: "block", reason: "eval spawn blocked by user policy: tools.approval.bash: deny" });
+					continue;
+				}
+				// The bash gate hands a `prompt` policy back to the host, which
+				// prompts. No host prompt exists for an eval spawn, so a user who
+				// set this to see every command would otherwise watch
+				// `subprocess.run("git pull")` run silently on a SAFE verdict.
+				if (!rule && policy.bashPolicy === "prompt") {
+					plans.push({
+						act: "ask",
+						command,
+						callee: site.callee,
+						headline: "prompt required by user policy",
+						reason: "tools.approval.bash: prompt",
+					});
 					continue;
 				}
 				if (CRITICAL_BASH_PATTERNS.some(pattern => pattern.test(command))) {
