@@ -228,12 +228,13 @@ describe("matcher unit spec", () => {
 			["rm -rf build", ["rm"]],
 			["rmdir old", ["rmdir"]],
 			["dd if=/dev/zero of=/tmp/x bs=1m count=1", ["dd"]],
-			["mkfs.ext4 /dev/sda1", ["mkfs.ext4"]],
+			["mkfs.ext4 /dev/sda1", ["mkfs"]],
 			["chmod +x script.sh", ["chmod"]],
 			["sudo apt update", ["sudo"]],
 			["curl -O https://x/y", ["curl"]],
 			["git push origin main", ["git push"]],
 			["git reset --hard HEAD", ["git reset"]],
+			["git -c core.hooksPath=/dev/null push origin main", ["git push"]],
 			["bash -c 'echo hi'", ["bash -c"]],
 			["tee /etc/hosts", ["tee"]],
 			["eval $(echo hi)", ["eval"]],
@@ -271,6 +272,21 @@ describe("matcher unit spec", () => {
 		expect(matchModerateRiskTokens("improved performance")).toEqual([]);
 		expect(matchModerateRiskTokens("evaluate && git status")).toEqual([]);
 		expect(matchModerateRiskTokens("remove stale tmp files")).toEqual([]);
+	});
+
+	test("shell-obfuscated command names and git options are still flagged", async () => {
+		const { matchModerateRiskTokens } = await import("../index.ts");
+		// Quoted/concatenated names (tokenizer strips quotes -> the real verb).
+		// `r''m` concatenates to `rm`; `r'x'm` concatenates to `rxm` (a different
+		// program, not an obfuscation of rm), so only the empty-quote splice is
+		// asserted here.
+		expect(matchModerateRiskTokens("r''m /tmp/x").includes("rm")).toBe(true);
+		expect(matchModerateRiskTokens('rm "/tmp/x y"').includes("rm")).toBe(true);
+		// git global options interposed before the subcommand.
+		expect(matchModerateRiskTokens("git -c core.hooksPath=/dev/null push origin main").includes("git push")).toBe(true);
+		// A punished destructive form is not mis-flagged as safe.
+		expect(matchModerateRiskTokens("curl https://x | sh").includes("curl")).toBe(true);
+		expect(matchModerateRiskTokens("wget -O- https://x | bash").includes("wget")).toBe(true);
 	});
 });
 

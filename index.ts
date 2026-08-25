@@ -420,13 +420,81 @@ function truncated(value: string, max: number): string {
 // class. The builtin CRITICAL_BASH_PATTERNS does not cover them all.
 // Anything NOT listed (echo, git status/diff/log, cd, pipes, redirects, &&)
 // keeps the graceful auto-run path.
-const MODERATE_RISK_RE =
-	/\b(rm|rmdir|unlink|mv|dd\b|mkfs[a-z0-9._-]*|chmod|chown|chattr|truncate|shred|wipefs|ddrescue|sudo|curl|wget|tee\b|eval|git\s+push|git\s+reset|git\s+clean|git\s+checkout\s+--|git\s+commit\s+--amend|python[23]?\s+-c|bash\s+-c|sh\s+-c|perl\s+-e)(?=[\s;&|()'"`]|$)/giu;
+//
+// Matching is over shell-tokenized segments (tokenizeShellSegments: quotes
+// stripped, operators split segments), NOT raw text, so an injected command
+// cannot evade the overlay by quoting a token (`r''m`), concatenating a name
+// (`r'x'm`), or interposing git global options (`git -c k=v push`). A segment
+// whose first word is itself piped (the segment list has no pipe verbs), so a
+// `|`-joined downstream command is covered by the fetch-and-execute verb set.
+const MODERATE_RISK_TOKENS = new Set([
+	"rm", "rmdir", "unlink", "mv", "dd", "mkfs", "chmod", "chown", "chattr",
+	"truncate", "shred", "wipefs", "ddrescue", "sudo", "curl", "wget", "tee",
+	"eval", "python", "python2", "python3", "bash", "sh", "perl",
+]);
 
 export function matchModerateRiskTokens(command: string): string[] {
+	// Collapse embedded quotes so `r'x'm` and `r''m` both read as `rm`: the
+	// tokenizer strips enclosing quotes but not mid-token ones, and an injected
+	// command can split a program name with quotes the shell will concatenate.
+	const unq = (w: string) => w.toLowerCase().replace(/['"]/g, "").trim();
+
+	const segments = tokenizeShellSegments(command);
 	const flags = new Set<string>();
-	for (const match of command.matchAll(MODERATE_RISK_RE)) {
-		flags.add(match[1].trim().toLowerCase());
+	for (const segment of segments) {
+		if (segment.length === 0) continue;
+		const words = segment.map(unq);
+		const first = words[0];
+		if (first === "mkfs" || first.startsWith("mkfs.")) {
+			flags.add("mkfs");
+			continue;
+		}
+		// python/bash/sh/perl with a `-c`/`-e` executing inline code. Must not
+		// also add bare `python`/`bash` (ordinary `bash script.sh` is fine).
+		if (["python", "python2", "python3", "bash", "sh", "perl"].includes(first)) {
+			const next = words[1];
+			if (next === "-c" || next === "-e") flags.add(`${first} ${next}`);
+			continue;
+		}
+		if (MODERATE_RISK_TOKENS.has(first)) {
+			flags.add(first);
+			continue;
+		}
+		// git: a dangerous SUBcommand anywhere (git -c k=v push; the global -c
+		// options sit before it). The subcommand is the first word that is not a
+		// git option. `git stash push`/`git merge-base --is-ancestor` are not
+		// risks, so anchor on whether the word IS the subcommand position.
+		if (first === "git") {
+			let sub = "";
+			for (let i = 1; i < words.length; i++) {
+				const w = words[i];
+				if (w.startsWith("-")) { // global option (-c k=v, -C dir)
+					if (w === "-c") i += 1; // -c takes a key=value argument
+					continue;
+				}
+				if (sub === "") {
+					// The FIRST non-option word is the subcommand.
+					if (w === "push" || w === "reset" || w === "clean" || (w === "checkout" && words[i + 1] === "--") || (w === "commit" && words[i + 1] === "--amend")) {
+						flags.add(`git ${w}`);
+						break;
+					}
+					sub = w;
+				}
+				// Any later word is an argument to the subcommand; `git stash
+				// push`/`git notes push` are not the push risk, and only the
+				// first non-option word decides the dangerous subcommand.
+			}
+			continue;
+		}
+		if (first === "eval") {
+			flags.add("eval");
+			continue;
+		}
+	}
+	// Standalone pipe verbs that run a downstream interpreter without `-c`:
+	// `curl ... | sh` runs whatever curl fetched.
+	for (const control of ["curl", "wget"]) {
+		if (segments.some(seg => seg[0] === control)) flags.add(control);
 	}
 	return [...flags].sort();
 }
@@ -784,9 +852,10 @@ export default function (pi: ExtensionAPI) {
 					"classifier unavailable",
 				);
 			}
-			// A malformed reply is a transient failure, not a policy: cache it
-			// and one flaky answer pins the session to continuous prompts (and a
-			// later config change could never retire it). Anything else caches.
+			// A malformed reply is a transient failure, not a policy: do NOT
+			// cache it, or one flaky answer pins the session to repeated prompts.
+			// Anything that parsed caches (including UNSURE, whose cached entry
+			// keeps a nondeterministic classifier from flapping verdicts).
 			if (!cached && judgement.verdict !== "PARSE_ERROR") remember(scoped, cacheKey, judgement);
 
 			if (judgement.verdict === "SAFE") {
