@@ -1,2 +1,4 @@
-# devDependencies (typecheck + test fixtures) — not part of the plugin
+.DS_Store
+
+# typecheck support (symlink to fork's @oh-my-pi) — machine-local, not part of the plugin
 node_modules/

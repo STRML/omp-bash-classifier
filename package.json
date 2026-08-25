@@ -1,7 +1,7 @@
 {
 	"name": "omp-bash-classifier",
-	"version": "0.1.0",
-	"description": "Classifier-graceful bash approval for OMP: trivial commands auto-run, dangerous commands block, ambiguous commands prompt. Shadows the builtin bash tool; delegates execution to native bash.",
+	"version": "0.2.0",
+	"description": "Model-judged bash permission requests for OMP: intercepts bash calls the host would auto-approve, classifies them, and prompts on anything risky instead of running it silently.",
 	"type": "module",
 	"private": true,
 	"scripts": {

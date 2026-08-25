@@ -1,122 +1,130 @@
 /**
- * Cache tests: verdicts are keyed by session + cwd + command, hit on repeat,
- * and never cross sessions or working directories.
- *
- * NOTE: the plugin module is loaded once per test FILE (bun isolates files),
- * so all cases here use distinct session ids / cwds / commands to stay
- * independent.
+ * Cache tests: verdicts are keyed per session by the full execution identity —
+ * native-resolved cwd, canonical env, pty, timeout, async, and command — and a
+ * session boundary drops only that session's entries.
  */
 import { beforeEach, describe, expect, test } from "bun:test";
 import {
-	classifierCalls,
+	fire,
 	loadPlugin,
 	makeCtx,
-	resetScoped,
-	setClassifier,
-	type BuiltTool,
+	makeEvent,
+	makeSettings,
+	modelCalls,
+	resultText,
+	confirmCalls,
+	setClassifierReply,
 } from "./fixtures";
 
-let tool: BuiltTool;
-
 beforeEach(async () => {
-	resetScoped();
-	tool = await loadPlugin();
+	await loadPlugin(makeSettings([]));
+	setClassifierReply("UNSAFE"); // default: every classification blocks, so cache hits are visible as blocked-without-model
 });
 
-async function run(
-	sessionId: string,
-	cwd: string | undefined,
-	command: string,
-	confirmResult: boolean | undefined = undefined,
-) {
-	const { ctx, invokeCalls } = makeCtx({ sessionId, cwd, ...(confirmResult !== undefined ? { confirmResult } : {}) });
-	const result = (await tool.execute(
-		"call-1",
-		{ command, ...(cwd !== undefined ? { "cwd?": cwd } : {}) },
-		new AbortController().signal,
-		undefined,
-		ctx,
-	)) as { content: { type: string; text: string }[]; isError?: boolean };
-	const text = result.content.map(c => c.text).join(" ");
-	return { text, isError: result.isError ?? false, invokeCalls };
-}
+let seq = 0;
 
-describe("cache keying", () => {
-	test("identical session+cwd+command classifies once, reuses verdict", async () => {
-		setClassifier("SAFE");
-		await run("cache-session", "/repo/a", "git status --short");
-		const callsAfterFirst = classifierCalls;
-		await run("cache-session", "/repo/a", "git status --short");
-		expect(classifierCalls).toBe(callsAfterFirst); // cache hit: no second model call
+const gate = async (command: string, opts: { sessionId?: string; cwd?: string; input?: Record<string, unknown>; hasUI?: boolean } = {}) => {
+	seq += 1;
+	const ctx = makeCtx({ sessionId: opts.sessionId ?? `cache-${seq}`, cwd: opts.cwd, hasUI: opts.hasUI ?? false });
+	const result = await fire("tool_call", makeEvent(command, opts.input ?? {}), ctx);
+	return { text: resultText(result), modelCalls: modelCalls.length, confirms: confirmCalls(ctx).length };
+};
+
+describe("identical execution identity is judged once", () => {
+	test("same session, cwd, and command: one model call, second run cached", async () => {
+		const first = await gate("npm publish", { cwd: "/repo", sessionId: "shared-session" });
+		expect(first.text).toContain("classified unsafe");
+		expect(first.modelCalls).toBe(1);
+
+		const second = await gate("npm publish", { cwd: "/repo", sessionId: "shared-session" });
+		expect(second.text).toContain("classified unsafe"); // blocked again (UNSAFE cached)
+		expect(second.modelCalls).toBe(1); // no second model call
 	});
 
-	test("same command in a different cwd reclassifies", async () => {
-		setClassifier("SAFE");
-		await run("cache-session", "/repo/a", "npm test");
-		const callsAfterFirst = classifierCalls;
-		await run("cache-session", "/repo/b", "npm test");
-		expect(classifierCalls).toBe(callsAfterFirst + 1);
+	test("cached SAFE runs without a second model call or prompt", async () => {
+		setClassifierReply("SAFE");
+		const ctx = makeCtx({ sessionId: "cache-session", hasUI: true });
+		await fire("tool_call", makeEvent("git status", { cwd: "/repo" }), ctx);
+		expect(modelCalls.length).toBe(1);
+
+		await fire("tool_call", makeEvent("git status", { cwd: "/repo" }), makeCtx({ sessionId: "cache-session", hasUI: true }));
+		expect(modelCalls.length).toBe(1);
+		expect(confirmCalls(ctx).length).toBe(0);
+	});
+});
+
+describe("every execution-affecting input is part of the identity", () => {
+	test("cwd change reclassifies", async () => {
+		await gate("make build", { cwd: "/repo/a" });
+		const second = await gate("make build", { cwd: "/repo/b" });
+		expect(second.modelCalls).toBe(2);
 	});
 
-	test("same command in a different session reclassifies", async () => {
-		setClassifier("SAFE");
-		await run("session-a", "/repo", "npm test");
-		const callsAfterFirst = classifierCalls;
-		await run("session-b", "/repo", "npm test");
-		expect(classifierCalls).toBe(callsAfterFirst + 1);
+	test("env override commands prompt and never classify (no cache entry)", async () => {
+		// Environment overrides are decided by a permission request before any
+		// classifier path — env values can select the program that runs — so
+		// they never reach the cache at all.
+		const first = await gate("make build", { cwd: "/repo", input: { env: { A: "1", B: "2" } } });
+		expect(first.text).toContain("environment override");
+		expect(first.modelCalls).toBe(0);
+		const second = await gate("make build", { cwd: "/repo", input: { env: { B: "2", A: "1" } } });
+		expect(second.modelCalls).toBe(0);
 	});
 
-	test("cached UNSAFE blocks without reclassification", async () => {
-		setClassifier("UNSAFE");
-		await run("cache-session", "/repo", "npm publish");
-		const callsAfterFirst = classifierCalls;
-		const second = await run("cache-session", "/repo", "npm publish");
-		expect(classifierCalls).toBe(callsAfterFirst);
-		expect(second.text).toContain("classified unsafe (cached)");
-		expect(second.invokeCalls).toHaveLength(0);
+	test("pty, timeout, and async each change the identity", async () => {
+		await gate("make build", { cwd: "/repo" });
+		const pty = await gate("make build", { cwd: "/repo", input: { pty: true } });
+		expect(pty.modelCalls).toBe(2);
+		const timeout = await gate("make build", { cwd: "/repo", input: { timeout: 42 } });
+		expect(timeout.modelCalls).toBe(3);
+		const asyncFlag = await gate("make build", { cwd: "/repo", input: { async: true } });
+		expect(asyncFlag.modelCalls).toBe(4);
 	});
 
-	test("cached SAFE after interactive UNSURE approval", async () => {
-		// First pass: classifier UNSURE, user approves -> SAFE cached.
-		setClassifier("UNSURE");
-		const first = await run("cache-session", "/repo", "git branch -D tmp", true);
-		expect(first.isError).toBe(false);
-		const callsAfterFirst = classifierCalls;
-		// Second pass: verdict must come from cache.
-		const second = await run("cache-session", "/repo", "git branch -D tmp");
-		expect(classifierCalls).toBe(callsAfterFirst);
-		expect(second.isError).toBe(false);
+	test("session change reclassifies", async () => {
+		await gate("make build", { cwd: "/repo" });
+		const other = await gate("make build", { cwd: "/repo", sessionId: "other-session" });
+		expect(other.modelCalls).toBe(2);
+	});
+});
+
+describe("cwd resolution", () => {
+	test("leading 'cd' without a cwd param resolves into the key", async () => {
+		const first = await gate("cd /tmp/x && make build", { sessionId: "cd-session" });
+		expect(first.text).toContain("classified unsafe");
+		expect(first.modelCalls).toBe(1);
+		// Identical command again: same resolved cwd, cached.
+		const second = await gate("cd /tmp/x && make build", { sessionId: "cd-session" });
+		expect(second.modelCalls).toBe(1);
 	});
 
-	test("cwd-absent and cwd-empty are the same key", async () => {
-		setClassifier("SAFE");
-		await run("cache-session", undefined, "ls -la");
-		const callsAfterFirst = classifierCalls;
-		await run("cache-session", "", "ls -la");
-		expect(classifierCalls).toBe(callsAfterFirst);
+	test("relative cwd resolves against the session cwd in the key", async () => {
+		const ctx = makeCtx({ sessionId: "cache-session", cwd: "/workspace" });
+		await fire("tool_call", makeEvent("make build", { cwd: "subdir" }), ctx);
+		expect(modelCalls.length).toBe(1);
+		// An explicit absolute path to the same dir is the same identity.
+		await fire("tool_call", makeEvent("make build", { cwd: "/workspace/subdir" }), makeCtx({ sessionId: "cache-session", cwd: "/workspace" }));
+		expect(modelCalls.length).toBe(1);
 	});
+});
 
-	test("trailing-slash cwd collapses to bare path", async () => {
-		setClassifier("SAFE");
-		await run("cache-session", "/repo/a", "make build");
-		const callsAfterFirst = classifierCalls;
-		await run("cache-session", "/repo/a/", "make build");
-		expect(classifierCalls).toBe(callsAfterFirst);
-	});
+describe("session boundaries drop only that session's entries", () => {
+	for (const event of ["session_start", "session_before_switch", "session_switch", "session_shutdown"]) {
+		test(`${event} clears the current session bucket only`, async () => {
+			const keep = `keep-${event}`;
+			const drop = `drop-${event}`;
+			await gate("make build", { sessionId: keep });
+			await gate("make build", { sessionId: drop });
+			expect(modelCalls.length).toBe(2);
 
-	test("explicit '.' cwd collapses to absent", async () => {
-		setClassifier("SAFE");
-		await run("cache-session", undefined, "make build");
-		const callsAfterFirst = classifierCalls;
-		await run("cache-session", ".", "make build");
-		expect(classifierCalls).toBe(callsAfterFirst);
-	});
+			// Boundary in the dropped session: its bucket is cleared.
+			await fire(event, {}, makeCtx({ sessionId: drop }));
+			await gate("make build", { sessionId: drop });
+			expect(modelCalls.length).toBe(3); // reclassified
 
-	test("root '/' is not collapsed to empty", async () => {
-		setClassifier("SAFE");
-		await run("cache-session", "/", "make root-distinct");
-		const callsAfterFirst = classifierCalls;
-		await run("cache-session", "", "make root-distinct");
-		expect(classifierCalls).toBe(callsAfterFirst + 1); // different cwd: reclassify
-	});
+			// The other session's verdict survives.
+			await gate("make build", { sessionId: keep });
+			expect(modelCalls.length).toBe(3);
+		});
+	}
 });
