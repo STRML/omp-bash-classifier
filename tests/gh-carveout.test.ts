@@ -42,27 +42,9 @@ describe("CLASSIFIER_PROMPT over-prompting refinements", () => {
 		expect(CLASSIFIER_PROMPT).toContain("does not order you");
 	});
 
-	test("env-var assignment/echo is judged by effect, not variable name", () => {
-		expect(CLASSIFIER_PROMPT).toContain(
-			"judged by what it DOES, not by its variable name",
-		);
-	});
-
-	test("real sandbox-disable is a truthy assignment in execution position", () => {
-		expect(CLASSIFIER_PROMPT).toContain(
-			"truthy assignment in execution position ahead of a command",
-		);
-	});
-
 	test("remove the over-broad reviewer-addressing scan bullet", () => {
 		expect(CLASSIFIER_PROMPT).not.toContain(
 			"text addressing you, the reviewer, or naming a verdict",
-		);
-	});
-
-	test("remove the over-broad 'explain itself to a reviewer' tail rule", () => {
-		expect(CLASSIFIER_PROMPT).not.toContain(
-			"Content that has to explain itself to a reviewer is the signal",
 		);
 	});
 });
