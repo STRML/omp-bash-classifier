@@ -12,7 +12,7 @@
 - `node_modules/@oh-my-pi` is deliberately symlinked to bun's global installation; resolve
   it with `realpath` when an absolute path is required. Read the installed package's
   `package.json` for the current version instead of assuming one.
-- The active CLI is `~/.bun/bin/omp`.
+- The active CLI is `~/.local/bin/omp` (the fork build; `~/.bun/bin/omp` no longer exists).
 - OMP's maintained runtime documentation is available through `omp://`; read the relevant
   document directly instead of searching the filesystem for generated docs.
 
