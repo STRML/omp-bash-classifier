@@ -1676,11 +1676,10 @@ export default function (pi: ExtensionAPI) {
 			// Whole-command allow matching can never fire on a compound line:
 			// shell control bails every allow rule, so `git status && git push`
 			// always fell through to the classifier no matter how narrow the
-			// rules were. Resolve compounds per segment instead, with the same
-			// precedence the host applies to deny/prompt compounds: every
-			// segment must reach a decision; a deny/prompt on any segment wins;
-			// an allow on every segment runs silent; ANY undecided segment
-			// falls through to classification unchanged.
+			// rules were. Resolve compounds per segment instead, mirroring the
+			// host's deny/prompt compound precedence: a deny/prompt on any
+			// segment wins; an allow on every segment runs silent; a compound
+			// with no deny/prompt decision and an undecided segment classifies.
 			// Strip standalone `2>&1` for MATCHING only: it is an inert fd-dup
 			// (moves no data), and the host tokenizer splits on its `&`, which
 			// would otherwise shatter every diagnostic compound into unmatched
@@ -1702,12 +1701,22 @@ export default function (pi: ExtensionAPI) {
 							: commandSegmentMatchesBashApprovalPattern(segment, candidate.match),
 					),
 				);
-				if (decisions.every(decision => decision !== undefined)) {
-					rule = decisions.find(decision => decision!.approval !== "allow") ?? {
-						match: "(every compound segment matches an allow rule)",
-						approval: "allow",
-					};
-				}
+				// Native compound semantics: a deny/prompt on any segment
+				// decides the call — the host prompts on exactly this shape,
+				// so adopt the rule even when sibling segments are undecided.
+				// Classifying here too produced a double prompt on compound
+				// force-pushes: the plugin's UNSAFE dialog, then the native
+				// gate prompting the same command. Only a compound with NO
+				// deny/prompt decision and an undecided segment classifies.
+				rule =
+					decisions.find(decision => decision?.approval === "deny") ??
+					decisions.find(decision => decision?.approval === "prompt") ??
+					(decisions.every(decision => decision !== undefined)
+						? {
+								match: "(every compound segment matches an allow rule)",
+								approval: "allow",
+							}
+						: undefined);
 			}
 
 			// A deny rule is the one decision that outranks everything natively

@@ -204,6 +204,32 @@ describe("allow rules", () => {
 		expect(modelCalls.length).toBe(0);
 	});
 
+	test("a prompt-rule segment defers to native even with undecided siblings", async () => {
+		await loadPlugin(
+			makeSettings([
+				{ match: "git push --force*", approval: "prompt" },
+				{ match: "git push*", approval: "allow" },
+			]),
+		);
+		// The double-prompt shape: the plugin classified this (echo undecided),
+		// raised its own UNSAFE dialog, and the native gate then prompted the
+		// same command. Now the prompt rule decides without any model call.
+		expect(await gate("echo deploying && git push --force origin main")).toBe("ALLOWED");
+		expect(modelCalls.length).toBe(0);
+	});
+
+	test("a deny-rule segment beats a prompt-rule segment in a compound", async () => {
+		await loadPlugin(
+			makeSettings([
+				{ match: "sudo *", approval: "deny" },
+				{ match: "git push --force*", approval: "prompt" },
+			]),
+		);
+		// Deny wins; the plugin returns early and the host blocks silently.
+		expect(await gate("sudo make install && git push --force origin main")).toBe("ALLOWED");
+		expect(modelCalls.length).toBe(0);
+	});
+
 	test("a segment carrying a redirect is never allow-matched", async () => {
 		await loadPlugin(makeSettings([{ match: "gh pr *", approval: "allow" }]));
 		expect(await gate("gh pr view 1 > /tmp/out")).toBe("ALLOWED"); // classifier says SAFE
