@@ -59,9 +59,10 @@ describe("CLASSIFIER_PROMPT over-prompting refinements", () => {
 		expect(CLASSIFIER_PROMPT).toContain(
 			"Reading local files — source, logs, session transcripts, dotfiles — and",
 		);
-		expect(CLASSIFIER_PROMPT).toContain("reading moves no data off the machine");
-		expect(CLASSIFIER_PROMPT).toContain(
-			"the moment the command sends that content to a remote endpoint",
-		);
+		expect(CLASSIFIER_PROMPT).toContain("local READ-ONLY consumers");
+		expect(CLASSIFIER_PROMPT).toContain("to a remote endpoint OR executes it");
+		// The carve-out must never cover execution paths.
+		expect(CLASSIFIER_PROMPT).toContain("into bash/sh/zsh, running a fetched or local script, or sourcing a file");
+		expect(CLASSIFIER_PROMPT).toContain("is executing, not reading, and is never carved out");
 	});
 });
