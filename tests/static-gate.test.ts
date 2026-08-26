@@ -218,6 +218,19 @@ describe("allow rules", () => {
 		expect(modelCalls.length).toBe(0);
 	});
 
+	test("a trailing-force prompt rule defers with undecided siblings too", async () => {
+		await loadPlugin(
+			makeSettings([
+				{ match: "git push * --force*", approval: "prompt" },
+				{ match: "git push*", approval: "allow" },
+			]),
+		);
+		// Flag-at-end escapes the prefix prompt rules but must still defer to
+		// the host prompt, not classify (which double-prompted the old way).
+		expect(await gate("echo deploying && git push origin main --force")).toBe("ALLOWED");
+		expect(modelCalls.length).toBe(0);
+	});
+
 	test("a deny-rule segment beats a prompt-rule segment in a compound", async () => {
 		await loadPlugin(
 			makeSettings([
