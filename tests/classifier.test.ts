@@ -228,7 +228,7 @@ describe("moderate-risk overlay", () => {
 		for (const command of [
 			"git push --force origin main",
 			"sudo make install",
-			"python3 -c 'print(1)'",
+			"python3 -c \"exec(base64.b64decode('cHJpbnQoMSkp'))\"",
 			"git commit --amend -m x",
 			"git checkout -- index.ts",
 		]) {
@@ -262,7 +262,8 @@ describe("matcher unit spec", () => {
 			["git push origin main", []],
 			["git reset --hard HEAD", ["git reset"]],
 			["git -c core.hooksPath=/dev/null push --force origin main", ["git push --force"]],
-			["bash -c 'echo hi'", ["bash -c"]],
+			["bash -c 'echo hi'", []],
+			["bash -c 'rm -rf x'", ["bash -c"]],
 			["tee /etc/hosts", ["tee"]],
 			["eval $(echo hi)", ["eval"]],
 		];

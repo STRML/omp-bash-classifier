@@ -646,8 +646,13 @@ export function parseJudgement(reply: string): Judgement {
 	const firstLine = reply.trim().split(/\r?\n/u, 1)[0] ?? "";
 	// Strip leading FORMATTING characters only (markdown emphasis, bullets,
 	// quotes, spaces): `**SAFE**` is a verdict, not an evasion. Anything that
-	// keeps a letter/digit before the token still fails the anchor.
-	const stripped = firstLine.replace(/^[^\w\r\n]+/u, "");
+	// keeps a letter/digit before the token still fails the anchor — except
+	// the prompt's own label: the model sometimes echoes the format as
+	// `VERDICT | SAFE | reason`, so an exact leading VERDICT label is removed
+	// too. `The verdict is SAFE` still fails: the anchor stays at reply start.
+	const stripped = firstLine
+		.replace(/^[^\w\r\n]+/u, "")
+		.replace(/^VERDICT\b[:| \t-]*/iu, "");
 	const match = /^(SAFE|UNSAFE|UNSURE)\b[\s|:.,-]*(.*)$/iu.exec(stripped.trim());
 	if (!match) {
 		return {
@@ -696,6 +701,23 @@ const MODERATE_RISK_TOKENS = new Set([
 // Interpreters that only matter when they execute inline code (-c/-e);
 // `bash script.sh` is an ordinary invocation.
 const INLINE_CODE_INTERPRETERS = new Set(["python", "python2", "python3", "bash", "sh", "perl"]);
+
+// Obfuscation and second-execution markers inside inline interpreter code.
+// Inline code is fully visible to the classifier — `python3 -c 'print(1)'`
+// shows every character it will run — so a SAFE verdict on plain code may
+// release it. A payload that decodes or re-execs is NOT the code the model
+// read, so the wrapper's SAFE says nothing about what actually runs.
+const INTERPRETER_CODE_RISK =
+	/exec\(|eval\(|os\.system|subprocess|base64|b64decode|compile\(|__import__|marshal|\\x[0-9a-f]{2}/;
+
+// Same token set as a word-boundary regex, for matching inside joined
+// interpreter-code text where a quoted payload arrives as one token
+// (`bash -c 'rm -rf x'` tokenizes to a single "rm -rf x" word). \b keeps
+// `chmod` from matching inside `immutable` etc.
+const INTERPRETER_RISK_TOKEN_RE = new RegExp(
+	`\\b(?:${[...MODERATE_RISK_TOKENS].join("|")})\\b`,
+	"u",
+);
 
 // Commands whose ARGUMENT is the program that runs: look through them to the
 // binary they name. env/nice/timeout/stdbuf take options or durations first.
@@ -1185,17 +1207,27 @@ export function matchModerateRiskTokens(command: string): string[] {
 			flags.add("mkfs");
 			continue;
 		}
-		if (INLINE_CODE_INTERPRETERS.has(verb)) {
-			const next = words[1];
-			if (next === "-c" || next === "-e") flags.add(`${verb} ${next}`);
-			continue;
-		}
 		// Decided by the whole command, not by the verb. See isPlainReadOnlyFetch,
 		// which re-tokenizes the raw command and lowercases only the leading
 		// word, so flag case survives: -K names a config file while -k only
 		// skips TLS verification.
 		if (commandBasename(verb) === "curl" || commandBasename(verb) === "wget") {
 			if (!plainReadOnlyFetch) flags.add(commandBasename(verb));
+			continue;
+		}
+		if (INLINE_CODE_INTERPRETERS.has(verb)) {
+			const next = words[1];
+			if (next === "-c" || next === "-e") {
+				// Plain inline code was read verbatim by the classifier, so
+				// SAFE releases it. Keep the flag for what a SAFE cannot
+				// vouch for: obfuscated payloads and destructive verbs the
+				// bare command would have flagged (`bash -c 'rm -rf x'`
+				// keeps the backstop `rm -rf x` has).
+				const codeText = words.slice(2).join(" ");
+				if (INTERPRETER_CODE_RISK.test(codeText) || INTERPRETER_RISK_TOKEN_RE.test(codeText)) {
+					flags.add(`${verb} ${next}`);
+				}
+			}
 			continue;
 		}
 		if (MODERATE_RISK_TOKENS.has(verb)) {
