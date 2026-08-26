@@ -54,4 +54,14 @@ describe("CLASSIFIER_PROMPT over-prompting refinements", () => {
 		);
 		expect(CLASSIFIER_PROMPT).toContain("Only a force variant rewrites remote");
 	});
+
+	test("local log reads are carved out as SAFE reading", () => {
+		expect(CLASSIFIER_PROMPT).toContain(
+			"Reading local files — source, logs, session transcripts, dotfiles — and",
+		);
+		expect(CLASSIFIER_PROMPT).toContain("reading moves no data off the machine");
+		expect(CLASSIFIER_PROMPT).toContain(
+			"the moment the command sends that content to a remote endpoint",
+		);
+	});
 });
