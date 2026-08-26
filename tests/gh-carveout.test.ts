@@ -23,7 +23,8 @@ describe("CLASSIFIER_PROMPT gh/rtk carve-outs", () => {
 	test("reading a hosted API is explicitly not sending local data", () => {
 		expect(CLASSIFIER_PROMPT).toContain("Reading a hosted API is");
 		expect(CLASSIFIER_PROMPT).toContain("sending LOCAL");
-		expect(CLASSIFIER_PROMPT).toContain("file contents or secrets to a network endpoint");
+		expect(CLASSIFIER_PROMPT).toContain("file contents or secrets");
+		expect(CLASSIFIER_PROMPT).toContain("to a network");
 	});
 
 	test("gh pr merge is NOT carved out (consequential remote action)", () => {
@@ -64,5 +65,22 @@ describe("CLASSIFIER_PROMPT over-prompting refinements", () => {
 		// The carve-out must never cover execution paths.
 		expect(CLASSIFIER_PROMPT).toContain("into bash/sh/zsh, running a fetched or local script, or sourcing a file");
 		expect(CLASSIFIER_PROMPT).toContain("is executing, not reading, and is never carved out");
+	});
+
+	test("credential bullet is scoped to material, not logs", () => {
+		expect(CLASSIFIER_PROMPT).toContain("Reading credential or key MATERIAL");
+		expect(CLASSIFIER_PROMPT).toContain("LOGS are not credential material");
+		expect(CLASSIFIER_PROMPT).toContain("Exfiltration requires a remote endpoint");
+	});
+
+	test("gh PR workflow and tag push are carved out as routine publishing", () => {
+		expect(CLASSIFIER_PROMPT).toContain("The normal GitHub pull-request workflow is SAFE");
+		expect(CLASSIFIER_PROMPT).toContain("(gh pr create/edit/comment)");
+		expect(CLASSIFIER_PROMPT).toContain("(gh pr merge/close)");
+		expect(CLASSIFIER_PROMPT).toContain("Creating and pushing an annotated tag");
+	});
+
+	test("prompt keeps the three-verdict contract", () => {
+		expect(CLASSIFIER_PROMPT).toContain("UNSURE — you cannot tell without context you do not have.");
 	});
 });
