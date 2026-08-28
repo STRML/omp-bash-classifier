@@ -73,9 +73,10 @@ describe("CLASSIFIER_PROMPT over-prompting refinements", () => {
 		expect(CLASSIFIER_PROMPT).toContain("Exfiltration requires a remote endpoint");
 	});
 
-	test("gh PR workflow and tag push are carved out as routine publishing", () => {
-		expect(CLASSIFIER_PROMPT).toContain("The normal GitHub pull-request workflow is SAFE");
-		expect(CLASSIFIER_PROMPT).toContain("(gh pr create/edit/comment)");
+	test("gh PR and issue workflows and tag push are carved out as routine publishing", () => {
+		expect(CLASSIFIER_PROMPT).toContain("The normal GitHub pull-request and issue workflows are SAFE");
+		expect(CLASSIFIER_PROMPT).toContain("(gh pr create/edit/comment, gh issue");
+		expect(CLASSIFIER_PROMPT).toContain("create/edit/comment — same payload conditions as PR comments");
 		expect(CLASSIFIER_PROMPT).toContain("(gh pr merge/close)");
 		expect(CLASSIFIER_PROMPT).toContain("Creating and pushing an annotated tag");
 	});
