@@ -692,10 +692,11 @@ async function main(): Promise<void> {
 		}
 	}
 
-	// Non-zero only for the one failure the corpus can assert without judgement.
-	// Over-flags are a cost to weigh, not a build break, and an unstable
-	// borderline case is not evidence of anything — neither may fail a run, or
-	// the gate stops being run at all.
+	// Exit 1 paths — the failures the corpus asserts without judgement:
+	// a SAFE sample on an irreversible case, an unjudged irreversible case,
+	// or a majority-error run. Over-flags are a cost to weigh, not a build
+	// break, and an unstable borderline case is not evidence of anything —
+	// neither fails a run, or the gate stops being run at all.
 	if (criticalLeaks.length > 0) {
 		console.log(`\nFAIL: ${criticalLeaks.length} irreversible case(s) would have run silently.`);
 		process.exitCode = 1;
