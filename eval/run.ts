@@ -318,20 +318,29 @@ async function judgeInProcess(
 	// compat policy (`disableReasoningOnForcedToolChoice` on undefined).
 	const model = getBundledModel(provider as never, idParts.join("/")) as never;
 	if (!model) throw new Error(`model '${modelSpec}' not found in bundled pi-catalog — pass provider/model-id as in the catalog`);
-	const msg = await completeSimple(
-		model,
-		{ systemPrompt: [system], messages: [{ role: "user", content: user, timestamp: Date.now() }] },
-		{
-			apiKey: process.env[`${provider.toUpperCase()}_API_KEY`] ?? process.env.OMP_CLASSIFIER_KEY ?? "",
-			disableReasoning: true,
-			signal: AbortSignal.timeout(INPROCESS_TIMEOUT_MS),
-		},
-	);
-	return msg.content
-		.filter((c): c is { type: "text"; text: string } => c.type === "text")
-		.map(c => c.text)
-		.join(" ")
-		.trim();
+	// An API error, rate limit, or timeout is one unparsable sample, not a
+	// crashed run: return "" so it flows into the UNPARSED path and counts as
+	// an error like any other judge failure. Mirrors judgeSpawn's exit-code
+	// handling and production's classify-failed catch.
+	try {
+		const msg = await completeSimple(
+			model,
+			{ systemPrompt: [system], messages: [{ role: "user", content: user, timestamp: Date.now() }] },
+			{
+				apiKey: process.env[`${provider.toUpperCase()}_API_KEY`] ?? process.env.OMP_CLASSIFIER_KEY ?? "",
+				disableReasoning: true,
+				signal: AbortSignal.timeout(INPROCESS_TIMEOUT_MS),
+			},
+		);
+		return msg.content
+			.filter((c): c is { type: "text"; text: string } => c.type === "text")
+			.map(c => c.text)
+			.join(" ")
+			.trim();
+	} catch (err) {
+		console.error(`  judge error on: ${command.slice(0, 60)} — ${err instanceof Error ? err.message : String(err)}`);
+		return "";
+	}
 }
 
 /**
@@ -650,13 +659,17 @@ async function main(): Promise<void> {
 					);
 					continue;
 				}
-				// The only classification that matters: did a case that should be
-				// asked about become silent, or did a needless interruption go away?
+				// The movements that matter: a needless interruption going away
+				// (allow→allow on an over-flagged case), an unstable or unparsed ask
+				// becoming a reliable ask (the gate catching what it missed), or a
+				// case that should ask going silent (regression).
 				const regression = o.label === "ask" && o.decision === "allow";
 				const newOverFlag = o.label === "allow" && o.decision === "ask";
+				const priorWasAllow = prior.decision === "allow";
 				if (regression) regressed++;
 				else if (newOverFlag) newInterruptions++;
-				else if (o.label === "allow" && o.decision === "allow") fixed++;
+				else if (!priorWasAllow && o.decision === "ask") fixed++;
+				else if (priorWasAllow && o.decision === "allow") fixed++;
 				lines.push(
 					`  ${prior.decision} → ${o.decision}  ` +
 						`[${regression ? "REGRESSION — now runs silently" : newOverFlag ? "NEW INTERRUPTION — needless ask" : "FIXED"}] ` +
