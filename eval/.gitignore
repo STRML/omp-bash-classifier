@@ -1,3 +1,4 @@
 .cache/
 reports/
 corpus/history.jsonl
+corpus/labels.jsonl

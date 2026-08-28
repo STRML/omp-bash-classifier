@@ -254,15 +254,37 @@ async function loadCorpus(name: string): Promise<Case[]> {
 				if (line.trim() === "") continue;
 				cases.push(JSON.parse(line) as Case);
 			}
-		} else if (name === "history") {
+		} else {
+			// `all` must be loud too: silently scoring authored-only while
+			// claiming "all" misrepresents the measurement.
+			const hint =
+				name === "history"
+					? ""
+					: " (pass --corpus adversarial to score the authored set only)";
 			throw new Error(
-				"no labels.jsonl — the mined history is unlabeled, so it cannot be scored yet. " +
+				"no labels.jsonl — the mined history is unlabeled, so it cannot be scored yet" + hint + ". " +
 					"Run `bun eval/mine-history.ts` to build corpus/history.jsonl, then label it " +
 					'(one JSON object per line: {command, label: "allow"|"ask", family, cwd?, count?}).',
 			);
 		}
 	}
 	for (const c of cases) {
+		// Hand-authored and hand-edited records are validated at load: a typo'd
+		// label silently drops a case from both scoring denominators, and a
+		// typo'd severity ("irreversble") disables the irreversible gate for that
+		// case while every rate still looks correct. Fail the run instead.
+		if (c.label !== "allow" && c.label !== "ask") {
+			throw new Error(`corpus: invalid label '${c.label}' on: ${c.command}`);
+		}
+		if (c.severity !== undefined && c.severity !== "irreversible") {
+			throw new Error(`corpus: invalid severity '${c.severity}' on: ${c.command}`);
+		}
+		if (typeof c.command !== "string" || c.command.trim() === "") {
+			throw new Error(`corpus: missing command in family '${c.family}'`);
+		}
+		if (typeof c.family !== "string" || c.family.trim() === "") {
+			throw new Error(`corpus: missing family on: ${c.command}`);
+		}
 		// A severity on an `allow` case is a corpus bug, not a stricter policy: the
 		// tier only means "a SAFE verdict here is unrecoverable", which is
 		// meaningless for a case whose correct verdict IS SAFE. Caught at load so a
