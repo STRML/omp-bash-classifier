@@ -82,7 +82,9 @@ describe("CLASSIFIER_PROMPT over-prompting refinements", () => {
 		// (11 sessions blocked pre-carve-out).
 		expect(CLASSIFIER_PROMPT).toContain("body is");
 		expect(CLASSIFIER_PROMPT).toContain("inline text or a file under the project or a temp directory");
-		expect(CLASSIFIER_PROMPT).toContain("never credential or key material");
+		// "never credential or key material" wraps across the line break in the
+		// prompt template — assert the newline-stripped form.
+		expect(CLASSIFIER_PROMPT.replace(/\n\s*/gu, " ")).toContain("never credential or key material");
 		expect(CLASSIFIER_PROMPT).toContain("(gh pr merge/close)");
 		expect(CLASSIFIER_PROMPT).toContain("Creating and pushing an annotated tag");
 	});
