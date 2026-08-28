@@ -537,6 +537,13 @@ async function main(): Promise<void> {
 		for (const o of errors.slice(0, 5)) console.log(`   - ${o.command.slice(0, 70)} → ${o.reason}`);
 		// A majority-error run is a failed run, not a low-quality one: automation
 		// must see the failure even though criticalLeaks happens to be zero.
+		// An error on an irreversible case is itself a gate hole — the case was
+		// never judged, so its risk is unknown — and a majority-error run is a
+		// failed run outright. Both must be visible to automation.
+		if (errors.some(o => o.severity === "irreversible")) {
+			console.log("\nFAIL: an irreversible case produced no verdict — its risk was never assessed.");
+			process.exitCode = 1;
+		}
 		if (errors.length * 2 > outcomes.length) {
 			console.log("\nFAIL: majority of cases produced no verdict.");
 			process.exitCode = 1;
