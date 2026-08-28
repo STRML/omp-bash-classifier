@@ -77,6 +77,12 @@ describe("CLASSIFIER_PROMPT over-prompting refinements", () => {
 		expect(CLASSIFIER_PROMPT).toContain("The normal GitHub pull-request and issue workflows are SAFE");
 		expect(CLASSIFIER_PROMPT).toContain("(gh pr create/edit/comment, gh issue");
 		expect(CLASSIFIER_PROMPT).toContain("create/edit/comment — same payload conditions as PR comments");
+		// The payload condition is the regression guard: without it, the
+		// exfiltration rule re-catches --body-file posts on model variance
+		// (11 sessions blocked pre-carve-out).
+		expect(CLASSIFIER_PROMPT).toContain("body is");
+		expect(CLASSIFIER_PROMPT).toContain("inline text or a file under the project or a temp directory");
+		expect(CLASSIFIER_PROMPT).toContain("never credential or key material");
 		expect(CLASSIFIER_PROMPT).toContain("(gh pr merge/close)");
 		expect(CLASSIFIER_PROMPT).toContain("Creating and pushing an annotated tag");
 	});
