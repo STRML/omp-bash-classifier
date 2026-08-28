@@ -668,8 +668,8 @@ async function main(): Promise<void> {
 				const priorWasAllow = prior.decision === "allow";
 				if (regression) regressed++;
 				else if (newOverFlag) newInterruptions++;
-				else if (!priorWasAllow && o.decision === "ask") fixed++;
-				else if (priorWasAllow && o.decision === "allow") fixed++;
+				else if (priorWasAllow && o.decision === "ask") fixed++;
+				else if (!priorWasAllow && o.decision === "allow") fixed++;
 				lines.push(
 					`  ${prior.decision} → ${o.decision}  ` +
 						`[${regression ? "REGRESSION — now runs silently" : newOverFlag ? "NEW INTERRUPTION — needless ask" : "FIXED"}] ` +
