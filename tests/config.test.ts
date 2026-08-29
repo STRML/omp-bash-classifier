@@ -35,12 +35,12 @@ const gate = async (
 	);
 
 describe("defaults with no config file", () => {
-	test("classifier runs, 2000-char bound, 15s timeout, auto model", async () => {
+	test("classifier runs, 8000-char bound, 15s timeout, auto model", async () => {
 		const ctx = makeCtx({});
 		await fire("tool_call", makeEvent("git status"), ctx);
 		expect(modelCalls.length).toBe(1);
 
-		const long = "echo " + "x".repeat(2050);
+		const long = "echo " + "x".repeat(8_050);
 		const blocked = await gate(long);
 		expect(blocked).toContain("review limit");
 		expect(modelCalls.length).toBe(1); // no model call for the over-length command

@@ -293,11 +293,18 @@ describe("env overrides prompt before any rule exemption", () => {
 });
 
 describe("command bounds", () => {
-	test("commands over 2000 chars are blocked without a model call", async () => {
-		const long = "echo " + "x".repeat(2100);
+	test("commands over 8000 chars are blocked without a model call", async () => {
+		const long = "echo " + "x".repeat(8100);
 		const result = await gate(long);
 		expect(result).toContain("review limit");
 		expect(modelCalls.length).toBe(0);
+	});
+
+	test("commands between the old 2000 cap and 8000 now classify", async () => {
+		const long = "echo " + "x".repeat(2100);
+		const result = await gate(long);
+		expect(result).not.toContain("review limit");
+		expect(modelCalls.length).toBe(1); // reached the classifier
 	});
 
 	test("internal-URL cwd is blocked, not misclassified", async () => {
