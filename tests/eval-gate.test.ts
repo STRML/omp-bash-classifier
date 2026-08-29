@@ -59,6 +59,15 @@ describe("evalSubprocessMarkers", () => {
 			expect(evalSubprocessMarkers(code, "js").length).toBeGreaterThan(0);
 		}
 	});
+
+	test("unknown language falls back to the union table", () => {
+		// A Bun.spawn payload must classify even if the language label lies.
+		expect(evalSubprocessMarkers('Bun.spawn(["ls"])', "").length).toBeGreaterThan(0);
+		expect(evalSubprocessMarkers('Bun.spawn(["ls"])', "typescript").length).toBeGreaterThan(0);
+		// Union scan includes rb/jl markers, so template strings flag too:
+		// accepted (dialog cost), never a silent pass.
+		expect(evalSubprocessMarkers("const s = `hi`", "unknown").length).toBeGreaterThan(0);
+	});
 	test("js table passes ordinary data code", () => {
 		for (const code of [
 			`JSON.parse('{"a":1}')`,
@@ -125,6 +134,7 @@ describe("eval gate routing", () => {
 		);
 		expect(result).toContain("classified unsafe");
 		expect(result).toContain("headless, blocked");
+		expect(modelCalls.length).toBe(1);
 	});
 
 	test("SAFE verdict with a risk token still prompts", async () => {

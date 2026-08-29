@@ -803,21 +803,37 @@ const EVAL_SPAWN_MARKERS_RB_JL: Array<[RegExp, string]> = [
 	[/\brun\s*\(/u, "run()"],
 ];
 
+// Word-boundary flags for eval-code that the classifier already judged SAFE.
+// Shell tokenization does not apply to program text, so this is a plain scan
+// over the moderate-risk verbs minus "eval": the marker scan already routes
+// eval()/Function() payloads to the classifier, and flagging the token again
+// would dialog every benign dynamic-expression payload.
+const EVAL_CODE_FLAG_RE = new RegExp(
+	`\\b(?:${[...MODERATE_RISK_TOKENS].filter(t => t !== "eval").join("|")})\\b`,
+	"u",
+);
+
 /**
  * Spawn/second-execution markers inside an eval payload. Empty array = the
  * payload is expression-only as far as this scan can tell, and the gate does
  * not tax it. Names are returned for the permission dialog and logs.
  */
 export function evalSubprocessMarkers(code: string, language: string): string[] {
-	const table =
-		language === "js" ? EVAL_SPAWN_MARKERS_JS
-		: language === "py" ? EVAL_SPAWN_MARKERS_PY
-		: EVAL_SPAWN_MARKERS_RB_JL;
-	const found: string[] = [];
-	for (const [pattern, name] of table) {
-		if (pattern.test(code)) found.push(name);
-	}
-	return found;
+	const scan = (table: Array<[RegExp, string]>): string[] => {
+		const found: string[] = [];
+		for (const [pattern, name] of table) {
+			if (pattern.test(code)) found.push(name);
+		}
+		return found;
+	};
+	if (language === "js") return scan(EVAL_SPAWN_MARKERS_JS);
+	if (language === "py") return scan(EVAL_SPAWN_MARKERS_PY);
+	if (language === "rb" || language === "jl") return scan(EVAL_SPAWN_MARKERS_RB_JL);
+	// Unknown or missing language: the payload reached us through a schema the
+	// model writes into, so do not trust the label. Scan the union — a false
+	// hit costs one dialog; a miss passes a spawn silently.
+	const union = [...EVAL_SPAWN_MARKERS_JS, ...EVAL_SPAWN_MARKERS_RB_JL];
+	return scan(union);
 }
 
 // Commands whose ARGUMENT is the program that runs: look through them to the
@@ -1842,7 +1858,7 @@ export default function (pi: ExtensionAPI) {
 						` tool=eval lang=${language || "?"} cached=${cached ? 1 : 0} reason="${judgement.reason}" code="${logCode}"`,
 				);
 				if (judgement.verdict === "SAFE") {
-					const flags = matchModerateRiskTokens(evalCode);
+					const flags = [...new Set(evalCode.match(EVAL_CODE_FLAG_RE) ?? [])];
 					if (flags.length === 0) return;
 					return await requestPermission(ctx, target, "flagged for approval", `classifier-safe but flags: ${flags.join(", ")}`, "eval code");
 				}
