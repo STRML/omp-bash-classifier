@@ -354,7 +354,7 @@ const CLASSIFIER_CONFIG_DEFAULTS: ClassifierConfig = {
 	enabled: true,
 	model: "",
 	timeoutMs: 15_000,
-	maxCommandLength: 2_000,
+	maxCommandLength: 8_000,
 };
 
 function classifierConfigPath(): string {
@@ -1390,7 +1390,7 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			if (key === "reset") {
-				writeClassifierConfig({ enabled: true, model: "", timeoutMs: 15_000, maxCommandLength: 2_000 });
+				writeClassifierConfig({ enabled: true, model: "", timeoutMs: 15_000, maxCommandLength: 8_000 });
 				notify(`omp-bash-classifier reset to defaults (${classifierConfigPath()})`);
 				return;
 			}
