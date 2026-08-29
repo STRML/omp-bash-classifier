@@ -377,7 +377,8 @@ function normalizeClassifierConfig(raw: Record<string, unknown>): ClassifierConf
 	if (
 		typeof raw.maxCommandLength === "number" &&
 		Number.isFinite(raw.maxCommandLength) &&
-		raw.maxCommandLength >= 64
+		raw.maxCommandLength >= 64 &&
+		raw.maxCommandLength <= 100_000
 	) {
 		config.maxCommandLength = raw.maxCommandLength;
 	}
@@ -1420,8 +1421,8 @@ export default function (pi: ExtensionAPI) {
 			}
 			if (key === "maxCommandLength") {
 				const n = Number(value);
-				if (!Number.isFinite(n) || n < 64) {
-					notify("usage: /classifier maxCommandLength <chars, >= 64>", "error");
+				if (!Number.isFinite(n) || n < 64 || n > 100_000) {
+					notify("usage: /classifier maxCommandLength <chars, 64-100000>", "error");
 					return;
 				}
 				const next = writeClassifierConfig({ maxCommandLength: n });
