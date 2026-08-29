@@ -350,6 +350,10 @@ interface ClassifierConfig {
 	maxCommandLength: number;
 }
 
+/** Bounds for the `maxCommandLength` config key and the `/classifier` setter. */
+const MIN_COMMAND_LENGTH = 64;
+const MAX_COMMAND_LENGTH_CEILING = 100_000;
+
 const CLASSIFIER_CONFIG_DEFAULTS: ClassifierConfig = {
 	enabled: true,
 	model: "",
@@ -377,8 +381,8 @@ function normalizeClassifierConfig(raw: Record<string, unknown>): ClassifierConf
 	if (
 		typeof raw.maxCommandLength === "number" &&
 		Number.isFinite(raw.maxCommandLength) &&
-		raw.maxCommandLength >= 64 &&
-		raw.maxCommandLength <= 100_000
+		raw.maxCommandLength >= MIN_COMMAND_LENGTH &&
+		raw.maxCommandLength <= MAX_COMMAND_LENGTH_CEILING
 	) {
 		config.maxCommandLength = raw.maxCommandLength;
 	}
@@ -1421,7 +1425,7 @@ export default function (pi: ExtensionAPI) {
 			}
 			if (key === "maxCommandLength") {
 				const n = Number(value);
-				if (!Number.isFinite(n) || n < 64 || n > 100_000) {
+				if (!Number.isFinite(n) || n < MIN_COMMAND_LENGTH || n > MAX_COMMAND_LENGTH_CEILING) {
 					notify("usage: /classifier maxCommandLength <chars, 64-100000>", "error");
 					return;
 				}
