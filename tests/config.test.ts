@@ -121,6 +121,15 @@ describe("bounds and garbage", () => {
 		expect(modelCalls.length).toBe(0);
 	});
 
+	test("maxCommandLength above the 100k ceiling falls back to default", async () => {
+		// A typo'd huge value must not push multi-MB commands into the
+		// classifier prompt and confirm dialog.
+		writeConfigFile({ maxCommandLength: 5_000_000 });
+		const blocked = await gate("echo " + "z".repeat(8_050));
+		expect(blocked).toContain("8000-character review limit");
+		expect(modelCalls.length).toBe(0);
+	});
+
 	test("timeoutMs from config aborts a slow completion", async () => {
 		// bun's AbortSignal.timeout exposes no duration, so the configurable
 		// timeout is proven behaviorally: a 20ms limit aborts the (stub) model

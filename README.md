@@ -57,9 +57,11 @@ Plugin settings live in `~/.omp/omp-bash-classifier.json`. View or change them w
 | `enabled` | `true` | `false` turns off model classification only. Critical-pattern and env checks still enforce. |
 | `model` | `""` (auto) | Explicit model id. Otherwise: `config.model` -> `@tiny` role -> session model. |
 | `timeoutMs` | `15000` | Classifier call budget. A timeout fails closed to a permission request. |
-| `maxCommandLength` | `2000` | Commands longer than this are blocked (floor 64). |
+| `maxCommandLength` | `8000` | Commands longer than this are blocked (bounds 64-100000; values outside fall back to the default). |
 
 Changing any key flushes the verdict cache. To silence the model quickly, `/classifier enabled false` takes effect on the very next command. `omp plugin disable` needs a session restart, since interceptors bind when a session begins.
+
+An existing config file that pins `maxCommandLength: 2000` keeps 2000 after upgrading — defaults only apply to absent keys. `/classifier reset` rewrites the file with current defaults.
 
 ## The model
 
