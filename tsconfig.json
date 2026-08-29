@@ -13,5 +13,5 @@
 		"isolatedModules": true,
 		"allowImportingTsExtensions": true
 	},
-	"include": ["index.ts", "tests/**/*.ts"]
+	"include": ["index.ts", "tests/**/*.ts", "eval/**/*.ts"]
 }
