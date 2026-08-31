@@ -40,6 +40,11 @@
  *     A caller-supplied `env` (`PATH`, `BASH_ENV`, `LD_PRELOAD`, `GIT_PAGER`)
  *     is never classified — its values can hold secrets — it goes straight to a
  *     permission request.
+ *   - Every gate decision appends one JSON line to
+ *     <agentDir>/omp-bash-classifier/decisions.jsonl (issue #33): tool,
+ *     decision, layer, why, command, verdict, cache provenance, timing. The
+ *     write is fire-and-forget: a failure drops the log line, never the
+ *     command.
  *   - Settings are read through `pi.pi.settings` (the HOST module instance); a
  *     plugin-local `import { settings }` is a second, uninitialized copy that
  *     throws. An SDK/isolated session may have no global settings at all, so an
@@ -418,6 +423,93 @@ function writeClassifierConfig(patch: Record<string, unknown>): ClassifierConfig
 	fs.writeFileSync(classifierConfigPath(), `${JSON.stringify(next, null, 2)}\n`);
 	classifierConfigCache = undefined;
 	return next;
+}
+// ---------------------------------------------------------------------------
+// Decision audit log (issue #33)
+//
+// One JSON line per gate decision at <agentDir>/omp-bash-classifier/
+// decisions.jsonl. The directory mirrors classifierConfigPath()'s resolution —
+// dirname(OMP_BASH_CLASSIFIER_CONFIG) when the test override is set,
+// <agentDir>/omp-bash-classifier otherwise — so tests point one env var at a
+// temp dir and find every artifact there. Append-only; the writer is
+// fire-and-forget (see logDecision inside the plugin factory).
+// ---------------------------------------------------------------------------
+
+/** Directory holding every plugin artifact: config, decisions.jsonl, status.json. */
+function classifierDataDir(): string {
+	const override = process.env.OMP_BASH_CLASSIFIER_CONFIG;
+	return override ? path.dirname(override) : path.join(getConfigRootDir(), PLUGIN_NAME);
+}
+
+function decisionsLogPath(): string {
+	return path.join(classifierDataDir(), "decisions.jsonl");
+}
+
+function statusReportPath(): string {
+	return path.join(classifierDataDir(), "status.json");
+}
+
+/** One decisions.jsonl line; the field order is the log contract (issue #33).
+ *  `verdict` is null whenever no model verdict existed (static rules, caps,
+ *  dialogs decided by a human); `ms` is wall-clock for the scope that logged
+ *  the line (tool_call entry for gate lines, dialog entry for its outcome). */
+export interface DecisionRecord {
+	ts: string;
+	tool: "bash" | "eval";
+	decision: "allow" | "block";
+	layer: string;
+	why: string;
+	cmd: string;
+	cwd: string;
+	verdict: Verdict | null;
+	cached: 0 | 1;
+	ms: number;
+}
+
+type DecisionLogInput = Omit<DecisionRecord, "ts">;
+
+/** Tail window for `/classifier status`: counts over the most recent lines. */
+const STATUS_TAIL_LINES = 500;
+const STATUS_LAST_DECISIONS = 10;
+
+export interface StatusReport {
+	config: ClassifierConfig;
+	cacheSizes: Record<string, number>;
+	decisions: { scanned: number; allow: number; block: number };
+	last: DecisionRecord[];
+}
+
+/**
+ * Build the `/classifier status` dump: effective config, per-session verdict
+ * cache sizes, allow/refusal counts over the last 500 audit lines, and the
+ * last 10 decisions. Tolerates a torn final line (a crash mid-append) and a
+ * missing log — both read as fewer decisions, never a throw. Pure read:
+ * writing status.json and notifying is the command handler's job.
+ */
+export function buildStatusReport(): StatusReport {
+	const cacheSizes: Record<string, number> = {};
+	for (const [sessionId, entries] of cache) cacheSizes[sessionId] = entries.size;
+	const recent: DecisionRecord[] = [];
+	try {
+		const lines = fs.readFileSync(decisionsLogPath(), "utf8").split("\n").slice(-STATUS_TAIL_LINES);
+		for (const lineText of lines) {
+			if (lineText.trim() === "") continue;
+			try {
+				recent.push(JSON.parse(lineText) as DecisionRecord);
+			} catch {
+				// Torn or non-JSON line: skip it, keep the rest.
+			}
+		}
+	} catch {
+		// No audit log yet: zero counts.
+	}
+	const allow = recent.filter(record => record.decision === "allow").length;
+	return {
+		config: readClassifierConfig(),
+		cacheSizes,
+		decisions: { scanned: recent.length, allow, block: recent.length - allow },
+		last: recent.slice(-STATUS_LAST_DECISIONS),
+	};
 }
 
 // ---------------------------------------------------------------------------
@@ -1476,9 +1568,9 @@ export default function (pi: ExtensionAPI) {
 	// prints the effective config and the file path.
 	pi.registerCommand("classifier", {
 		description:
-			"View or set omp-bash-classifier options: enabled, model, timeoutMs, maxCommandLength, reset",
+			"View or set omp-bash-classifier options: enabled, model, timeoutMs, maxCommandLength, reset, status",
 		getArgumentCompletions: (prefix: string) => {
-			const keywords = ["enabled", "model", "timeoutMs", "maxCommandLength", "reset", "file"] as const;
+			const keywords = ["enabled", "model", "timeoutMs", "maxCommandLength", "reset", "status", "file"] as const;
 			return keywords
 				.filter(keyword => keyword.startsWith(prefix.toLowerCase()))
 				.map(keyword => ({ label: keyword, value: keyword }));
@@ -1492,6 +1584,22 @@ export default function (pi: ExtensionAPI) {
 			}
 			if (key === "file") {
 				notify(classifierConfigPath());
+				return;
+			}
+			if (key === "status") {
+				const report = buildStatusReport();
+				const json = JSON.stringify(report, null, 2);
+				let where: string;
+				try {
+					fs.mkdirSync(path.dirname(statusReportPath()), { recursive: true });
+					fs.writeFileSync(statusReportPath(), `${json}\n`);
+					where = `written to ${statusReportPath()}`;
+				} catch {
+					where = "status.json unwritable; dump below only";
+				}
+				// Full dump on disk; the toast gets a truncation so a long tail of
+				// decisions cannot flood the pane.
+				notify(`omp-bash-classifier status — ${where}:\n${truncated(json, 1500)}`);
 				return;
 			}
 			if (key === "reset") {
@@ -1533,7 +1641,7 @@ export default function (pi: ExtensionAPI) {
 				notify(`classifier maxCommandLength=${next.maxCommandLength}`);
 				return;
 			}
-			notify(`unknown key "${key}". Keys: enabled, model, timeoutMs, maxCommandLength, reset, file`, "error");
+			notify(`unknown key "${key}". Keys: enabled, model, timeoutMs, maxCommandLength, reset, status, file`, "error");
 		},
 	});
 
@@ -1734,6 +1842,41 @@ export default function (pi: ExtensionAPI) {
 			2,
 		);
 
+	let auditLogWarned = false;
+	let auditLogDirMade = false;
+
+	/**
+	 * Append one line to the decision audit log (issue #33). Fire-and-forget:
+	 * the gate's only job is to decide the command, so a failed write drops the
+	 * line — it warns once per plugin load (an unwritable path cannot heal
+	 * mid-process, so once is the cap) and never throws into the gate. `cmd` is
+	 * flattened to one line and truncated here so no call site can forget it.
+	 * Allow `why`s are short causes per the contract: "rule: <pattern>",
+	 * "approved by user", or the verdict's reason; block `why`s carry the
+	 * refusal payload's why or the headline that drove the dialog.
+	 */
+	const logDecision = (line: DecisionLogInput): void => {
+		try {
+			if (!auditLogDirMade) {
+				fs.mkdirSync(path.dirname(decisionsLogPath()), { recursive: true });
+				auditLogDirMade = true;
+			}
+			const record: DecisionRecord = {
+				ts: new Date().toISOString(),
+				...line,
+				cmd: truncated(line.cmd.replace(/\s+/gu, " ").trim(), 120),
+			};
+			fs.appendFileSync(decisionsLogPath(), `${JSON.stringify(record)}\n`);
+		} catch (err) {
+			if (!auditLogWarned) {
+				auditLogWarned = true;
+				pi.logger.warn(
+					`bash-classifier: decision audit log unwritable ` +
+						`(${err instanceof Error ? err.message : String(err)}); decision logging is off`,
+				);
+			}
+		}
+	};
 	/**
 	 * Raise a real permission request. Returns the block result, or undefined to
 	 * let the command through. Headless (no UI) always blocks: there is nobody to
@@ -1762,7 +1905,8 @@ export default function (pi: ExtensionAPI) {
 		},
 		headline: string,
 		reason: string,
-		tool = "bash",
+		tool: "bash" | "eval" = "bash",
+		logWhyPrefix = "",
 	): Promise<{ block: true; reason: string } | undefined> => {
 		const subject = tool === "eval" ? "eval code" : "bash command";
 		const detail = reason ? `${headline}: ${reason}` : headline;
@@ -1781,10 +1925,28 @@ export default function (pi: ExtensionAPI) {
 				notThis: "Do not retry the same command without addressing the denial.",
 			},
 		};
-		const block = (): { block: true; reason: string } => ({
-			block: true,
-			reason: refusalPayload(tool, layer, detail, guidance[layer].next, guidance[layer].notThis),
-		});
+		const began = Date.now();
+		const audit = (decision: "allow" | "block", why: string) =>
+			logDecision({
+				tool,
+				decision,
+				layer,
+				why,
+				cmd: target.command,
+				cwd: target.cwd,
+				verdict: null,
+				cached: 0,
+				ms: Date.now() - began,
+			});
+		const block = (): { block: true; reason: string } => {
+			// Verdict-driven callers pass "follows verdict" so the dialog/headless
+			// line is readable as the outcome of the preceding layer:"verdict" line.
+			audit("block", logWhyPrefix === "" ? detail : `${logWhyPrefix}: ${detail}`);
+			return {
+				block: true,
+				reason: refusalPayload(tool, layer, detail, guidance[layer].next, guidance[layer].notThis),
+			};
+		};
 		if (!ctx.hasUI) return block();
 		const approved = await ctx.ui.confirm(
 			// The reason stays OUT of the title. Titles are a single truncated
@@ -1794,10 +1956,16 @@ export default function (pi: ExtensionAPI) {
 			`Run ${subject}? (${headline})`,
 			buildPermissionBody(target, reason, ctx.cwd),
 		);
-		return approved ? undefined : block();
+		if (approved) {
+			audit("allow", "approved by user");
+			return undefined;
+		}
+		return block();
 	};
 
 	pi.on("tool_call", async (event, ctx) => {
+		// Wall-clock anchor for the audit log's `ms`: gate entry to decision.
+		const started = Date.now();
 		const isBash = event.toolName === "bash";
 		const isEval = event.toolName === "eval";
 		if (!isBash && !isEval) return;
@@ -1885,13 +2053,16 @@ export default function (pi: ExtensionAPI) {
 			// Over-bound spawn-bearing code is blocked unseen, like bash: no
 			// classifier or dialog may approve text it did not read.
 			if (evalCode.length > config.maxCommandLength) {
+				const why =
+					`eval code blocked: ${evalCode.length} chars exceeds the ` +
+					`${config.maxCommandLength}-character review limit`;
+				logDecision({ tool: "eval", decision: "block", layer: "cap", why, cmd: evalCode, cwd: ctx.cwd, verdict: null, cached: 0, ms: Date.now() - started });
 				return {
 					block: true,
 					reason: refusalPayload(
 						"eval",
 						"cap",
-						`eval code blocked: ${evalCode.length} chars exceeds the ` +
-							`${config.maxCommandLength}-character review limit`,
+						why,
 						"Move the long code into a file and eval a short cell that reads it.",
 						"Do not shorten the code only to dodge the limit.",
 						{ chars: String(evalCode.length), limit: String(config.maxCommandLength) },
@@ -1924,8 +2095,14 @@ export default function (pi: ExtensionAPI) {
 				);
 				if (judgement.verdict === "SAFE") {
 					const flags = [...new Set(evalCode.match(EVAL_CODE_FLAG_RE) ?? [])];
-					if (flags.length === 0) return;
-					return await requestPermission(ctx, target, "flagged for approval", `classifier-safe but flags: ${flags.join(", ")}`, "eval");
+					if (flags.length === 0) {
+						// Fresh SAFE auto-run logs layer "verdict"; a replayed cached
+						// verdict logs "cached" — provenance, same allow.
+						logDecision({ tool: "eval", decision: "allow", layer: cached ? "cached" : "verdict", why: judgement.reason, cmd: evalCode, cwd, verdict: "SAFE", cached: cached ? 1 : 0, ms: Date.now() - started });
+						return;
+					}
+					logDecision({ tool: "eval", decision: "block", layer: "verdict", why: `classifier-safe but flags: ${flags.join(", ")}`, cmd: evalCode, cwd, verdict: "SAFE", cached: cached ? 1 : 0, ms: Date.now() - started });
+					return await requestPermission(ctx, target, "flagged for approval", `classifier-safe but flags: ${flags.join(", ")}`, "eval", "follows verdict");
 				}
 				const detail =
 					judgement.verdict === "UNSAFE"
@@ -1936,9 +2113,13 @@ export default function (pi: ExtensionAPI) {
 				if (judgement.verdict === "PARSE_ERROR") {
 					pi.logger.warn(`bash-classifier: unparseable reply: ${judgement.rawReply ?? "(none)"}`);
 				}
-				return await requestPermission(ctx, target, detail, judgement.reason, "eval");
+				// Two lines on purpose: the verdict itself, then requestPermission's
+				// dialog/headless outcome prefixed "follows verdict".
+				logDecision({ tool: "eval", decision: "block", layer: "verdict", why: `${detail}: ${judgement.reason}`, cmd: evalCode, cwd, verdict: judgement.verdict, cached: cached ? 1 : 0, ms: Date.now() - started });
+				return await requestPermission(ctx, target, detail, judgement.reason, "eval", "follows verdict");
 			} catch (err) {
 				pi.logger.error(`bash-classifier: ${err instanceof Error ? err.message : String(err)}`);
+				logDecision({ tool: "eval", decision: "block", layer: "internal-error", why: "bash classifier failed; eval code not run", cmd: evalCode, cwd: ctx.cwd, verdict: null, cached: 0, ms: Date.now() - started });
 				return {
 					block: true,
 					reason: refusalPayload(
@@ -1955,13 +2136,16 @@ export default function (pi: ExtensionAPI) {
 		// Universal bound, before every static-rule/critical/env branch: neither
 		// the classifier nor a permission dialog may approve unseen suffix text.
 		if (command.length > config.maxCommandLength) {
+			const why =
+				`bash command blocked: ${command.length} chars exceeds the ` +
+				`${config.maxCommandLength}-character review limit`;
+			logDecision({ tool: "bash", decision: "block", layer: "cap", why, cmd: command, cwd: ctx.cwd, verdict: null, cached: 0, ms: Date.now() - started });
 			return {
 				block: true,
 				reason: refusalPayload(
 					"bash",
 					"cap",
-					`bash command blocked: ${command.length} chars exceeds the ` +
-						`${config.maxCommandLength}-character review limit`,
+					why,
 					"Write long text to a file and reference it (e.g. git commit -F <file>), or split the command into steps.",
 					"Do not shorten the message only to dodge the limit.",
 					{ chars: String(command.length), limit: String(config.maxCommandLength) },
@@ -2040,6 +2224,7 @@ export default function (pi: ExtensionAPI) {
 			// that ExtensionContext does not expose. Passing the raw URL to
 			// resolveToCwd would mislabel it; skipping the gate would fail open.
 			if (cwdInput?.includes("://") || cwdInput?.includes("local:/")) {
+				logDecision({ tool: "bash", decision: "block", layer: "cwd", why: "bash classifier cannot resolve an internal-URL cwd; command not run", cmd: command, cwd: cwdInput ?? ctx.cwd, verdict: null, cached: 0, ms: Date.now() - started });
 				return {
 					block: true,
 					reason: refusalPayload(
@@ -2088,6 +2273,7 @@ export default function (pi: ExtensionAPI) {
 			// a per-session `autoApprove` (wrapper.ts:189-192) forces `yolo`
 			// without appearing in settings at all.
 			if (CRITICAL_BASH_PATTERNS.some(pattern => pattern.test(command))) {
+				logDecision({ tool: "bash", decision: "block", layer: "critical", why: "critical pattern: matches a built-in dangerous-command pattern", cmd: command, cwd, verdict: null, cached: 0, ms: Date.now() - started });
 				return await requestPermission(
 					ctx,
 					target,
@@ -2101,6 +2287,7 @@ export default function (pi: ExtensionAPI) {
 			// prompt/narrow-allow rule that only judged the command string. Env
 			// values are not shown to the classifier — they can hold secrets.
 			if (env.key !== "") {
+				logDecision({ tool: "bash", decision: "block", layer: "env", why: "environment override: command runs with caller-supplied env; not classified", cmd: command, cwd, verdict: null, cached: 0, ms: Date.now() - started });
 				return await requestPermission(
 					ctx,
 					target,
@@ -2114,7 +2301,10 @@ export default function (pi: ExtensionAPI) {
 			// `tools.approval.bash` policy in native resolveApproval, so apply the
 			// user prompt only when no pattern rule decided the call.
 			if (rule?.approval === "prompt") return;
-			if (rule?.approval === "allow" && !isBlanketPattern(rule.match)) return;
+			if (rule?.approval === "allow" && !isBlanketPattern(rule.match)) {
+				logDecision({ tool: "bash", decision: "allow", layer: "rule", why: `rule: ${rule.match}`, cmd: command, cwd, verdict: null, cached: 0, ms: Date.now() - started });
+				return;
+			}
 			if (!rule && policy.bashPolicy === "prompt") return;
 
 			// Classify every remaining command in every approval mode. The host
@@ -2170,12 +2360,18 @@ export default function (pi: ExtensionAPI) {
 				// answering `SAFE` must not auto-run rm/dd/mkfs-class commands
 				// the builtin critical list does not cover.
 				const flags = matchModerateRiskTokens(command);
-				if (flags.length === 0) return;
+				if (flags.length === 0) {
+					logDecision({ tool: "bash", decision: "allow", layer: cached ? "cached" : "verdict", why: judgement.reason, cmd: command, cwd, verdict: "SAFE", cached: cached ? 1 : 0, ms: Date.now() - started });
+					return;
+				}
+				logDecision({ tool: "bash", decision: "block", layer: "verdict", why: `classifier-safe but flags: ${flags.join(", ")}`, cmd: command, cwd, verdict: "SAFE", cached: cached ? 1 : 0, ms: Date.now() - started });
 				return await requestPermission(
 					ctx,
 					target,
 					"flagged for approval",
 					`classifier-safe but flags: ${flags.join(", ")}`,
+					"bash",
+					"follows verdict",
 				);
 			}
 			const verdict = judgement.verdict;
@@ -2190,11 +2386,13 @@ export default function (pi: ExtensionAPI) {
 				// model-formatting problem; the dialog only shows the summary.
 				pi.logger.warn(`bash-classifier: unparseable reply: ${judgement.rawReply ?? "(none)"}`);
 			}
-			return await requestPermission(ctx, target, detail, judgement.reason);
+			logDecision({ tool: "bash", decision: "block", layer: "verdict", why: `${detail}: ${judgement.reason}`, cmd: command, cwd, verdict, cached: cached ? 1 : 0, ms: Date.now() - started });
+			return await requestPermission(ctx, target, detail, judgement.reason, "bash", "follows verdict");
 		} catch (err) {
 			// Unexpected plugin error: fail closed rather than wave the command
 			// through on a path we cannot vouch for.
 			pi.logger.error(`bash-classifier: ${err instanceof Error ? err.message : String(err)}`);
+			logDecision({ tool: "bash", decision: "block", layer: "internal-error", why: "bash classifier failed; command not run", cmd: command, cwd: ctx.cwd, verdict: null, cached: 0, ms: Date.now() - started });
 			return {
 				block: true,
 				reason: refusalPayload(
