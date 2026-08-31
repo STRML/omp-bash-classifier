@@ -1,4 +1,4 @@
-# omp-bash-classifier
+# omp-classifier
 
 Model-judged permission checks for OMP's bash tool, and for `eval` payloads that spawn
 processes.
@@ -47,13 +47,13 @@ Even a SAFE verdict is gated. It auto-runs only when the command contains none o
 ## Install
 
 ```bash
-git clone https://github.com/STRML/omp-bash-classifier.git
-cd omp-bash-classifier && omp plugin install .
+git clone https://github.com/STRML/omp-classifier.git
+cd omp-classifier && omp plugin install .
 ```
 
-This symlinks the checkout to `~/.omp/plugins/node_modules/omp-bash-classifier`. No build step, no runtime dependencies. Plugins load at session start, so start a new OMP session.
+This symlinks the checkout to `~/.omp/plugins/node_modules/omp-classifier`. No build step, no runtime dependencies. Plugins load at session start, so start a new OMP session.
 
-Uninstall: `omp plugin uninstall omp-bash-classifier`.
+Uninstall: `omp plugin uninstall omp-classifier`. Installed under the old name? Uninstall `omp-bash-classifier` once, then run the install above.
 
 ## Configuration
 

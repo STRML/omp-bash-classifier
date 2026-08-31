@@ -1,7 +1,7 @@
 {
-	"name": "omp-bash-classifier",
+	"name": "omp-classifier",
 	"version": "0.2.1",
-	"description": "Model-judged bash permission requests for OMP: intercepts bash calls the host would auto-approve, classifies them, and prompts on anything risky instead of running it silently.",
+	"description": "Model-judged permission gate for OMP: intercepts bash calls and spawn-bearing eval payloads the host would auto-approve, classifies them, and prompts on anything risky instead of running it silently.",
 	"type": "module",
 	"private": true,
 	"scripts": {
