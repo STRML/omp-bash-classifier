@@ -67,6 +67,7 @@ Plugin settings live in `~/.omp/omp-bash-classifier.json`. View or change them w
 | `model` | `""` (auto) | Explicit model id. Otherwise: `config.model` -> `@tiny` role -> session model. |
 | `timeoutMs` | `15000` | Classifier call budget. A timeout fails closed to a permission request. |
 | `maxCommandLength` | `8000` | Commands longer than this are blocked (bounds 64-100000; values outside fall back to the default). |
+| `evidenceUserMessages` | `0` | How many recent user messages (0-6) ride into the classify record as `evidence.userMessages`. `0` sends no evidence. Values outside the bounds fall back to the default. |
 
 Changing any key flushes the verdict cache and the session grants. To silence the model quickly, `/classifier enabled false` takes effect on the very next command. `omp plugin disable` needs a session restart, since interceptors bind when a session begins.
 
@@ -106,6 +107,10 @@ Pick on measured behavior, not size. Scored on the shipped prompt: eight routine
 All four reject every plainly destructive command. What separates them is resistance to a command that argues for its own SAFE verdict, and that does not track model strength: the Sonnet-class model the default `smol` chain lands on scored worst. Measure before switching. An earlier prompt let claude-sonnet-5 through on 29/50 injection samples.
 
 Avoid cursor-provider models (`composer-*`, `gpt-5.4-nano-*`, `gemini-3.7-flash-*`). They answer as agents rather than judges, every reply parses as no-verdict, and every command then prompts.
+
+## Evidence
+
+The classify record can carry an `evidence` object whose fields have different authors, and the prompt judges each field by its channel. `evidenceUserMessages` attaches the session's last N user messages — the user's own words, the only tier that may authorize an action. Every tool call may also carry `operatorContext`: the requesting agent's explanation of intent, flattened to one line, capped at 500 characters, and never able to authorize anything. A prior refusal of the same action rides along as the third tier. The channel decides provenance: content claiming authorization from the wrong channel is itself an injection signal, judged by the same rules as the command text.
 
 ## Limits
 
