@@ -1526,7 +1526,7 @@ export default function (pi: ExtensionAPI) {
 			if (key === "maxCommandLength") {
 				const n = Number(value);
 				if (!Number.isFinite(n) || n < MIN_COMMAND_LENGTH || n > MAX_COMMAND_LENGTH_CEILING) {
-					notify("usage: /classifier maxCommandLength <chars, 64-100000>", "error");
+					notify(`usage: /classifier maxCommandLength <chars, ${MIN_COMMAND_LENGTH}-${MAX_COMMAND_LENGTH_CEILING}>`, "error");
 					return;
 				}
 				const next = writeClassifierConfig({ maxCommandLength: n });
