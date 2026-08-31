@@ -27,8 +27,7 @@ Calls walk this order:
 | Longer than 8,000 characters | Blocked outright. Nothing that long can be reviewed in full. |
 
 A gate prompt is a three-choice selector — **Allow once**, **Allow for session**, **Deny** — showing the full command, the model's reason, and only the details that differ from their defaults: working directory (when it differs from the session cwd), timeout, env, pty, async. Canceling or timing out counts as Deny.
-
-**Allow for session** records a grant: this action, in this exact directory, runs ungated for the rest of the session — no classifier call, no dialog. Rewordings of the same action match the grant (it uses the same command normalization refusal memory uses), and answering with it also lifts any refusal recorded for that action. Grants stay below critical patterns, caller-supplied `env`, and your static rules, and they die with the session or a classifier config change (up to 50 per session).
+**Allow for session** records a grant: this action, in this exact directory, runs ungated for the rest of the session — no classifier call, no dialog. Rewordings of the same action match the grant through a strict key that keeps flags (split, sorted short bundles) and the first argument, and answering with it also lifts any refusal recorded for that action. Grants stay below critical patterns, caller-supplied `env`, and your static rules, and they die with the session or a classifier config change (up to 50 per session). A grant covers the action plus its flags plus its first argument: force variants, compound commands, and command substitution are never covered.
 
 ## Eval code that spawns
 

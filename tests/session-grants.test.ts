@@ -16,7 +16,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { buildStatusReport, type DecisionRecord } from "../index";
+import { buildStatusReport, normalizeGrantTarget, type DecisionRecord } from "../index";
 import {
 	ALLOW_ONCE,
 	ALLOW_SESSION,
@@ -157,11 +157,13 @@ describe("session grants", () => {
 		setClassifierReply("SAFE | routine");
 		const approved = await prompted("rm -rf ./x", ALLOW_SESSION, sid);
 		expect(resultText(approved.result)).toBe("ALLOWED");
-		// A third rewording hits the grant BEFORE the classifier: allowed with
-		// no model call and no dialog, though a fresh UNSAFE verdict is pending.
+		// A third spelling with the SAME flags hits the grant BEFORE the
+		// classifier: allowed with no model call and no dialog, though a fresh
+		// UNSAFE verdict is pending. ("rm -r x" without -f is a different key
+		// now and gates again — see the regression test below.)
 		setClassifierReply("UNSAFE | would block if asked");
 		const thirdCtx = makeCtx({ sessionId: sid, hasUI: true });
-		const third = await fire("tool_call", makeEvent("rm -r x"), thirdCtx);
+		const third = await fire("tool_call", makeEvent("rm -r -f ./x"), thirdCtx);
 		expect(third).toBeUndefined();
 		expect(selectCalls(thirdCtx)).toHaveLength(0);
 		expect(modelCalls.length).toBe(2);
@@ -271,5 +273,76 @@ describe("/classifier dry-run", () => {
 		expect(modelCalls.length).toBe(1);
 		expect(buildStatusReport().cacheSizes[sid]).toBe(1);
 		expect(readDecisions()).toHaveLength(auditLines);
+	});
+});
+
+describe("grant target strictness (gate fix)", () => {
+	test("REGRESSION: a plain-push grant does not cover git push --force", async () => {
+		const sid = nextSession();
+		await prompted("git push origin main", ALLOW_SESSION, sid);
+		expect(modelCalls.length).toBe(1);
+
+		// The force variant is a different authorization key: it must gate
+		// again (classify + dialog), never ride the plain-push grant.
+		const ctx = makeCtx({ sessionId: sid, hasUI: true });
+		const result = await fire("tool_call", makeEvent("git push --force origin main"), ctx);
+		expect(refusalOf(result).layer).toBe("dialog");
+		expect(selectCalls(ctx)).toHaveLength(1);
+		expect(modelCalls.length).toBe(2);
+	});
+
+	test("a grant on 'pkill -f MyApp' honors the identical command", async () => {
+		const sid = nextSession();
+		const first = await prompted("pkill -f MyApp", ALLOW_SESSION, sid);
+		expect(resultText(first.result)).toBe("ALLOWED");
+		expect(selectCalls(first.ctx)[0][1]).toHaveLength(3); // grantable: three options
+
+		const secondCtx = makeCtx({ sessionId: sid, hasUI: true });
+		const second = await fire("tool_call", makeEvent("pkill -f MyApp"), secondCtx);
+		expect(second).toBeUndefined();
+		expect(selectCalls(secondCtx)).toHaveLength(0);
+		expect(modelCalls.length).toBe(1);
+	});
+
+	test("flags are canonical: -rf covers -r -f but not a bare rm", async () => {
+		const sid = nextSession();
+		await prompted("rm -rf x", ALLOW_SESSION, sid);
+		expect(modelCalls.length).toBe(1);
+
+		// Combined-short vs split shorts: same key, honored without a model call.
+		const splitCtx = makeCtx({ sessionId: sid, hasUI: true });
+		const split = await fire("tool_call", makeEvent("rm -r -f x"), splitCtx);
+		expect(split).toBeUndefined();
+		expect(selectCalls(splitCtx)).toHaveLength(0);
+		expect(modelCalls.length).toBe(1);
+
+		// Dropping a flag changes the authorization: gates again.
+		const bareCtx = makeCtx({ sessionId: sid, hasUI: true });
+		const bare = await fire("tool_call", makeEvent("rm x"), bareCtx);
+		expect(refusalOf(bare).layer).toBe("dialog");
+		expect(selectCalls(bareCtx)).toHaveLength(1);
+		expect(modelCalls.length).toBe(2);
+	});
+
+	test("a compound command is offered only Allow once / Deny", async () => {
+		const sid = nextSession();
+		const ctx = makeCtx({ sessionId: sid, hasUI: true });
+		const result = await fire("tool_call", makeEvent("git status && git push --force"), ctx);
+		expect(refusalOf(result).layer).toBe("dialog");
+		expect(selectCalls(ctx)[0][1].map(option => option.label)).toEqual(["Allow once", "Deny"]);
+	});
+
+	test("normalizeGrantTarget unit table", () => {
+		expect(normalizeGrantTarget("git push origin main")).toBe("git push origin");
+		expect(normalizeGrantTarget("git push --force origin main")).toBe("git push --force origin");
+		expect(normalizeGrantTarget("GIT   PUSH --Force ORIGIN main")).toBe("git push --force origin");
+		expect(normalizeGrantTarget("pkill -f MyApp")).toBe("pkill -f myapp");
+		expect(normalizeGrantTarget("rm -rf x")).toBe(normalizeGrantTarget("rm -r -f x"));
+		expect(normalizeGrantTarget("rm x")).not.toBe(normalizeGrantTarget("rm -rf x"));
+		expect(normalizeGrantTarget("cd /tmp && rm -rf x")).toBe(normalizeGrantTarget("rm -rf x"));
+		expect(normalizeGrantTarget("rm -rf ./x")).toBe(normalizeGrantTarget("rm -rf x"));
+		expect(normalizeGrantTarget("echo hello")).toBe("echo hello");
+		expect(normalizeGrantTarget("git status")).toBe("git status");
+		expect(normalizeGrantTarget("")).toBe("");
 	});
 });

@@ -1674,6 +1674,69 @@ function liftRefusals(ctx: ExtensionContext, command: string): void {
 	}
 }
 
+/**
+ * Strict authorization key for a session grant (issue #32). Grants are
+ * authorization, so unlike normalizeRefusalTarget — whose over-match is the
+ * SAFE direction for refusal memory — this key must NOT collapse distinct
+ * actions: flag tokens are KEPT (combined short flags split, then sorted and
+ * deduped, so "-rf" and "-r -f" produce the same key) and only the first
+ * non-flag argument survives. Lowercased, whitespace-collapsed, leading
+ * `cd <path> &&` stripped, `./` argument spellings canonicalized.
+ * "git push origin main" and "git push --force origin main" differ here;
+ * refusing to notice that difference turned a grant into an overgrant.
+ */
+export function normalizeGrantTarget(command: string): string {
+	const collapsed = command.replace(/\s+/gu, " ").trim().toLowerCase();
+	const stripped = extractLeadingCdTarget(collapsed)?.rest || collapsed;
+	const words = stripped.split(" ").filter(word => word !== "");
+	if (words.length === 0) return "";
+	const lead = [words[0]];
+	// git is the one two-word verb (mirrors normalizeRefusalTarget); the
+	// subverb must be a word, not a flag.
+	if (words[0] === "git" && words[1] !== undefined && !words[1].startsWith("-")) lead.push(words[1]);
+	const flags = new Set<string>();
+	let firstArg = "";
+	for (const word of words.slice(lead.length)) {
+		if (word.startsWith("-")) {
+			// Combined short flags ("-rf" -> -r, -f) split so any spelling of the
+			// same flags matches; long flags ("--force") and bare "-" stay whole.
+			if (word.startsWith("--") || word.length <= 2) flags.add(word);
+			else for (const ch of word.slice(1)) flags.add(`-${ch}`);
+			continue;
+		}
+		if (firstArg === "") firstArg = word.replace(/^\.\//u, "");
+	}
+	return [...lead, ...[...flags].sort(), firstArg].filter(part => part !== "").join(" ");
+}
+
+/**
+ * Exact-ish grant key for eval program text: the shell verb+argument shape
+ * does not apply to program code, so the whole payload — lowercased,
+ * whitespace-collapsed, `./` word spellings canonicalized — is the key. A
+ * grant covers this exact text and nothing shorter.
+ */
+function normalizeEvalGrantTarget(code: string): string {
+	return code
+		.replace(/\s+/gu, " ")
+		.trim()
+		.toLowerCase()
+		.split(" ")
+		.map(word => word.replace(/^\.\//u, ""))
+		.join(" ");
+}
+
+/**
+ * The grant key for a bash command, or "" when the command is not grantable
+ * at all: compound commands, command substitution, and backticks are never
+ * covered by a session grant. A grant keyed to one simple shape must not be
+ * laundered through a compound line or substitution text the key cannot see.
+ */
+function grantKeyForCommand(command: string): string {
+	if (bashCommandSegments(command).length > 1) return "";
+	if (command.includes("$(") || command.includes("`")) return "";
+	return normalizeGrantTarget(command);
+}
+
 function sessionGrants(sessionId: string): Grant[] {
 	let list = grants.get(sessionId);
 	if (!list) {
@@ -1685,32 +1748,30 @@ function sessionGrants(sessionId: string): Grant[] {
 
 /** Record a session grant: this command's target, in this exact directory,
  *  may run ungated for the rest of the session. */
-function addGrant(ctx: ExtensionContext, command: string, cwd: string): void {
+function addGrant(ctx: ExtensionContext, key: string, cwd: string): void {
 	try {
-		const target = normalizeRefusalTarget(command);
-		if (target === "") return;
+		if (key === "") return;
 		const sessionId = ctx.sessionManager.getSessionId();
 		const list = sessionGrants(sessionId);
 		// One grant per (target, directory): re-approving refreshes ts and moves
 		// the grant to newest instead of stacking duplicates.
-		const existing = list.findIndex(grant => grant.normalizedTarget === target && grant.cwd === cwd);
+		const existing = list.findIndex(grant => grant.normalizedTarget === key && grant.cwd === cwd);
 		if (existing !== -1) list.splice(existing, 1);
 		while (list.length >= GRANT_CAP) list.shift();
-		list.push({ normalizedTarget: target, cwd, ts: Date.now() });
+		list.push({ normalizedTarget: key, cwd, ts: Date.now() });
 	} catch {
 		// No session id, no grant; the caller's decision below is unchanged.
 	}
 }
 
 /** The session's grant for this command's target and directory, if any. */
-function matchingGrant(ctx: ExtensionContext, command: string, cwd: string): Grant | undefined {
+function matchingGrant(ctx: ExtensionContext, key: string, cwd: string): Grant | undefined {
 	try {
-		const target = normalizeRefusalTarget(command);
-		if (target === "") return undefined;
+		if (key === "") return undefined;
 		const cwdInput = cwd ?? "";
 		return grants
 			.get(ctx.sessionManager.getSessionId())
-			?.find(grant => grant.normalizedTarget === target && grant.cwd === cwdInput);
+			?.find(grant => grant.normalizedTarget === key && grant.cwd === cwdInput);
 	} catch {
 		return undefined;
 	}
@@ -2179,13 +2240,24 @@ export default function (pi: ExtensionAPI) {
 			return { block: true, reason: "dry-run probe: decision captured, nothing executed" };
 		}
 		if (!ctx.hasUI) return block();
+		// A session grant is only OFFERED for a command with a strict
+		// authorization key (issue #32): simple, substitution-free commands for
+		// bash; the whole payload text for eval. Compounds and substitutions are
+		// never grantable — a grant keyed to one shape must not be laundered
+		// through another.
+		const grantKey = tool === "eval" ? normalizeEvalGrantTarget(target.command) : grantKeyForCommand(target.command);
 		const choice = await ctx.ui.select(
 			`Run ${subject}? (${headline})\n${buildPermissionBody(target, reason, ctx.cwd)}`,
-			[
-				{ label: "Allow once", description: "This call only" },
-				{ label: "Allow for session", description: "This action, in this directory, for the rest of the session" },
-				{ label: "Deny" },
-			],
+			grantKey !== ""
+				? [
+						{ label: "Allow once", description: "This call only" },
+						{ label: "Allow for session", description: "This action, in this directory, for the rest of the session" },
+						{ label: "Deny" },
+					]
+				: [
+						{ label: "Allow once", description: "This call only" },
+						{ label: "Deny" },
+					],
 			// The old confirm default was approve; keep the cursor on it.
 			{ initialIndex: 0 },
 		);
@@ -2193,7 +2265,7 @@ export default function (pi: ExtensionAPI) {
 			// The user said yes to this action (issue #30): erase the memory
 			// that its target was refused, so rewordings run clean again.
 			liftRefusals(ctx, target.command);
-			if (choice === "Allow for session") addGrant(ctx, target.command, target.cwd);
+			if (choice === "Allow for session") addGrant(ctx, grantKey, target.cwd);
 			audit("allow", choice === "Allow for session" ? "approved by user (session grant)" : "approved by user");
 			return undefined;
 		}
@@ -2336,7 +2408,7 @@ export default function (pi: ExtensionAPI) {
 			// Session grant (issue #32): same user-tier authorization as the bash
 			// path — "Allow for session" on this payload's dialog promised the
 			// session off, so it must hold here too, not only for bash.
-			if (matchingGrant(ctx, evalCode, cwd)) {
+			if (matchingGrant(ctx, normalizeEvalGrantTarget(evalCode), cwd)) {
 				logDecision({ tool: "eval", decision: "allow", layer: "granted", why: "session grant", cmd: evalCode, cwd, verdict: null, cached: 0, ms: Date.now() - started });
 				return;
 			}
@@ -2665,7 +2737,7 @@ export default function (pi: ExtensionAPI) {
 			// critical-pattern and env-override checks above, which rank the
 			// command itself, and below host static rules, which were configured
 			// explicitly.
-			if (matchingGrant(ctx, command, cwd)) {
+			if (matchingGrant(ctx, grantKeyForCommand(command), cwd)) {
 				logDecision({ tool: "bash", decision: "allow", layer: "granted", why: "session grant", cmd: command, cwd, verdict: null, cached: 0, ms: Date.now() - started });
 				return;
 			}
