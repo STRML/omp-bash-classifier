@@ -13,6 +13,7 @@ import {
 	makeSettings,
 	modelCalls,
 	removeConfigFile,
+	refusalOf,
 	resultText,
 	setClassifierDelay,
 	setClassifierReply,
@@ -58,7 +59,7 @@ describe("enabled=false", () => {
 		writeConfigFile({ enabled: false });
 		const result = await gate("rm -rf /");
 		expect(result).toContain("critical pattern");
-		expect(result).toContain("headless, blocked");
+		expect(refusalOf(result).layer).toBe("headless");
 		expect(modelCalls.length).toBe(0);
 	});
 
@@ -138,7 +139,7 @@ describe("bounds and garbage", () => {
 		writeConfigFile({ timeoutMs: 20 });
 		const result = await gate("git status");
 		expect(result).toContain("unclassified");
-		expect(result).toContain("headless, blocked");
+		expect(refusalOf(result).layer).toBe("unclassified");
 		expect(modelCalls.length).toBe(0); // aborted before the call completed
 	});
 
