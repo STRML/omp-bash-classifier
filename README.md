@@ -1,12 +1,13 @@
 # omp-bash-classifier
 
-Model-judged permission checks for OMP's bash tool.
+Model-judged permission checks for OMP's bash tool, and for `eval` payloads that spawn
+processes.
 
 In `yolo` mode, OMP auto-approves every bash command. That includes the ones nobody should wave through: `curl … | sh`, `rm -rf /`, `dd of=/dev/…`, `mkfs`, `kill -9 1`, `nc -e`. A second hole compounds it. A `bash.patterns` rule written to prompt on exactly those shapes never fires, because the native gate ranks critical-pattern matches above prompt rules.
 
-This plugin closes both holes. It registers a `tool_call` handler in front of the native bash tool and sends commands that would otherwise run unseen past a small model first. Routine work still runs silently. Dangerous work gets a real Run-or-Deny prompt.
-
 The handler only adds friction. It blocks, or it asks. It never bypasses the native gate, weakens your existing rules, or executes anything itself.
+
+The system is one tower of layers: evidence, recognition, judgment, memory, interaction, self-measurement, control. The map, invariants, and roadmap live in [docs/SYSTEM.md](docs/SYSTEM.md).
 
 ## How each command is decided
 
