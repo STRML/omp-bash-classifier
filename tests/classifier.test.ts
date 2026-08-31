@@ -18,7 +18,8 @@ import {
 	loggerInfos,
 	resultText,
 	refusalOf,
-	confirmCalls,
+	selectCalls,
+	ALLOW_ONCE,
 	setClassifierReply,
 	setClassifierThrows,
 } from "./fixtures";
@@ -45,7 +46,7 @@ describe("verdict routing", () => {
 		const ctx = fresh({ hasUI: true });
 		const result = resultText(await fire("tool_call", makeEvent("git status"), ctx));
 		expect(result).toBe("ALLOWED");
-		expect(confirmCalls(ctx).length).toBe(0);
+		expect(selectCalls(ctx).length).toBe(0);
 		expect(modelCalls.length).toBe(1);
 	});
 	test("SAFE auto-run is recorded in the decision log", async () => {
@@ -57,20 +58,20 @@ describe("verdict routing", () => {
 
 	test("UNSAFE with UI + approve runs", async () => {
 		setClassifierReply("UNSAFE");
-		const ctx = fresh({ hasUI: true, confirmResult: true });
+		const ctx = fresh({ hasUI: true, selectResult: ALLOW_ONCE });
 		const result = resultText(await fire("tool_call", makeEvent("git branch -D feature"), ctx));
 		expect(result).toBe("ALLOWED");
-		expect(confirmCalls(ctx)[0][0]).toContain("classified unsafe");
+		expect(selectCalls(ctx)[0][0]).toContain("classified unsafe");
 	});
 
 	test("UNSAFE with UI + deny blocks", async () => {
 		setClassifierReply("UNSAFE");
-		const ctx = fresh({ hasUI: true, confirmResult: false });
+		const ctx = fresh({ hasUI: true });
 		const result = resultText(await fire("tool_call", makeEvent("git branch -D feature"), ctx));
 		const payload = refusalOf(result);
 		expect(result).toContain("classified unsafe");
 		expect(payload.layer).toBe("dialog");
-		expect(confirmCalls(ctx).length).toBe(1);
+		expect(selectCalls(ctx).length).toBe(1);
 	});
 
 	test("UNSAFE headless fails closed", async () => {
@@ -92,11 +93,10 @@ describe("verdict routing", () => {
 		const headless = await gate("make build");
 		expect(headless).toContain("unclassified");
 		expect(headless).toContain("model call failed"); // underlying error surfaces
-
-		const ctx = fresh({ hasUI: true, confirmResult: true });
+		const ctx = fresh({ hasUI: true, selectResult: ALLOW_ONCE });
 		const result = resultText(await fire("tool_call", makeEvent("make test"), ctx));
 		expect(result).toBe("ALLOWED");
-		expect(confirmCalls(ctx)[0][0]).toContain("unclassified");
+		expect(selectCalls(ctx)[0][0]).toContain("unclassified");
 	});
 
 	test("empty model reply surfaces a quota hint, not a parse complaint", async () => {
@@ -241,11 +241,11 @@ describe("moderate-risk overlay", () => {
 
 	test("flagged SAFE still runs when the user approves interactively", async () => {
 		setClassifierReply("SAFE");
-		const ctx = fresh({ hasUI: true, confirmResult: true });
+		const ctx = fresh({ hasUI: true, selectResult: ALLOW_ONCE });
 		const result = await fire("tool_call", makeEvent("git push --force origin main", {}), ctx);
-		// requestPermission -> ui.confirm -> true -> undefined (run).
+		// requestPermission -> ui.select "Allow once" -> undefined (run).
 		expect(result).toBeUndefined();
-		expect(confirmCalls(ctx).length).toBe(1);
+		expect(selectCalls(ctx).length).toBe(1);
 	});
 });
 

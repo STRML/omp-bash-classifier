@@ -5,8 +5,7 @@
  */
 import { beforeEach, describe, expect, test } from "bun:test";
 import {
-	confirmCalls,
-	dialogText,
+	selectCalls,
 	fire,
 	loadPlugin,
 	makeCtx,
@@ -27,9 +26,15 @@ async function prompt(command: string, input: Record<string, unknown> = {}, cwd 
 	setClassifierReply("UNSAFE: Reads local git data and sends to a temp log");
 	const ctx = makeCtx({ sessionId: `prompt-${command.length}-${Math.random()}`, hasUI: true, cwd });
 	await fire("tool_call", makeEvent(command, input), ctx);
-	const calls = confirmCalls(ctx);
+	const calls = selectCalls(ctx);
 	expect(calls).toHaveLength(1);
-	return { title: calls[0][0], body: calls[0][1], dialog: dialogText(ctx) };
+	// The select title carries the whole dialog: first line is the headline,
+	// everything after it is the verbatim body. Drop only the join newline;
+	// the body itself begins with its own blank line (buildPermissionBody's
+	// leading "\n"), as it did under confirm.
+	const full = calls[0][0];
+	const body = full.slice(full.indexOf("\n") + 1);
+	return { title: full.slice(0, full.indexOf("\n")), body, dialog: full };
 }
 
 describe("title", () => {
@@ -154,7 +159,7 @@ describe("body", () => {
 		setClassifierReply("UNSAFE: **danger** <!-- hi -->");
 		const ctx = makeCtx({ sessionId: "prompt-reason-md", hasUI: true });
 		await fire("tool_call", makeEvent("git log"), ctx);
-		const body = confirmCalls(ctx)[0][1];
+		const body = selectCalls(ctx)[0][0];
 		const reasonLine = body.split("\n").find(l => l.includes("**danger**"));
 		expect(reasonLine?.startsWith("    ")).toBe(true);
 	});

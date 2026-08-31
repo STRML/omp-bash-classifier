@@ -12,7 +12,7 @@ import {
 	makeSettings,
 	modelCalls,
 	resultText,
-	confirmCalls,
+	selectCalls,
 	setClassifierReply,
 } from "./fixtures";
 
@@ -27,7 +27,7 @@ const gate = async (command: string, opts: { sessionId?: string; cwd?: string; i
 	seq += 1;
 	const ctx = makeCtx({ sessionId: opts.sessionId ?? `cache-${seq}`, cwd: opts.cwd, hasUI: opts.hasUI ?? false });
 	const result = await fire("tool_call", makeEvent(command, opts.input ?? {}), ctx);
-	return { text: resultText(result), modelCalls: modelCalls.length, confirms: confirmCalls(ctx).length };
+	return { text: resultText(result), modelCalls: modelCalls.length, selects: selectCalls(ctx).length };
 };
 
 describe("identical execution identity is judged once", () => {
@@ -48,7 +48,7 @@ describe("identical execution identity is judged once", () => {
 
 		await fire("tool_call", makeEvent("git status", { cwd: "/repo" }), makeCtx({ sessionId: "cache-session", hasUI: true }));
 		expect(modelCalls.length).toBe(1);
-		expect(confirmCalls(ctx).length).toBe(0);
+		expect(selectCalls(ctx).length).toBe(0);
 	});
 });
 

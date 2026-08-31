@@ -15,7 +15,9 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { normalizeRefusalTarget } from "../index";
 import type { DecisionRecord } from "../index";
 import {
-	confirmCalls,
+	selectCalls,
+	ALLOW_ONCE,
+	DENY,
 	fire,
 	loadPlugin,
 	makeCtx,
@@ -98,14 +100,14 @@ describe("refusal memory", () => {
 
 	test("a SAFE that lands despite a prior refusal still prompts", async () => {
 		const sid = nextSession();
-		const ctx = makeCtx({ sessionId: sid, hasUI: true, confirmResult: false });
+		const ctx = makeCtx({ sessionId: sid, hasUI: true, selectResult: DENY });
 		setClassifierReply("UNSAFE | not this session");
 		await fire("tool_call", makeEvent("echo bye"), ctx);
 		// echo is not a moderate-risk token, so without the refusal memory a
 		// SAFE here would auto-run; the dialog proves the refusal decided.
 		setClassifierReply("SAFE | harmless rewording");
 		const result = await fire("tool_call", makeEvent("echo bye again"), ctx);
-		expect(confirmCalls(ctx).length).toBe(2);
+		expect(selectCalls(ctx).length).toBe(2);
 		const payload = JSON.parse(
 			(result as { block: true; reason: string }).reason,
 		) as { layer: string };
@@ -116,16 +118,15 @@ describe("refusal memory", () => {
 	test("user approval lifts the refusal for the target", async () => {
 		const sid = nextSession();
 		setClassifierReply("UNSAFE | deletes files");
-		await fire("tool_call", makeEvent("rm -rf x"), makeCtx({ sessionId: sid, hasUI: true, confirmResult: false }));
+		await fire("tool_call", makeEvent("rm -rf x"), makeCtx({ sessionId: sid, hasUI: true }));
 		setClassifierReply("SAFE | routine");
 		const approved = await fire(
 			"tool_call",
 			makeEvent("rm -rf ./x"),
-			makeCtx({ sessionId: sid, hasUI: true, confirmResult: true }),
+			makeCtx({ sessionId: sid, hasUI: true, selectResult: ALLOW_ONCE }),
 		);
 		expect(approved).toBeUndefined();
-		// A third rewording of the same action classifies clean: no memory.
-		await fire("tool_call", makeEvent("rm -r x"), makeCtx({ sessionId: sid, hasUI: true, confirmResult: true }));
+		await fire("tool_call", makeEvent("rm -r x"), makeCtx({ sessionId: sid, hasUI: true, selectResult: ALLOW_ONCE }));
 		expect(modelCalls.length).toBe(3);
 		expect(recordOf(2).priorRefusal).toBeUndefined();
 	});

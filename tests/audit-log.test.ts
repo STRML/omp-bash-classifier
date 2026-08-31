@@ -14,6 +14,8 @@ import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
 	fire,
+	ALLOW_ONCE,
+	DENY,
 	loadPlugin,
 	loggerWarnings,
 	makeCtx,
@@ -159,7 +161,7 @@ describe("decision audit log", () => {
 	test("dialog paths log the verdict line plus the dialog outcome; approval logs allow", async () => {
 		seq += 1;
 		setClassifierReply("UNSAFE");
-		const deny = makeCtx({ sessionId: `audit-${seq}`, hasUI: true, confirmResult: false });
+		const deny = makeCtx({ sessionId: `audit-${seq}`, hasUI: true, selectResult: DENY });
 		const blocked = resultText(await fire("tool_call", makeEvent(`git branch -D audit-ui-${seq}`), deny));
 		expect(refusalOf(blocked).layer).toBe("dialog");
 		let lines = readDecisions();
@@ -169,7 +171,7 @@ describe("decision audit log", () => {
 		expect(lines[1].why.startsWith("follows verdict")).toBe(true);
 
 		seq += 1;
-		const approve = makeCtx({ sessionId: `audit-${seq}`, hasUI: true, confirmResult: true });
+		const approve = makeCtx({ sessionId: `audit-${seq}`, hasUI: true, selectResult: ALLOW_ONCE });
 		expect(await fire("tool_call", makeEvent(`git branch -D audit-ui-${seq}`), approve)).toBeUndefined();
 		lines = readDecisions();
 		expect(lines).toHaveLength(4); // two per decision
