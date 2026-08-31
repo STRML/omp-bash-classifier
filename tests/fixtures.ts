@@ -321,6 +321,7 @@ export function makeSettings(patterns: unknown[], bashPolicy?: string): Record<s
 }
 
 let testConfigPath: string | undefined;
+let testConfigDir: string | undefined;
 
 // The plugin's config path must NEVER resolve to the real homedir file during
 // tests: machine state (a live /classifier edit) would silently flip defaults
@@ -366,6 +367,9 @@ process.on("exit", () => {
 	} catch {
 		// already gone
 	}
+	// The config dir also holds the decision audit log (#33): one sweep clears
+	// every artifact this process wrote.
+	if (testConfigDir) fs.rmSync(testConfigDir, { recursive: true, force: true });
 });
 
 /** Remove the host lockfile, so the plugin sees no lockfile at all. */
@@ -380,7 +384,13 @@ export function removeLockfile(): void {
 /** Point the plugin's config file at a fresh temp path (per test file). */
 export function useTempConfigFile(): string {
 	if (!testConfigPath) {
-		testConfigPath = path.join(os.tmpdir(), `omp-classifier-test-${process.pid}.json`);
+		// A per-pid DIRECTORY, not a bare file: the decision audit log (#33)
+		// resolves to dirname(OMP_BASH_CLASSIFIER_CONFIG)/decisions.jsonl, so one
+		// dir keeps config + audit artifacts together and cleanable at exit.
+		if (!testConfigDir) {
+			testConfigDir = fs.mkdtempSync(path.join(os.tmpdir(), `omp-classifier-test-${process.pid}-`));
+		}
+		testConfigPath = path.join(testConfigDir, "omp-bash-classifier.json");
 	}
 	process.env.OMP_BASH_CLASSIFIER_CONFIG = testConfigPath;
 	return testConfigPath;
