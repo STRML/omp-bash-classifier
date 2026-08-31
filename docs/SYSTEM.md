@@ -102,15 +102,16 @@ The agent driving this system is owed three things:
 
 ## Roadmap
 
-| Layer | Work | Tracked |
+| Layer | Work | State |
 | --- | --- | --- |
-| L4 | Structured refusal payload (`why`/`next`/`notThis`, deciding layer, axes) | #28 |
-| L2 | Pin temperature in `classify()` | #29 |
-| L3 | Refusal memory across rewording, with headless inheritance | #30 |
-| L0, L2 | Provenance-tiered evidence: user messages, operator context, plan grants | #31 |
-| L4 | Session grants and dry-run preview | #32 |
-| L3, L6 | Unified decision audit JSONL and agent-readable status | #33 |
-| L1, L2 | Cheap pre-filter stage for provably routine calls | #34 |
-| L0 | Eval payload cwd propagation (spawn's own cwd in the record) | #14 |
-| L2 | Residual over-flag family | #17 |
-| L0 | Kernel-level spawn interception (structural scan fix) | #13 |
+| L4 | Structured refusal payload (`why`/`next`/`notThis`, deciding layer, axes) | Landed (#28, PR #37) |
+| L2 | Pin temperature in `classify()` | Landed (#29, PR #37) |
+| L3 | Unified decision audit JSONL and agent-readable status | Landed (#33, PRs #38/#39) |
+| L3 | Refusal memory across rewording | Landed (#30, PR #40); subagent inheritance is a host gap |
+| L4 | Session grants and dry-run preview | Landed (#32, PR #41); grant key keeps flags, compounds never grantable |
+| L0, L2 | Provenance-tiered evidence: user messages, operator context | Landed (#31, PR #42); plan grants = the #32 grant store |
+| L5 | Live corpus re-baseline for the post-#31 prompt | Blocked on provider credits (#44) |
+| L1, L2 | Cheap pre-filter stage | Measured NO-GO on adversarial corpus (2.2-4.4% volume, 0 misses); re-measure on a history corpus first (#34) |
+| L0 | Eval payload cwd propagation (spawn's own cwd in the record) | Open, re-scoped (#14) |
+| L2 | Residual over-flag family | Open; #31 is the architectural path (#17) |
+| L0 | Kernel-level spawn interception (structural scan fix) | Open; documented gap in README Limits (#13) |
