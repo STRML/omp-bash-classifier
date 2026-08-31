@@ -265,6 +265,9 @@ export interface CtxOptions {
 	selectResult?: string | undefined;
 	tinyModel?: unknown;
 	model?: unknown;
+	/** Session branch entries for evidence collection (issue #31). Empty by
+	 *  default; the gate reads getBranch() only when evidenceUserMessages > 0. */
+	branch?: ReadonlyArray<{ type: string; message?: { role?: string; content?: unknown } }>;
 }
 
 /** The three labels the plugin's permission dialog offers (issue #32). */
@@ -277,7 +280,7 @@ export function makeCtx(options: CtxOptions = {}): ExtensionContext {
 	const notifyCalls: string[][] = [];
 	const ctx = {
 		cwd: options.cwd ?? "/workspace",
-		sessionManager: { getSessionId: () => options.sessionId ?? "session-1" },
+		sessionManager: { getSessionId: () => options.sessionId ?? "session-1", getBranch: () => options.branch ?? [] },
 		hasUI: options.hasUI ?? false,
 		ui: {
 			select: async (title: string, items: Array<{ label: string; description?: string }>) => {
