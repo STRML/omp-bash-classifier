@@ -59,7 +59,7 @@ Uninstall: `omp plugin uninstall omp-classifier`. Installed under the old name? 
 
 Your existing `bash.patterns` and `tools.approval` keep working. A narrow `allow` rule doubles as the opt-out from classification for a trusted shape; blanket patterns never qualify.
 
-Plugin settings live in `~/.omp/omp-bash-classifier.json`. View or change them with `/classifier`:
+Plugin settings live in `~/.omp/omp-classifier.json`. View or change them with `/classifier`:
 
 | Key | Default | Meaning |
 |---|---|---|

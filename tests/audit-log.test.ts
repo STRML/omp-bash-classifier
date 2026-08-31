@@ -3,7 +3,7 @@
  * fire-and-forget so a broken log never touches the gate, plus the
  * buildStatusReport tail summary behind `/classifier status`.
  *
- * Each test points OMP_BASH_CLASSIFIER_CONFIG at a fresh temp dir, so
+ * Each test points OMP_CLASSIFIER_CONFIG at a fresh temp dir, so
  * decisions.jsonl resolves to dirname(override)/decisions.jsonl and can be
  * asserted byte-for-byte. Unique commands + fresh sessions per test, matching
  * the module-level cache conventions in classifier.test.ts.
@@ -42,7 +42,7 @@ const readDecisions = (): DecisionRecord[] =>
 
 beforeEach(async () => {
 	dir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-audit-"));
-	process.env.OMP_BASH_CLASSIFIER_CONFIG = path.join(dir, "omp-bash-classifier.json");
+	process.env.OMP_CLASSIFIER_CONFIG = path.join(dir, "omp-classifier.json");
 	await loadPlugin(makeSettings([]));
 	setClassifierReply("SAFE");
 });
@@ -50,7 +50,7 @@ beforeEach(async () => {
 afterEach(() => {
 	// Restore the shared suite config path so later test files never see this
 	// dir, then remove it.
-	process.env.OMP_BASH_CLASSIFIER_CONFIG = useTempConfigFile();
+	process.env.OMP_CLASSIFIER_CONFIG = useTempConfigFile();
 	fs.rmSync(dir, { recursive: true, force: true });
 });
 
@@ -109,7 +109,7 @@ describe("decision audit log", () => {
 		// both fail on every decision.
 		const blocker = path.join(dir, "not-a-dir");
 		fs.writeFileSync(blocker, "occupied");
-		process.env.OMP_BASH_CLASSIFIER_CONFIG = path.join(blocker, "omp-bash-classifier.json");
+		process.env.OMP_CLASSIFIER_CONFIG = path.join(blocker, "omp-classifier.json");
 
 		seq += 1;
 		setClassifierReply("UNSAFE");

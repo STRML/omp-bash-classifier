@@ -1,5 +1,5 @@
 /**
- * omp-bash-classifier
+ * omp-classifier
  *
  * Adds a model-judged permission gate to the native `bash` tool. Commands not
  * already decided by a static deny/prompt/narrow-allow rule get classified;
@@ -41,7 +41,7 @@
  *     is never classified — its values can hold secrets — it goes straight to a
  *     permission request.
  *   - Every gate decision appends one JSON line to
- *     <agentDir>/omp-bash-classifier/decisions.jsonl (issue #33): tool,
+ *     <agentDir>/omp-classifier/decisions.jsonl (issue #33): tool,
  *     decision, layer, why, command, verdict, cache provenance, timing. The
  *     write is fire-and-forget: a failure drops the log line, never the
  *     command.
@@ -395,7 +395,7 @@ function canonicalEnv(value: unknown): CanonicalEnv {
 //
 // OMP's /settings renders only the host's compiled settings schema; there is no
 // extension hook to add keys, so the classifier keeps its own small config
-// file. `OMP_BASH_CLASSIFIER_CONFIG` overrides the path (used by tests).
+// file. `OMP_CLASSIFIER_CONFIG` overrides the path (used by tests).
 // ---------------------------------------------------------------------------
 
 interface ClassifierConfig {
@@ -425,7 +425,7 @@ const CLASSIFIER_CONFIG_DEFAULTS: ClassifierConfig = {
 };
 
 function classifierConfigPath(): string {
-	return process.env.OMP_BASH_CLASSIFIER_CONFIG ?? path.join(getConfigRootDir(), "omp-bash-classifier.json");
+	return process.env.OMP_CLASSIFIER_CONFIG ?? path.join(getConfigRootDir(), "omp-classifier.json");
 }
 
 interface ClassifierConfigCache {
@@ -490,17 +490,17 @@ function writeClassifierConfig(patch: Record<string, unknown>): ClassifierConfig
 // ---------------------------------------------------------------------------
 // Decision audit log (issue #33)
 //
-// One JSON line per gate decision at <agentDir>/omp-bash-classifier/
+// One JSON line per gate decision at <agentDir>/omp-classifier/
 // decisions.jsonl. The directory mirrors classifierConfigPath()'s resolution —
-// dirname(OMP_BASH_CLASSIFIER_CONFIG) when the test override is set,
-// <agentDir>/omp-bash-classifier otherwise — so tests point one env var at a
+// dirname(OMP_CLASSIFIER_CONFIG) when the test override is set,
+// <agentDir>/omp-classifier otherwise — so tests point one env var at a
 // temp dir and find every artifact there. Append-only; the writer is
 // fire-and-forget (see logDecision inside the plugin factory).
 // ---------------------------------------------------------------------------
 
 /** Directory holding every plugin artifact: config, decisions.jsonl, status.json. */
 function classifierDataDir(): string {
-	const override = process.env.OMP_BASH_CLASSIFIER_CONFIG;
+	const override = process.env.OMP_CLASSIFIER_CONFIG;
 	return override ? path.dirname(override) : path.join(getConfigRootDir(), PLUGIN_NAME);
 }
 
@@ -588,7 +588,7 @@ export function buildStatusReport(): StatusReport {
 // losing the session.
 // ---------------------------------------------------------------------------
 
-const PLUGIN_NAME = "omp-bash-classifier";
+const PLUGIN_NAME = "omp-classifier";
 
 /**
  * Resolve the lockfile the way the host does. `OMP_PROFILE`/`PI_PROFILE`,
@@ -606,18 +606,18 @@ const PLUGIN_NAME = "omp-bash-classifier";
  * not an exception to it: `settings` fails for its own reason, not because
  * host imports are duplicated.
  *
- * `OMP_BASH_CLASSIFIER_TEST_LOCKFILE` is TEST-ONLY, and now enforced as such
+ * `OMP_CLASSIFIER_TEST_LOCKFILE` is TEST-ONLY, and now enforced as such
  * rather than merely documented: it is honored only under `NODE_ENV=test`,
  * which bun sets for `bun test`. Documented-only was not enough, because a
  * stray export in a real session redirects the read and produces the exact
  * failure this function exists to prevent — a notice naming a path the session
- * never consulted. Contrast `OMP_BASH_CLASSIFIER_CONFIG`, a legitimate user
+ * never consulted. Contrast `OMP_CLASSIFIER_CONFIG`, a legitimate user
  * knob: that redirects the plugin's OWN file, where the plugin is the sole
  * reader. This redirects a read of a HOST file the plugin only observes.
  */
 function pluginLockfilePath(): string {
-	if (process.env.NODE_ENV === "test" && process.env.OMP_BASH_CLASSIFIER_TEST_LOCKFILE) {
-		return process.env.OMP_BASH_CLASSIFIER_TEST_LOCKFILE;
+	if (process.env.NODE_ENV === "test" && process.env.OMP_CLASSIFIER_TEST_LOCKFILE) {
+		return process.env.OMP_CLASSIFIER_TEST_LOCKFILE;
 	}
 	return getPluginsLockfile();
 }
@@ -1889,7 +1889,7 @@ export default function (pi: ExtensionAPI) {
 	// prints the effective config and the file path.
 	pi.registerCommand("classifier", {
 		description:
-			"View or set omp-bash-classifier options: enabled, model, timeoutMs, maxCommandLength, evidenceUserMessages, reset, status, dry-run",
+			"View or set omp-classifier options: enabled, model, timeoutMs, maxCommandLength, evidenceUserMessages, reset, status, dry-run",
 		getArgumentCompletions: (prefix: string) => {
 			const keywords = ["enabled", "model", "timeoutMs", "maxCommandLength", "evidenceUserMessages", "reset", "status", "dry-run", "file"] as const;
 			return keywords
@@ -1900,7 +1900,7 @@ export default function (pi: ExtensionAPI) {
 			const [key, value] = args.trim().split(/\s+/u);
 			const notify = (message: string, level: "info" | "error" = "info") => ctx.ui.notify(message, level);
 			if (!key) {
-				notify(`omp-bash-classifier (${classifierConfigPath()}):\n${formatClassifierConfig(readClassifierConfig())}`);
+				notify(`omp-classifier (${classifierConfigPath()}):\n${formatClassifierConfig(readClassifierConfig())}`);
 				return;
 			}
 			if (key === "file") {
@@ -1951,12 +1951,12 @@ export default function (pi: ExtensionAPI) {
 				}
 				// Full dump on disk; the toast gets a truncation so a long tail of
 				// decisions cannot flood the pane.
-				notify(`omp-bash-classifier status — ${where}:\n${truncated(json, 1500)}`);
+				notify(`omp-classifier status — ${where}:\n${truncated(json, 1500)}`);
 				return;
 			}
 			if (key === "reset") {
 				writeClassifierConfig({ enabled: true, model: "", timeoutMs: 15_000, maxCommandLength: 8_000, evidenceUserMessages: 0 });
-				notify(`omp-bash-classifier reset to defaults (${classifierConfigPath()})`);
+				notify(`omp-classifier reset to defaults (${classifierConfigPath()})`);
 				return;
 			}
 			if (key === "enabled") {
@@ -2036,7 +2036,7 @@ export default function (pi: ExtensionAPI) {
 			if (!settingsWarned) {
 				settingsWarned = true;
 				pi.logger.warn(
-					`bash-classifier: settings unreadable (${err instanceof Error ? err.message : String(err)}); ` +
+					`classifier: settings unreadable (${err instanceof Error ? err.message : String(err)}); ` +
 						`classifying every bash command and honoring no static rules`,
 				);
 			}
@@ -2262,7 +2262,7 @@ export default function (pi: ExtensionAPI) {
 			if (!auditLogWarned) {
 				auditLogWarned = true;
 				pi.logger.warn(
-					`bash-classifier: decision audit log unwritable ` +
+					`classifier: decision audit log unwritable ` +
 						`(${err instanceof Error ? err.message : String(err)}); decision logging is off`,
 				);
 			}
@@ -2496,7 +2496,7 @@ export default function (pi: ExtensionAPI) {
 				// rule for touching the UI is to check hasUI first (see
 				// requestPermission).
 				if (ctx.hasUI) ctx.ui.notify(notice, "warning");
-				else pi.logger.warn(`bash-classifier: ${notice}`);
+				else pi.logger.warn(`classifier: ${notice}`);
 				staleDisableWarned.add(sessionId);
 			}
 		} catch {
@@ -2556,7 +2556,7 @@ export default function (pi: ExtensionAPI) {
 				const judgement = cached ?? (await classify(ctx, evalCode, cwd, resolvedModel, config.timeoutMs, { kind: "eval-code", language, ...recordExtras }, operatorContext).catch(
 					(err: unknown) => {
 						classifyError = err instanceof Error ? err.message : String(err);
-						pi.logger.warn(`bash-classifier: classify failed: ${classifyError}`);
+						pi.logger.warn(`classifier: classify failed: ${classifyError}`);
 						return undefined;
 					},
 				));
@@ -2566,7 +2566,7 @@ export default function (pi: ExtensionAPI) {
 				if (!cached && judgement.verdict !== "PARSE_ERROR") remember(scoped, cacheKey, judgement);
 				const logCode = truncated(evalCode.replace(/\s+/gu, " ").trim(), 120);
 				if (!dryRun) pi.logger.info(
-					`bash-classifier: verdict=${judgement.verdict}` +
+					`classifier: verdict=${judgement.verdict}` +
 						` tool=eval lang=${language || "?"} cached=${cached ? 1 : 0} reason="${judgement.reason}" code="${logCode}"`,
 				);
 				if (judgement.verdict === "SAFE") {
@@ -2596,7 +2596,7 @@ export default function (pi: ExtensionAPI) {
 							? "classifier parse error"
 							: "classifier unsure";
 				if (judgement.verdict === "PARSE_ERROR") {
-					pi.logger.warn(`bash-classifier: unparseable reply: ${judgement.rawReply ?? "(none)"}`);
+					pi.logger.warn(`classifier: unparseable reply: ${judgement.rawReply ?? "(none)"}`);
 				}
 				// Two lines on purpose: the verdict itself, then requestPermission's
 				// dialog/headless outcome prefixed "follows verdict".
@@ -2609,14 +2609,14 @@ export default function (pi: ExtensionAPI) {
 				}
 				return await requestPermission(ctx, target, detail, judgement.reason, "eval", "follows verdict");
 			} catch (err) {
-				pi.logger.error(`bash-classifier: ${err instanceof Error ? err.message : String(err)}`);
-				logDecision({ tool: "eval", decision: "block", layer: "internal-error", why: "bash classifier failed; eval code not run", cmd: evalCode, cwd: ctx.cwd, verdict: null, cached: 0, ms: Date.now() - started });
+				pi.logger.error(`classifier: ${err instanceof Error ? err.message : String(err)}`);
+				logDecision({ tool: "eval", decision: "block", layer: "internal-error", why: "classifier failed; eval code not run", cmd: evalCode, cwd: ctx.cwd, verdict: null, cached: 0, ms: Date.now() - started });
 				return {
 					block: true,
 					reason: refusalPayload(
 						"eval",
 						"internal-error",
-						"bash classifier failed; eval code not run",
+						"classifier failed; eval code not run",
 						"Retry the command; if it keeps failing, check the plugin's error line in the OMP log.",
 						"Do not treat the command as reviewed or approved.",
 					),
@@ -2726,13 +2726,13 @@ export default function (pi: ExtensionAPI) {
 			// that ExtensionContext does not expose. Passing the raw URL to
 			// resolveToCwd would mislabel it; skipping the gate would fail open.
 			if (cwdInput?.includes("://") || cwdInput?.includes("local:/")) {
-				logDecision({ tool: "bash", decision: "block", layer: "cwd", why: "bash classifier cannot resolve an internal-URL cwd; command not run", cmd: command, cwd: cwdInput ?? ctx.cwd, verdict: null, cached: 0, ms: Date.now() - started });
+				logDecision({ tool: "bash", decision: "block", layer: "cwd", why: "classifier cannot resolve an internal-URL cwd; command not run", cmd: command, cwd: cwdInput ?? ctx.cwd, verdict: null, cached: 0, ms: Date.now() - started });
 				return {
 					block: true,
 					reason: refusalPayload(
 						"bash",
 						"cwd",
-						"bash classifier cannot resolve an internal-URL cwd; command not run",
+						"classifier cannot resolve an internal-URL cwd; command not run",
 						"Resolve the internal URL to a filesystem path and retry.",
 						"Do not rewrite the URL (e.g. strip the scheme) to fake a filesystem path.",
 					),
@@ -2890,7 +2890,7 @@ export default function (pi: ExtensionAPI) {
 				// vanished into an opaque "unavailable". Keep the message so the
 				// permission dialog says WHY.
 				classifyError = err instanceof Error ? err.message : String(err);
-				pi.logger.warn(`bash-classifier: classify failed: ${classifyError}`);
+				pi.logger.warn(`classifier: classify failed: ${classifyError}`);
 				return undefined;
 			}));
 			if (!judgement) {
@@ -2915,7 +2915,7 @@ export default function (pi: ExtensionAPI) {
 			// and it feeds the issue #2 eval corpus.
 			const logCommand = truncated(command.replace(/\s+/gu, " ").trim(), 120);
 			if (!dryRun) pi.logger.info(
-				`bash-classifier: verdict=${judgement.verdict}` +
+				`classifier: verdict=${judgement.verdict}` +
 					` cached=${cached ? 1 : 0} reason="${judgement.reason}" cmd="${logCommand}"`,
 			);
 
@@ -2960,7 +2960,7 @@ export default function (pi: ExtensionAPI) {
 			if (verdict === "PARSE_ERROR") {
 				// The raw reply is the only way to tell a provider problem from a
 				// model-formatting problem; the dialog only shows the summary.
-				pi.logger.warn(`bash-classifier: unparseable reply: ${judgement.rawReply ?? "(none)"}`);
+				pi.logger.warn(`classifier: unparseable reply: ${judgement.rawReply ?? "(none)"}`);
 			}
 			logDecision({ tool: "bash", decision: "block", layer: "verdict", why: `${detail}: ${judgement.reason}`, cmd: command, cwd, verdict, cached: cached ? 1 : 0, ms: Date.now() - started });
 			// UNSAFE and PARSE_ERROR are refusals (issue #30); UNSURE is
@@ -2973,14 +2973,14 @@ export default function (pi: ExtensionAPI) {
 		} catch (err) {
 			// Unexpected plugin error: fail closed rather than wave the command
 			// through on a path we cannot vouch for.
-			pi.logger.error(`bash-classifier: ${err instanceof Error ? err.message : String(err)}`);
-			logDecision({ tool: "bash", decision: "block", layer: "internal-error", why: "bash classifier failed; command not run", cmd: command, cwd: ctx.cwd, verdict: null, cached: 0, ms: Date.now() - started });
+			pi.logger.error(`classifier: ${err instanceof Error ? err.message : String(err)}`);
+			logDecision({ tool: "bash", decision: "block", layer: "internal-error", why: "classifier failed; command not run", cmd: command, cwd: ctx.cwd, verdict: null, cached: 0, ms: Date.now() - started });
 			return {
 				block: true,
 				reason: refusalPayload(
 					"bash",
 					"internal-error",
-					"bash classifier failed; command not run",
+					"classifier failed; command not run",
 					"Retry the command; if it keeps failing, check the plugin's error line in the OMP log.",
 					"Do not treat the command as reviewed or approved.",
 				),

@@ -4,7 +4,7 @@ All notable changes, newest first. Issue and PR numbers reference STRML/omp-clas
 
 ## 2026-08-31
 
-- Renamed the project to `omp-classifier` (GitHub repo, package name, docs). The runtime plugin identity and on-disk config path keep the `bash-classifier` names for now.
+- Renamed the project to `omp-classifier` — GitHub repo, package name, plugin identity, config file (`~/.omp/omp-classifier.json`), env overrides (`OMP_CLASSIFIER_CONFIG`, `OMP_CLASSIFIER_TEST_LOCKFILE`), and the decision audit dir. Upgrading: `omp plugin uninstall omp-bash-classifier`, `omp plugin install .`, and `mv ~/.omp/omp-bash-classifier.json ~/.omp/omp-classifier.json`.
 - Evidence tiers: the classify record can carry the session's recent user messages (the only tier that may authorize), operator context (flattened, capped at 500 chars, never authorizing), and prior refusals; the channel decides provenance, and authorization claims from the wrong channel are themselves injection signals (#31).
 - Session grants and dry-run: **Allow for session** records a strict-key grant (action + flags + first argument) that skips classification for the rest of the session and lifts any matching refusal; `/classifier dry-run <command>` previews the gate decision side-effect free (#32).
 - Refusal memory: a denied action keeps prompting its rewordings for the rest of the session (#30).

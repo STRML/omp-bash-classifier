@@ -41,7 +41,7 @@ const readDecisions = (): DecisionRecord[] =>
 
 beforeEach(async () => {
 	dir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-refusal-"));
-	process.env.OMP_BASH_CLASSIFIER_CONFIG = path.join(dir, "omp-bash-classifier.json");
+	process.env.OMP_CLASSIFIER_CONFIG = path.join(dir, "omp-classifier.json");
 	await loadPlugin(makeSettings([]));
 	setClassifierReply("SAFE");
 });

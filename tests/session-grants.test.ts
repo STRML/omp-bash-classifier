@@ -7,7 +7,7 @@
  * static rules. Dry-run: /classifier dry-run <command> fires the real gate
  * once with all side effects off and reports the first decision it reaches.
  *
- * Each test points OMP_BASH_CLASSIFIER_CONFIG at a fresh temp dir, so
+ * Each test points OMP_CLASSIFIER_CONFIG at a fresh temp dir, so
  * decisions.jsonl and the config file are per-test (same convention as
  * audit-log.test.ts). Fresh sessions per test — the plugin's stores are
  * module-level.
@@ -50,7 +50,7 @@ const readDecisions = (): DecisionRecord[] =>
 
 beforeEach(async () => {
 	dir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-grants-"));
-	process.env.OMP_BASH_CLASSIFIER_CONFIG = path.join(dir, "omp-bash-classifier.json");
+	process.env.OMP_CLASSIFIER_CONFIG = path.join(dir, "omp-classifier.json");
 	await loadPlugin(makeSettings([]));
 	setClassifierReply("UNSAFE | no");
 });

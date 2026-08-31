@@ -348,7 +348,7 @@ let testConfigDir: string | undefined;
 // The plugin's config path must NEVER resolve to the real homedir file during
 // tests: machine state (a live /classifier edit) would silently flip defaults
 // and fail the suite. Force the env override before the plugin first reads it.
-process.env.OMP_BASH_CLASSIFIER_CONFIG = useTempConfigFile();
+process.env.OMP_CLASSIFIER_CONFIG = useTempConfigFile();
 
 let testLockPath: string | undefined;
 
@@ -362,7 +362,7 @@ let testLockPath: string | undefined;
 // redirect inert and the suite read the developer's real lockfile. Pin it here
 // beside the redirect rather than relying on bun's default.
 process.env.NODE_ENV = "test";
-process.env.OMP_BASH_CLASSIFIER_TEST_LOCKFILE = lockfilePathForTests();
+process.env.OMP_CLASSIFIER_TEST_LOCKFILE = lockfilePathForTests();
 
 function lockfilePathForTests(): string {
 	if (!testLockPath) {
@@ -407,14 +407,14 @@ export function removeLockfile(): void {
 export function useTempConfigFile(): string {
 	if (!testConfigPath) {
 		// A per-pid DIRECTORY, not a bare file: the decision audit log (#33)
-		// resolves to dirname(OMP_BASH_CLASSIFIER_CONFIG)/decisions.jsonl, so one
+		// resolves to dirname(OMP_CLASSIFIER_CONFIG)/decisions.jsonl, so one
 		// dir keeps config + audit artifacts together and cleanable at exit.
 		if (!testConfigDir) {
 			testConfigDir = fs.mkdtempSync(path.join(os.tmpdir(), `omp-classifier-test-${process.pid}-`));
 		}
-		testConfigPath = path.join(testConfigDir, "omp-bash-classifier.json");
+		testConfigPath = path.join(testConfigDir, "omp-classifier.json");
 	}
-	process.env.OMP_BASH_CLASSIFIER_CONFIG = testConfigPath;
+	process.env.OMP_CLASSIFIER_CONFIG = testConfigPath;
 	return testConfigPath;
 }
 
@@ -435,7 +435,7 @@ export function removeConfigFile(): void {
 		}
 	}
 	testConfigPath = undefined;
-	process.env.OMP_BASH_CLASSIFIER_CONFIG = useTempConfigFile();
+	process.env.OMP_CLASSIFIER_CONFIG = useTempConfigFile();
 }
 
 /** Render an interceptor result: undefined means "let the host decide/run". */
