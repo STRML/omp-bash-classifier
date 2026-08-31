@@ -14,6 +14,7 @@ import {
 	makeSettings,
 	modelCalls,
 	resultText,
+	refusalOf,
 	confirmCalls,
 	setClassifierReply,
 } from "./fixtures";
@@ -68,7 +69,7 @@ describe("critical patterns outrank everything", () => {
 		await loadPlugin(makeSettings([{ match: "rm -rf *", approval: "allow" }]));
 		const result = await gate("rm -rf /");
 		expect(result).toContain("critical pattern");
-		expect(result).toContain("headless, blocked");
+		expect(refusalOf(result).layer).toBe("headless");
 		expect(modelCalls.length).toBe(0);
 	});
 

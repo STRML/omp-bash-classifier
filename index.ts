@@ -1607,6 +1607,10 @@ export default function (pi: ExtensionAPI) {
 			{ systemPrompt: [CLASSIFIER_PROMPT], messages: [promptMessage] },
 			{
 				apiKey: ctx.modelRegistry.resolver(model, sessionId),
+				// Verdicts must be reproducible: sampling at provider default let
+				// the same command flip SAFE/UNSAFE across retries. StreamOptions
+				// supports temperature directly (pi-ai types.d.ts).
+				temperature: 0,
 				disableReasoning: true,
 				// The runner bounds this handler (extensionHandlers.toolCallTimeoutMs,
 				// 30s default) and fails closed on timeout; keep the model call well
@@ -1702,6 +1706,35 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	/**
+	 * Machine-readable refusal payload for every block site (#28). The string a
+	 * tool_call handler returns as `reason` is the only channel back to the
+	 * model, so every deny ships structured fields: which tool, which control
+	 * layer blocked, why, what to do next, and what NOT to do (anti-gaming).
+	 * `axes` carries structured extras (e.g. the cap's actual/limit counts).
+	 */
+	const refusalPayload = (
+		tool: string,
+		layer: string,
+		why: string,
+		next: string,
+		notThis: string,
+		axes?: Record<string, string>,
+	): string =>
+		JSON.stringify(
+			{
+				classifier: "blocked",
+				tool,
+				layer,
+				why,
+				next,
+				notThis,
+				...(axes ?? {}),
+			},
+			null,
+			2,
+		);
+
+	/**
 	 * Raise a real permission request. Returns the block result, or undefined to
 	 * let the command through. Headless (no UI) always blocks: there is nobody to
 	 * ask, and this path is only reached for commands the gate could not clear.
@@ -1710,6 +1743,12 @@ export default function (pi: ExtensionAPI) {
 	 * descriptions and ACP/RPC omit them entirely. Every UI adapter includes a
 	 * confirm message in the elicitation title/body, so the executable command is
 	 * visible on every surface before a yes/no decision.
+	 *
+	 * The dialog (title + body) is untouched; only the returned reason becomes a
+	 * refusalPayload. Layers: "dialog" when a human denies, "headless" when
+	 * nobody could be asked, "unclassified" when the classifier never returned
+	 * a verdict — that cause outranks headless, because the decisive fact is
+	 * that the command was never judged.
 	 */
 	const requestPermission = async (
 		ctx: ExtensionContext,
@@ -1723,10 +1762,30 @@ export default function (pi: ExtensionAPI) {
 		},
 		headline: string,
 		reason: string,
-		subject = "bash command",
+		tool = "bash",
 	): Promise<{ block: true; reason: string } | undefined> => {
+		const subject = tool === "eval" ? "eval code" : "bash command";
 		const detail = reason ? `${headline}: ${reason}` : headline;
-		if (!ctx.hasUI) return { block: true, reason: `${detail} (headless, blocked)` };
+		const layer = ctx.hasUI ? "dialog" : headline === "unclassified" ? "unclassified" : "headless";
+		const guidance: Record<typeof layer, { next: string; notThis: string }> = {
+			unclassified: {
+				next: "Retry the command once the classifier is available, or ask the user to decide.",
+				notThis: "Do not treat the command as reviewed or approved.",
+			},
+			headless: {
+				next: "Rerun interactively so the permission dialog can be answered, or allow this exact command with a static rule.",
+				notThis: "Do not retry the command unchanged and expect a different result.",
+			},
+			dialog: {
+				next: "Ask the user how to proceed, then revise the command accordingly.",
+				notThis: "Do not retry the same command without addressing the denial.",
+			},
+		};
+		const block = (): { block: true; reason: string } => ({
+			block: true,
+			reason: refusalPayload(tool, layer, detail, guidance[layer].next, guidance[layer].notThis),
+		});
+		if (!ctx.hasUI) return block();
 		const approved = await ctx.ui.confirm(
 			// The reason stays OUT of the title. Titles are a single truncated
 			// line, and a classifier reason is a sentence, so putting it here is
@@ -1735,7 +1794,7 @@ export default function (pi: ExtensionAPI) {
 			`Run ${subject}? (${headline})`,
 			buildPermissionBody(target, reason, ctx.cwd),
 		);
-		return approved ? undefined : { block: true, reason: `${detail} — denied by user` };
+		return approved ? undefined : block();
 	};
 
 	pi.on("tool_call", async (event, ctx) => {
@@ -1828,9 +1887,15 @@ export default function (pi: ExtensionAPI) {
 			if (evalCode.length > config.maxCommandLength) {
 				return {
 					block: true,
-					reason:
+					reason: refusalPayload(
+						"eval",
+						"cap",
 						`eval code blocked: ${evalCode.length} chars exceeds the ` +
-						`${config.maxCommandLength}-character review limit`,
+							`${config.maxCommandLength}-character review limit`,
+						"Move the long code into a file and eval a short cell that reads it.",
+						"Do not shorten the code only to dodge the limit.",
+						{ chars: String(evalCode.length), limit: String(config.maxCommandLength) },
+					),
 				};
 			}
 			const cwd = ctx.cwd;
@@ -1849,7 +1914,7 @@ export default function (pi: ExtensionAPI) {
 					},
 				));
 				if (!judgement) {
-					return await requestPermission(ctx, target, "unclassified", classifyError ? `classifier unavailable: ${truncated(classifyError, 160)}` : "classifier unavailable", "eval code");
+					return await requestPermission(ctx, target, "unclassified", classifyError ? `classifier unavailable: ${truncated(classifyError, 160)}` : "classifier unavailable", "eval");
 				}
 				if (!cached && judgement.verdict !== "PARSE_ERROR") remember(scoped, cacheKey, judgement);
 				const logCode = truncated(evalCode.replace(/\s+/gu, " ").trim(), 120);
@@ -1860,7 +1925,7 @@ export default function (pi: ExtensionAPI) {
 				if (judgement.verdict === "SAFE") {
 					const flags = [...new Set(evalCode.match(EVAL_CODE_FLAG_RE) ?? [])];
 					if (flags.length === 0) return;
-					return await requestPermission(ctx, target, "flagged for approval", `classifier-safe but flags: ${flags.join(", ")}`, "eval code");
+					return await requestPermission(ctx, target, "flagged for approval", `classifier-safe but flags: ${flags.join(", ")}`, "eval");
 				}
 				const detail =
 					judgement.verdict === "UNSAFE"
@@ -1871,10 +1936,19 @@ export default function (pi: ExtensionAPI) {
 				if (judgement.verdict === "PARSE_ERROR") {
 					pi.logger.warn(`bash-classifier: unparseable reply: ${judgement.rawReply ?? "(none)"}`);
 				}
-				return await requestPermission(ctx, target, detail, judgement.reason, "eval code");
+				return await requestPermission(ctx, target, detail, judgement.reason, "eval");
 			} catch (err) {
 				pi.logger.error(`bash-classifier: ${err instanceof Error ? err.message : String(err)}`);
-				return { block: true, reason: "bash classifier failed; eval code not run" };
+				return {
+					block: true,
+					reason: refusalPayload(
+						"eval",
+						"internal-error",
+						"bash classifier failed; eval code not run",
+						"Retry the command; if it keeps failing, check the plugin's error line in the OMP log.",
+						"Do not treat the command as reviewed or approved.",
+					),
+				};
 			}
 		}
 
@@ -1883,9 +1957,15 @@ export default function (pi: ExtensionAPI) {
 		if (command.length > config.maxCommandLength) {
 			return {
 				block: true,
-				reason:
+				reason: refusalPayload(
+					"bash",
+					"cap",
 					`bash command blocked: ${command.length} chars exceeds the ` +
-					`${config.maxCommandLength}-character review limit`,
+						`${config.maxCommandLength}-character review limit`,
+					"Write long text to a file and reference it (e.g. git commit -F <file>), or split the command into steps.",
+					"Do not shorten the message only to dodge the limit.",
+					{ chars: String(command.length), limit: String(config.maxCommandLength) },
+				),
 			};
 		}
 
@@ -1960,7 +2040,16 @@ export default function (pi: ExtensionAPI) {
 			// that ExtensionContext does not expose. Passing the raw URL to
 			// resolveToCwd would mislabel it; skipping the gate would fail open.
 			if (cwdInput?.includes("://") || cwdInput?.includes("local:/")) {
-				return { block: true, reason: "bash classifier cannot resolve an internal-URL cwd; command not run" };
+				return {
+					block: true,
+					reason: refusalPayload(
+						"bash",
+						"cwd",
+						"bash classifier cannot resolve an internal-URL cwd; command not run",
+						"Resolve the internal URL to a filesystem path and retry.",
+						"Do not rewrite the URL (e.g. strip the scheme) to fake a filesystem path.",
+					),
+				};
 			}
 			const cwd = cwdInput ? resolveToCwd(cwdInput, ctx.cwd) : ctx.cwd;
 			const env = canonicalEnv(event.input.env);
@@ -2106,7 +2195,16 @@ export default function (pi: ExtensionAPI) {
 			// Unexpected plugin error: fail closed rather than wave the command
 			// through on a path we cannot vouch for.
 			pi.logger.error(`bash-classifier: ${err instanceof Error ? err.message : String(err)}`);
-			return { block: true, reason: "bash classifier failed; command not run" };
+			return {
+				block: true,
+				reason: refusalPayload(
+					"bash",
+					"internal-error",
+					"bash classifier failed; command not run",
+					"Retry the command; if it keeps failing, check the plugin's error line in the OMP log.",
+					"Do not treat the command as reviewed or approved.",
+				),
+			};
 		}
 	});
 

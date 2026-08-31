@@ -414,3 +414,23 @@ export function resultText(result: unknown): string {
 	}
 	return String(result);
 }
+
+/** Shape every block reason must have since #28. */
+export interface RefusalPayload {
+	classifier: string;
+	tool: string;
+	layer: string;
+	why: string;
+	next: string;
+	notThis: string;
+}
+
+/** Parse a structured refusal payload (#28) out of a rendered block result. */
+export function refusalOf(result: unknown): RefusalPayload {
+	const text = resultText(result);
+	try {
+		return JSON.parse(text) as RefusalPayload;
+	} catch {
+		throw new Error(`expected a refusal payload, got: ${text}`);
+	}
+}

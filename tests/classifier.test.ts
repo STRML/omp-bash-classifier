@@ -17,6 +17,7 @@ import {
 	modelCalls,
 	loggerInfos,
 	resultText,
+	refusalOf,
 	confirmCalls,
 	setClassifierReply,
 	setClassifierThrows,
@@ -66,8 +67,9 @@ describe("verdict routing", () => {
 		setClassifierReply("UNSAFE");
 		const ctx = fresh({ hasUI: true, confirmResult: false });
 		const result = resultText(await fire("tool_call", makeEvent("git branch -D feature"), ctx));
+		const payload = refusalOf(result);
 		expect(result).toContain("classified unsafe");
-		expect(result).toContain("denied by user");
+		expect(payload.layer).toBe("dialog");
 		expect(confirmCalls(ctx).length).toBe(1);
 	});
 
@@ -75,14 +77,14 @@ describe("verdict routing", () => {
 		setClassifierReply("UNSAFE");
 		const result = await gate("git push --force origin main");
 		expect(result).toContain("classified unsafe");
-		expect(result).toContain("headless, blocked");
+		expect(refusalOf(result).layer).toBe("headless");
 	});
 
 	test("UNSURE headless fails closed", async () => {
 		setClassifierReply("UNSURE");
 		const result = await gate("make deploy");
 		expect(result).toContain("classifier unsure");
-		expect(result).toContain("headless, blocked");
+		expect(refusalOf(result).layer).toBe("headless");
 	});
 
 	test("classifier throw asks with UI, blocks headless", async () => {
@@ -118,7 +120,7 @@ describe("verdict routing", () => {
 	test("no model available fails closed", async () => {
 		const result = await gate("make build", { model: undefined });
 		expect(result).toContain("no model available");
-		expect(result).toContain("headless, blocked");
+		expect(refusalOf(result).layer).toBe("headless");
 		expect(modelCalls.length).toBe(0);
 	});
 
@@ -141,7 +143,7 @@ describe("strict verdict parsing", () => {
 		setClassifierReply("I think this command is SAFE, it only lists files");
 		const result = await gate("git status -s");
 		expect(result).toContain("classifier parse error");
-		expect(result).toContain("headless, blocked");
+		expect(refusalOf(result).layer).toBe("headless");
 	});
 
 	test("a non-verdict first word is rejected", async () => {
