@@ -103,6 +103,7 @@ Avoid cursor-provider models (`composer-*`, `gpt-5.4-nano-*`, `gemini-3.7-flash-
 - **Later handlers win.** Another extension's `tool_call` handler can revise the command after this one judges it; the host applies the last revision. Input-mutating extensions alongside this plugin are unsupported.
 - **Internal-URL working directories are blocked.** `skill://` and similar cwds expand from session state the plugin cannot see. Pass the resolved filesystem path.
 - **Command contents are not inspected.** `npm test` and `make` are judged as the routine commands they look like. Package scripts and hooks go unread.
+- **Refusal memory is session-local.** A refused action follows reworded commands within that session only and dies with it; subagent inheritance is a host gap (`parentAgentId` is not exposed to extensions).
 
 ## Privacy
 
