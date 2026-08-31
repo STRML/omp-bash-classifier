@@ -190,21 +190,33 @@ mock.module("@oh-my-pi/pi-ai", () => ({
 
 type Handler = (event: unknown, ctx: ExtensionContext) => unknown;
 const handlers = new Map<string, Handler>();
+export type CommandHandler = (args: string, ctx: ExtensionContext) => Promise<unknown>;
+/** Slash commands the plugin registered, by name (e.g. "classifier"). */
+export const registeredCommands = new Map<string, CommandHandler>();
+
+/** Invoke a registered slash command like the host would. */
+export async function fireCommand(name: string, args: string, ctx: ExtensionContext): Promise<unknown> {
+	const handler = registeredCommands.get(name);
+	if (!handler) throw new Error(`no command registered for "/${name}"`);
+	return await handler(args, ctx);
+}
 
 /** Load the plugin with a fake pi; returns a fire() bound to it. */
 export async function loadPlugin(settings: Record<string, unknown>): Promise<void> {
 	loggerWarnings.length = 0;
 	loggerInfos.length = 0;
 	handlers.clear();
+	registeredCommands.clear();
 	modelCalls.length = 0;
-	classifierThrows = false;
 	const mod = await import("../index.ts");
 	mod.default({
 		pi: { settings },
 		on: (event: string, handler: Handler) => {
 			handlers.set(event, handler);
 		},
-		registerCommand: () => {},
+		registerCommand: (name: string, command: { handler: CommandHandler }) => {
+			registeredCommands.set(name, command.handler);
+		},
 		logger: {
 			warn: (message: string) => {
 				loggerWarnings.push(message);
@@ -248,22 +260,29 @@ export interface CtxOptions {
 	sessionId?: string;
 	cwd?: string;
 	hasUI?: boolean;
-	confirmResult?: boolean;
+	/** Selected dialog option label. undefined = canceled/timed-out dialog,
+	 *  which the gate treats as denial (issue #32). */
+	selectResult?: string | undefined;
 	tinyModel?: unknown;
 	model?: unknown;
 }
 
+/** The three labels the plugin's permission dialog offers (issue #32). */
+export const ALLOW_ONCE = "Allow once";
+export const ALLOW_SESSION = "Allow for session";
+export const DENY = "Deny";
+
 export function makeCtx(options: CtxOptions = {}): ExtensionContext {
-	const confirmCalls: string[][] = [];
+	const selectCalls: Array<[string, Array<{ label: string; description?: string }>]> = [];
 	const notifyCalls: string[][] = [];
 	const ctx = {
 		cwd: options.cwd ?? "/workspace",
 		sessionManager: { getSessionId: () => options.sessionId ?? "session-1" },
 		hasUI: options.hasUI ?? false,
 		ui: {
-			confirm: async (title: string, message: string) => {
-				confirmCalls.push([title, message]);
-				return options.confirmResult ?? false;
+			select: async (title: string, items: Array<{ label: string; description?: string }>) => {
+				selectCalls.push([title, items]);
+				return options.selectResult;
 			},
 			notify: (message: string, type = "info") => {
 				notifyCalls.push([message, type]);
@@ -285,25 +304,25 @@ export function makeCtx(options: CtxOptions = {}): ExtensionContext {
 		model: "model" in options ? options.model : { id: "test-model" },
 		modelRegistry: { resolver: () => undefined },
 	} as unknown as ExtensionContext;
-	Object.defineProperty(ctx, "confirmCalls", { value: confirmCalls });
+	Object.defineProperty(ctx, "selectCalls", { value: selectCalls });
 	Object.defineProperty(ctx, "notifyCalls", { value: notifyCalls });
 	return ctx;
 }
 
 /**
- * What the TUI actually parses as Markdown. The host joins the two confirm
- * arguments with a SINGLE newline (extension-ui-controller.ts:947) before
- * handing the result to the Markdown component, so a test that inspects title
- * and message separately cannot see a body that lazily continues the title
- * paragraph. Assert against this, not against the parts.
+ * The full dialog text the TUI renders as Markdown. The plugin passes the
+ * title and the verbatim body as ONE string on the select dialog's title
+ * (the TUI renders a select title as a full Markdown block), joined by a
+ * single newline — the same join the old confirm's two arguments got
+ * (extension-ui-controller.ts:947). Assert against this, not against the
+ * parts, so a body that lazily continues the title paragraph is visible.
  */
 export function dialogText(ctx: ExtensionContext, index = 0): string {
-	const [title, message] = confirmCalls(ctx)[index];
-	return `${title}\n${message}`;
+	return selectCalls(ctx)[index][0];
 }
 
-export function confirmCalls(ctx: ExtensionContext): string[][] {
-	return (ctx as unknown as { confirmCalls: string[][] }).confirmCalls;
+export function selectCalls(ctx: ExtensionContext): Array<[string, Array<{ label: string; description?: string }>]> {
+	return (ctx as unknown as { selectCalls: Array<[string, Array<{ label: string; description?: string }>]> }).selectCalls;
 }
 
 export function notifyCalls(ctx: ExtensionContext): string[][] {

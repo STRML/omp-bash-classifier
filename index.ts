@@ -64,6 +64,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import type { ToolCallEvent } from "@oh-my-pi/pi-coding-agent";
 import { CRITICAL_BASH_PATTERNS } from "@oh-my-pi/pi-coding-agent/tools/bash";
 import { resolveToCwd } from "@oh-my-pi/pi-coding-agent/tools/path-utils";
 import { extractLeadingCdTarget, tokenizeShellSegments } from "@oh-my-pi/pi-coding-agent/tools/shell-tokenize";
@@ -101,6 +102,43 @@ interface Refusal {
 }
 const refusals = new Map<string, Refusal[]>();
 const REFUSAL_CAP = 20;
+
+/** Per-session grants (issue #32): sessionId -> grants, oldest first. A grant
+ *  records a user's "Allow for session" answer: this command's normalized
+ *  target, in this exact directory, may run without further gating until the
+ *  session ends. Config changes clear every store (re-arms the gate). */
+interface Grant {
+	normalizedTarget: string;
+	cwd: string;
+	ts: number;
+}
+const grants = new Map<string, Grant[]>();
+const GRANT_CAP = 50;
+
+/** Dry-run capture (issue #32): `/classifier dry-run <command>` sets this,
+ *  fires the real tool_call handler once, and reads back what it recorded.
+ *  While set, the gate's decision choke points record the FIRST decision they
+ *  reach instead of acting on it — no decisions.jsonl write, no refusal or
+ *  grant store mutation, no cache write, no model call, no dialog — and
+ *  dry-run clears the variable in a finally. Module-level on purpose: the
+ *  alternative threads a flag through every hot-path decision site. The race
+ *  window (a real bash call interleaving with a probe on the shared module
+ *  state) is acceptable for a single-user interactive host; every probe-path
+ *  early return is a fail-closed block, so a racing live call can lose its
+ *  cache write or get spuriously blocked, but never silently allowed. */
+interface DryRunResult {
+	would: "allow" | "block" | "classify";
+	layer: string;
+	why: string;
+	note?: string;
+}
+let dryRun: { result: DryRunResult | undefined } | null = null;
+
+/** First decision wins: later decision points in the same probe are ignored,
+ *  so the reported layer is the one that actually decided. */
+function recordDryRunResult(entry: DryRunResult): void {
+	if (dryRun && dryRun.result === undefined) dryRun.result = entry;
+}
 // Classifier timeout is config-driven (config.timeoutMs, default 15_000).
 
 
@@ -1552,6 +1590,9 @@ function sessionCache(sessionId: string): Map<string, Judgement> {
 }
 
 function remember(scoped: Map<string, Judgement>, key: string, judgement: Judgement): void {
+	// Dry-run probe (issue #32): a cached verdict may be FOLLOWED (no model
+	// call either way) but never written.
+	if (dryRun) return;
 	// Overwriting an existing key cannot grow the map, so evict only for a new
 	// one — otherwise re-caching a key (UNSAFE verdict, then the human's
 	// session grant) throws away an unrelated command's verdict.
@@ -1602,6 +1643,8 @@ function sessionRefusals(sessionId: string): Refusal[] {
 /** Record a refusal. Bookkeeping must never decide the command, so the host
  *  read is guarded like the diagnostic block above the gate. */
 function addRefusal(ctx: ExtensionContext, command: string, why: string): void {
+	// Dry-run probe (issue #32): records nothing.
+	if (dryRun) return;
 	try {
 		const target = normalizeRefusalTarget(command);
 		if (target === "") return;
@@ -1631,6 +1674,48 @@ function liftRefusals(ctx: ExtensionContext, command: string): void {
 	}
 }
 
+function sessionGrants(sessionId: string): Grant[] {
+	let list = grants.get(sessionId);
+	if (!list) {
+		list = [];
+		grants.set(sessionId, list);
+	}
+	return list;
+}
+
+/** Record a session grant: this command's target, in this exact directory,
+ *  may run ungated for the rest of the session. */
+function addGrant(ctx: ExtensionContext, command: string, cwd: string): void {
+	try {
+		const target = normalizeRefusalTarget(command);
+		if (target === "") return;
+		const sessionId = ctx.sessionManager.getSessionId();
+		const list = sessionGrants(sessionId);
+		// One grant per (target, directory): re-approving refreshes ts and moves
+		// the grant to newest instead of stacking duplicates.
+		const existing = list.findIndex(grant => grant.normalizedTarget === target && grant.cwd === cwd);
+		if (existing !== -1) list.splice(existing, 1);
+		while (list.length >= GRANT_CAP) list.shift();
+		list.push({ normalizedTarget: target, cwd, ts: Date.now() });
+	} catch {
+		// No session id, no grant; the caller's decision below is unchanged.
+	}
+}
+
+/** The session's grant for this command's target and directory, if any. */
+function matchingGrant(ctx: ExtensionContext, command: string, cwd: string): Grant | undefined {
+	try {
+		const target = normalizeRefusalTarget(command);
+		if (target === "") return undefined;
+		const cwdInput = cwd ?? "";
+		return grants
+			.get(ctx.sessionManager.getSessionId())
+			?.find(grant => grant.normalizedTarget === target && grant.cwd === cwdInput);
+	} catch {
+		return undefined;
+	}
+}
+
 /** The session's refusal for this command's target, or undefined. */
 function priorRefusalFor(ctx: ExtensionContext, command: string): Refusal | undefined {
 	try {
@@ -1655,9 +1740,9 @@ export default function (pi: ExtensionAPI) {
 	// prints the effective config and the file path.
 	pi.registerCommand("classifier", {
 		description:
-			"View or set omp-bash-classifier options: enabled, model, timeoutMs, maxCommandLength, reset, status",
+			"View or set omp-bash-classifier options: enabled, model, timeoutMs, maxCommandLength, reset, status, dry-run",
 		getArgumentCompletions: (prefix: string) => {
-			const keywords = ["enabled", "model", "timeoutMs", "maxCommandLength", "reset", "status", "file"] as const;
+			const keywords = ["enabled", "model", "timeoutMs", "maxCommandLength", "reset", "status", "dry-run", "file"] as const;
 			return keywords
 				.filter(keyword => keyword.startsWith(prefix.toLowerCase()))
 				.map(keyword => ({ label: keyword, value: keyword }));
@@ -1671,6 +1756,37 @@ export default function (pi: ExtensionAPI) {
 			}
 			if (key === "file") {
 				notify(classifierConfigPath());
+				return;
+			}
+			if (key === "dry-run") {
+				// Everything after the key is the command text — including leading
+				// spaces' significance is none (normalized anyway), but flags must
+				// survive: split only twice.
+				const commandText = args.trim().slice(key.length).trim();
+				if (commandText === "") {
+					notify("usage: /classifier dry-run <command>", "error");
+					return;
+				}
+				// Fires the REAL tool_call handler once with the capture variable
+				// set: every decision choke point records instead of acts (see the
+				// dryRun comment at the module state). The handler reference is
+				// declared below; commands can only fire after registration.
+				const captured: { result: DryRunResult | undefined } = { result: undefined };
+				dryRun = captured;
+				try {
+					await handleToolCall(
+						{ type: "tool_call", toolCallId: `dry-run-${Date.now()}`, toolName: "bash", input: { command: commandText } },
+						ctx,
+					);
+				} finally {
+					dryRun = null;
+				}
+				const result = captured.result ?? {
+					would: "allow",
+					layer: "gate",
+					why: "no gate decision recorded; the host's normal approval flow decides",
+				} satisfies DryRunResult;
+				notify(JSON.stringify(result, null, 2));
 				return;
 			}
 			if (key === "status") {
@@ -1728,7 +1844,7 @@ export default function (pi: ExtensionAPI) {
 				notify(`classifier maxCommandLength=${next.maxCommandLength}`);
 				return;
 			}
-			notify(`unknown key "${key}". Keys: enabled, model, timeoutMs, maxCommandLength, reset, status, file`, "error");
+			notify(`unknown key "${key}". Keys: enabled, model, timeoutMs, maxCommandLength, reset, status, dry-run, file`, "error");
 		},
 	});
 
@@ -1943,6 +2059,17 @@ export default function (pi: ExtensionAPI) {
 	 * refusal payload's why or the headline that drove the dialog.
 	 */
 	const logDecision = (line: DecisionLogInput): void => {
+		// Dry-run probe (issue #32): the audit write is the one side effect
+		// EVERY decision site shares, so the probe records the decision here —
+		// first record wins (see recordDryRunResult) — and writes nothing.
+		if (dryRun) {
+			recordDryRunResult({
+				would: line.decision === "allow" ? "allow" : "block",
+				layer: line.layer,
+				why: line.why,
+			});
+			return;
+		}
 		try {
 			if (!auditLogDirMade) {
 				fs.mkdirSync(path.dirname(decisionsLogPath()), { recursive: true });
@@ -1964,21 +2091,25 @@ export default function (pi: ExtensionAPI) {
 			}
 		}
 	};
+
 	/**
 	 * Raise a real permission request. Returns the block result, or undefined to
 	 * let the command through. Headless (no UI) always blocks: there is nobody to
 	 * ask, and this path is only reached for commands the gate could not clear.
 	 *
-	 * Use `confirm`, not option descriptions: TUI selectors truncate option
-	 * descriptions and ACP/RPC omit them entirely. Every UI adapter includes a
-	 * confirm message in the elicitation title/body, so the executable command is
-	 * visible on every surface before a yes/no decision.
+	 * Three-way `select` (issue #32): "Allow once" is the old confirm-yes;
+	 * "Allow for session" additionally records a grant so this target, in this
+	 * directory, stops gating for the session; "Deny" and undefined (cancel or
+	 * timeout) both deny. The TUI renders a select's TITLE as a full Markdown
+	 * block — not the single truncated line a confirm title gets — so the same
+	 * title+body join confirm used keeps the executable command visible on the
+	 * dialog. Option descriptions are a bonus layer on surfaces that show them;
+	 * the title alone still carries everything needed to decide.
 	 *
-	 * The dialog (title + body) is untouched; only the returned reason becomes a
-	 * refusalPayload. Layers: "dialog" when a human denies, "headless" when
-	 * nobody could be asked, "unclassified" when the classifier never returned
-	 * a verdict — that cause outranks headless, because the decisive fact is
-	 * that the command was never judged.
+	 * Only the returned reason becomes a refusalPayload. Layers: "dialog" when a
+	 * human denies, "headless" when nobody could be asked, "unclassified" when
+	 * the classifier never returned a verdict — that cause outranks headless,
+	 * because the decisive fact is that the command was never judged.
 	 */
 	const requestPermission = async (
 		ctx: ExtensionContext,
@@ -2025,39 +2156,66 @@ export default function (pi: ExtensionAPI) {
 				cached: 0,
 				ms: Date.now() - began,
 			});
-		const block = (): { block: true; reason: string } => {
+		const block = (whyOverride?: string): { block: true; reason: string } => {
 			// Verdict-driven callers pass "follows verdict" so the dialog/headless
 			// line is readable as the outcome of the preceding layer:"verdict" line.
-			audit("block", logWhyPrefix === "" ? detail : `${logWhyPrefix}: ${detail}`);
+			audit("block", whyOverride ?? (logWhyPrefix === "" ? detail : `${logWhyPrefix}: ${detail}`));
 			return {
 				block: true,
 				reason: refusalPayload(tool, layer, detail, guidance[layer].next, guidance[layer].notThis),
 			};
 		};
+		// Dry-run probe (issue #32): never open a dialog, never audit. When a
+		// decision was logged before reaching here (critical, env, a verdict),
+		// that record already won; the unclassified path arrives with none, so
+		// record the prompt itself. A racing live call gets a fail-closed block.
+		if (dryRun) {
+			recordDryRunResult({
+				would: "block",
+				layer: "dialog",
+				why: `would prompt: ${detail}`,
+				note: "the gate raises a permission dialog here",
+			});
+			return { block: true, reason: "dry-run probe: decision captured, nothing executed" };
+		}
 		if (!ctx.hasUI) return block();
-		const approved = await ctx.ui.confirm(
-			// The reason stays OUT of the title. Titles are a single truncated
-			// line, and a classifier reason is a sentence, so putting it here is
-			// what produced dialogs headed "...chained read-only inspection is…"
-			// with the command pushed below the fold.
-			`Run ${subject}? (${headline})`,
-			buildPermissionBody(target, reason, ctx.cwd),
+		const choice = await ctx.ui.select(
+			`Run ${subject}? (${headline})\n${buildPermissionBody(target, reason, ctx.cwd)}`,
+			[
+				{ label: "Allow once", description: "This call only" },
+				{ label: "Allow for session", description: "This action, in this directory, for the rest of the session" },
+				{ label: "Deny" },
+			],
+			// The old confirm default was approve; keep the cursor on it.
+			{ initialIndex: 0 },
 		);
-		if (approved) {
+		if (choice === "Allow once" || choice === "Allow for session") {
 			// The user said yes to this action (issue #30): erase the memory
 			// that its target was refused, so rewordings run clean again.
 			liftRefusals(ctx, target.command);
-			audit("allow", "approved by user");
+			if (choice === "Allow for session") addGrant(ctx, target.command, target.cwd);
+			audit("allow", choice === "Allow for session" ? "approved by user (session grant)" : "approved by user");
 			return undefined;
 		}
 		// A human denial is the one decision a rewording cannot launder:
 		// remember the target so the next phrasing of this action meets the
-		// prior refusal at the classifier.
+		// prior refusal at the classifier. A canceled/timed-out dialog counts
+		// as denial too — nothing ran and nobody approved — but the audit line
+		// says which it was.
 		addRefusal(ctx, target.command, reason.trim() !== "" ? reason : headline);
-		return block();
+		return block(choice === undefined ? `prompt canceled: ${detail}` : undefined);
 	};
 
-	pi.on("tool_call", async (event, ctx) => {
+	/** End a dry-run probe at a decision point the gate itself passes through
+	 *  silently (host-owned rules, disabled classification, would-classify).
+	 *  The probe discards the returned payload; a live call racing the probe
+	 *  window gets a fail-closed block instead of an unguarded pass-through. */
+	const dryRunStop = (entry: DryRunResult): { block: true; reason: string } => {
+		recordDryRunResult(entry);
+		return { block: true, reason: "dry-run probe: decision captured, nothing executed" };
+	};
+
+	const handleToolCall = async (event: ToolCallEvent, ctx: ExtensionContext) => {
 		// Wall-clock anchor for the audit log's `ms`: gate entry to decision.
 		const started = Date.now();
 		const isBash = event.toolName === "bash";
@@ -2071,8 +2229,14 @@ export default function (pi: ExtensionAPI) {
 		const config = readClassifierConfig();
 		const configSignature = [config.enabled, config.model, config.timeoutMs, config.maxCommandLength].join("|");
 		if (configSignature !== classifierConfigSignature) {
-			cache.clear();
-			classifierConfigSignature = configSignature;
+			// A dry-run probe (issue #32) touches neither the cache nor the grant
+			// stores, AND leaves the signature stale on purpose: the next live
+			// call performs exactly the invalidation it would have performed.
+			if (!dryRun) {
+				cache.clear();
+				grants.clear();
+				classifierConfigSignature = configSignature;
+			}
 		}
 
 		// Fires whenever the lockfile says disabled, INCLUDING when
@@ -2169,6 +2333,13 @@ export default function (pi: ExtensionAPI) {
 			const resolvedModel = resolveClassifierModel(ctx);
 			const scoped = sessionCache(ctx.sessionManager.getSessionId());
 			const cacheKey = JSON.stringify(["eval", resolvedModel?.id ?? "(none)", cwd, language, evalCode]);
+			// Session grant (issue #32): same user-tier authorization as the bash
+			// path — "Allow for session" on this payload's dialog promised the
+			// session off, so it must hold here too, not only for bash.
+			if (matchingGrant(ctx, evalCode, cwd)) {
+				logDecision({ tool: "eval", decision: "allow", layer: "granted", why: "session grant", cmd: evalCode, cwd, verdict: null, cached: 0, ms: Date.now() - started });
+				return;
+			}
 			// Refusal memory (issue #30): a reworded payload meets its session's
 			// prior refusal. The record tells the model; the SAFE branch below
 			// stops trusting a bare SAFE for a refused target.
@@ -2191,7 +2362,7 @@ export default function (pi: ExtensionAPI) {
 				}
 				if (!cached && judgement.verdict !== "PARSE_ERROR") remember(scoped, cacheKey, judgement);
 				const logCode = truncated(evalCode.replace(/\s+/gu, " ").trim(), 120);
-				pi.logger.info(
+				if (!dryRun) pi.logger.info(
 					`bash-classifier: verdict=${judgement.verdict}` +
 						` tool=eval lang=${language || "?"} cached=${cached ? 1 : 0} reason="${judgement.reason}" code="${logCode}"`,
 				);
@@ -2328,7 +2499,17 @@ export default function (pi: ExtensionAPI) {
 
 			// A deny rule is the one decision that outranks everything natively
 			// (tools/bash.ts:557) — the host blocks the call, nothing to add.
-			if (rule?.approval === "deny" || policy.bashPolicy === "deny") return;
+			if (rule?.approval === "deny" || policy.bashPolicy === "deny") {
+				if (dryRun) {
+					return dryRunStop({
+						would: "allow",
+						layer: "rule",
+						why: rule ? `rule: ${rule.match}` : "tools.approval.bash: deny",
+						note: "host-native deny decides before this gate; the command never classifies",
+					});
+				}
+				return;
+			}
 
 			// Native bash extracts a bare leading `cd <path> && …` when no
 			// structured cwd was supplied, then resolves cwd with resolveToCwd
@@ -2430,12 +2611,32 @@ export default function (pi: ExtensionAPI) {
 			// decisions still win. A pattern rule's policy outranks a non-deny
 			// `tools.approval.bash` policy in native resolveApproval, so apply the
 			// user prompt only when no pattern rule decided the call.
-			if (rule?.approval === "prompt") return;
+			if (rule?.approval === "prompt") {
+				if (dryRun) {
+					return dryRunStop({
+						would: "allow",
+						layer: "rule",
+						why: `rule: ${rule.match}`,
+						note: "host-native prompt rule prompts before this gate; the gate does not classify",
+					});
+				}
+				return;
+			}
 			if (rule?.approval === "allow" && !isBlanketPattern(rule.match)) {
 				logDecision({ tool: "bash", decision: "allow", layer: "rule", why: `rule: ${rule.match}`, cmd: command, cwd, verdict: null, cached: 0, ms: Date.now() - started });
 				return;
 			}
-			if (!rule && policy.bashPolicy === "prompt") return;
+			if (!rule && policy.bashPolicy === "prompt") {
+				if (dryRun) {
+					return dryRunStop({
+						would: "allow",
+						layer: "policy",
+						why: "tools.approval.bash: prompt",
+						note: "host-native approval policy prompts before this gate; the gate does not classify",
+					});
+				}
+				return;
+			}
 
 			// Classify every remaining command in every approval mode. The host
 			// has a per-session `autoApprove` flag that forces yolo without
@@ -2445,9 +2646,41 @@ export default function (pi: ExtensionAPI) {
 			// but never lets an invisible autoApprove bypass this gate.
 			// enabled=false turns OFF model classification only; the critical and
 			// env checks above, and static rule handling, stay enforced.
-			if (!config.enabled) return;
+			if (!config.enabled) {
+				if (dryRun) {
+					return dryRunStop({
+						would: "allow",
+						layer: "config",
+						why: "classification is disabled (/classifier enabled false)",
+						note: "critical, env, and static-rule checks stay active; no gate decision for this command",
+					});
+				}
+				return;
+			}
+
+			// Session grant (issue #32): the user already approved this action for
+			// this directory for the rest of the session. A grant is user-tier
+			// authorization: it outranks model classification AND the refusal
+			// memory (creating it lifts the target's refusals), but sits below the
+			// critical-pattern and env-override checks above, which rank the
+			// command itself, and below host static rules, which were configured
+			// explicitly.
+			if (matchingGrant(ctx, command, cwd)) {
+				logDecision({ tool: "bash", decision: "allow", layer: "granted", why: "session grant", cmd: command, cwd, verdict: null, cached: 0, ms: Date.now() - started });
+				return;
+			}
 
 			const cached = scoped.get(cacheKey);
+			// Dry-run probe (issue #32): with nothing cached, the classifier model
+			// would run — report that instead of paying the call.
+			if (dryRun && !cached) {
+				return dryRunStop({
+					would: "classify",
+					layer: "classifier",
+					why: "no static rule, session grant, or cached verdict decides this command",
+					note: "the classifier model would run here; skipped in dry-run",
+				});
+			}
 			let classifyError = "";
 			const judgement = cached ?? (await classify(ctx, command, cwd, resolvedModel, config.timeoutMs, recordExtras).catch((err: unknown) => {
 				// Provider errors (quota exhausted, auth, HTTP failures) previously
@@ -2478,7 +2711,7 @@ export default function (pi: ExtensionAPI) {
 			// the choke point for both the SAFE auto-run and the prompt path,
 			// and it feeds the issue #2 eval corpus.
 			const logCommand = truncated(command.replace(/\s+/gu, " ").trim(), 120);
-			pi.logger.info(
+			if (!dryRun) pi.logger.info(
 				`bash-classifier: verdict=${judgement.verdict}` +
 					` cached=${cached ? 1 : 0} reason="${judgement.reason}" cmd="${logCommand}"`,
 			);
@@ -2550,7 +2783,8 @@ export default function (pi: ExtensionAPI) {
 				),
 			};
 		}
-	});
+	};
+	pi.on("tool_call", handleToolCall);
 
 	// Session boundaries: delete only this runner's entries. The extension module
 	// is shared across concurrent sessions; clearing the whole cache on one
@@ -2559,6 +2793,7 @@ export default function (pi: ExtensionAPI) {
 		const sessionId = ctx.sessionManager.getSessionId();
 		cache.delete(sessionId);
 		refusals.delete(sessionId);
+		grants.delete(sessionId);
 	};
 	pi.on("session_start", dropCurrent);
 	pi.on("session_before_switch", dropCurrent);
@@ -2582,5 +2817,6 @@ export default function (pi: ExtensionAPI) {
 		cache.delete(sessionId);
 		staleDisableWarned.delete(sessionId);
 		refusals.delete(sessionId);
+		grants.delete(sessionId);
 	});
 }

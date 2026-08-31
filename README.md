@@ -23,9 +23,12 @@ Calls walk this order:
 | `prompt` rule | Untouched. The native gate prompts, in every mode including `yolo`. |
 | Narrow `allow` rule | Untouched. An explicit decision about a specific shape is never re-judged. For a compound line, a `deny`/`prompt` on any segment decides immediately (the native gate blocks or prompts once — no plugin dialog, no classification), an `allow` on every segment runs silent, and only a compound with no deny/prompt decision and an undecided segment classifies. Blanket patterns never vouch for segments; inert fd-dups (`2>&1`) are ignored, but real redirects (`> file`) bar a segment. |
 | Blanket `allow` (`*`, `**`, `* *`) or no matching rule | Classified in every mode. SAFE passes to the native gate; UNSAFE or UNSURE raises a plugin request. |
+| Granted earlier for this directory | Runs ungated for the rest of the session. A past **Allow for session** answer is user-tier authorization: it outranks classification and refusal memory, but not the critical, env, and static-rule rows above. |
 | Longer than 8,000 characters | Blocked outright. Nothing that long can be reviewed in full. |
 
-A classified UNSAFE produces a Run or Deny dialog showing the full command, the model's reason, and only the details that differ from their defaults: working directory (when it differs from the session cwd), timeout, env, pty, async.
+A gate prompt is a three-choice selector — **Allow once**, **Allow for session**, **Deny** — showing the full command, the model's reason, and only the details that differ from their defaults: working directory (when it differs from the session cwd), timeout, env, pty, async. Canceling or timing out counts as Deny.
+
+**Allow for session** records a grant: this action, in this exact directory, runs ungated for the rest of the session — no classifier call, no dialog. Rewordings of the same action match the grant (it uses the same command normalization refusal memory uses), and answering with it also lifts any refusal recorded for that action. Grants stay below critical patterns, caller-supplied `env`, and your static rules, and they die with the session or a classifier config change (up to 50 per session).
 
 ## Eval code that spawns
 
@@ -66,9 +69,17 @@ Plugin settings live in `~/.omp/omp-bash-classifier.json`. View or change them w
 | `timeoutMs` | `15000` | Classifier call budget. A timeout fails closed to a permission request. |
 | `maxCommandLength` | `8000` | Commands longer than this are blocked (bounds 64-100000; values outside fall back to the default). |
 
-Changing any key flushes the verdict cache. To silence the model quickly, `/classifier enabled false` takes effect on the very next command. `omp plugin disable` needs a session restart, since interceptors bind when a session begins.
+Changing any key flushes the verdict cache and the session grants. To silence the model quickly, `/classifier enabled false` takes effect on the very next command. `omp plugin disable` needs a session restart, since interceptors bind when a session begins.
 
 An existing config file that pins `maxCommandLength: 2000` keeps 2000 after upgrading — defaults only apply to absent keys. `/classifier reset` rewrites the file with current defaults.
+
+`/classifier dry-run <command>` previews what the gate would do, side-effect free: no model call, no dialog, no cache, grant, refusal, or audit writes. It prints the first decision the gate would reach as JSON:
+
+```json
+{ "would": "allow", "layer": "granted", "why": "session grant" }
+```
+
+`would` is `allow` (the gate passes the command: a rule, a grant, a cached verdict, or disabled classification), `block` (cap, critical pattern, or a verdict that would prompt), or `classify` (the gate would run the model here — skipped in the preview). Host-native outcomes carry a `note`: a `deny`/`prompt` rule or approval policy decides before this gate, so the gate would never see the command.
 
 ## The model
 

@@ -15,7 +15,8 @@ import {
 	modelCalls,
 	resultText,
 	refusalOf,
-	confirmCalls,
+	selectCalls,
+	ALLOW_ONCE,
 	setClassifierReply,
 } from "./fixtures";
 
@@ -86,11 +87,11 @@ describe("critical patterns outrank everything", () => {
 		expect(modelCalls.length).toBe(0);
 	});
 
-	test("critical with a UI raises a real confirm, not a silent run", async () => {
-		const ctx = makeCtx({ hasUI: true, confirmResult: true });
+	test("critical with a UI raises a real dialog, not a silent run", async () => {
+		const ctx = makeCtx({ hasUI: true, selectResult: ALLOW_ONCE });
 		const result = resultText(await fire("tool_call", makeEvent("mkfs.ext4 /dev/sdb1"), ctx));
 		expect(result).toBe("ALLOWED"); // user approved
-		expect(confirmCalls(ctx)[0][0]).toContain("critical pattern");
+		expect(selectCalls(ctx)[0][0]).toContain("critical pattern");
 		expect(modelCalls.length).toBe(0);
 	});
 });
