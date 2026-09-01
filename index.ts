@@ -115,6 +115,14 @@ interface Grant {
 const grants = new Map<string, Grant[]>();
 const GRANT_CAP = 50;
 
+/** Per-session classifier pause (issue #48): `/classifier off` adds the
+ *  sessionId here. Same semantics as `config.enabled=false` scoped to one
+ *  session — model classification skips, critical/env/static-rule checks stay
+ *  on — but NOT part of classifierConfigSignature: pausing changes no trust
+ *  state, so cached verdicts stay valid and a resume serves them again.
+ *  Wiped at session boundaries like cache/refusals/grants. */
+const sessionOff = new Set<string>();
+
 /** Dry-run capture (issue #32): `/classifier dry-run <command>` sets this,
  *  fires the real tool_call handler once, and reads back what it recorded.
  *  While set, the gate's decision choke points record the FIRST decision they
@@ -538,15 +546,18 @@ const STATUS_LAST_DECISIONS = 10;
 export interface StatusReport {
 	config: ClassifierConfig;
 	cacheSizes: Record<string, number>;
+	/** SessionIds currently paused via `/classifier off`, sorted. */
+	pausedSessions: string[];
 	decisions: { scanned: number; allow: number; block: number };
 	last: DecisionRecord[];
 }
 
 /**
  * Build the `/classifier status` dump: effective config, per-session verdict
- * cache sizes, allow/refusal counts over the last 500 audit lines, and the
- * last 10 decisions. Tolerates a torn final line (a crash mid-append) and a
- * missing log — both read as fewer decisions, never a throw. Pure read:
+ * cache sizes, sessionIds paused via `/classifier off`, allow/refusal counts
+ * over the last 500 audit lines, and the last 10 decisions. Tolerates a torn
+ * final line (a crash mid-append) and a missing log — both read as fewer
+ * decisions, never a throw. Pure read:
  * writing status.json and notifying is the command handler's job.
  */
 export function buildStatusReport(): StatusReport {
@@ -570,6 +581,7 @@ export function buildStatusReport(): StatusReport {
 	return {
 		config: readClassifierConfig(),
 		cacheSizes,
+		pausedSessions: [...sessionOff].sort(),
 		decisions: { scanned: recent.length, allow, block: recent.length - allow },
 		last: recent.slice(-STATUS_LAST_DECISIONS),
 	};
@@ -1889,9 +1901,9 @@ export default function (pi: ExtensionAPI) {
 	// prints the effective config and the file path.
 	pi.registerCommand("classifier", {
 		description:
-			"View or set omp-classifier options: enabled, model, timeoutMs, maxCommandLength, evidenceUserMessages, reset, status, dry-run",
+			"View or set omp-classifier options: enabled, model, timeoutMs, maxCommandLength, evidenceUserMessages, reset, status, dry-run, off, on",
 		getArgumentCompletions: (prefix: string) => {
-			const keywords = ["enabled", "model", "timeoutMs", "maxCommandLength", "evidenceUserMessages", "reset", "status", "dry-run", "file"] as const;
+			const keywords = ["enabled", "model", "timeoutMs", "maxCommandLength", "evidenceUserMessages", "reset", "status", "dry-run", "off", "on", "file"] as const;
 			return keywords
 				.filter(keyword => keyword.startsWith(prefix.toLowerCase()))
 				.map(keyword => ({ label: keyword, value: keyword }));
@@ -1968,6 +1980,24 @@ export default function (pi: ExtensionAPI) {
 				notify(`classifier enabled=${next.enabled}. Critical, env, and static-rule checks stay active either way.`);
 				return;
 			}
+			if (key === "off" || key === "on") {
+				// A throwing sessionManager must not take the command handler
+				// down; report and leave the session state untouched.
+				try {
+					const sessionId = ctx.sessionManager.getSessionId();
+					if (key === "off") {
+						sessionOff.add(sessionId);
+						notify("classification paused for this session only (/classifier on resumes). Critical, env, and static-rule checks stay active.");
+					} else if (sessionOff.delete(sessionId)) {
+						notify("classification resumed for this session.");
+					} else {
+						notify("classification was not paused for this session.");
+					}
+				} catch (err) {
+					notify(`could not update the session pause: ${err instanceof Error ? err.message : String(err)}`, "error");
+				}
+				return;
+			}
 			if (key === "model") {
 				const next = writeClassifierConfig({ model: value ?? "" });
 				notify(`classifier model=${next.model || "(auto: @tiny, then session model)"}`);
@@ -2007,7 +2037,7 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			notify(
-				`unknown key "${key}". Keys: enabled, model, timeoutMs, maxCommandLength, evidenceUserMessages, reset, status, dry-run, file`,
+				`unknown key "${key}". Keys: enabled, model, timeoutMs, maxCommandLength, evidenceUserMessages, reset, status, dry-run, off, on, file`,
 				"error",
 			);
 		},
@@ -2487,7 +2517,7 @@ export default function (pi: ExtensionAPI) {
 				// took that route and then ran `omp plugin disable` is still
 				// being gated and still deserves to know why.
 				const remedy = config.enabled
-					? "If you meant to turn it off, restart OMP to unload it, or run /classifier enabled false to stop classifying now."
+					? "If you meant to turn it off, run /classifier off (this session) or /classifier enabled false (global), or restart OMP to unload it."
 					: "Classification is already off, but critical patterns, env checks and static rules keep running until you restart OMP.";
 				const notice =
 					`${PLUGIN_NAME} is marked disabled in ${verdict.path} while still bound to this session. ` +
@@ -2509,8 +2539,10 @@ export default function (pi: ExtensionAPI) {
 			// Expression-only payload: the host's `eval` approval applies, the
 			// gate adds nothing (posture A's whole point).
 			if (markers.length === 0) return;
-			// enabled=false turns OFF model classification only, mirroring bash.
-			if (!config.enabled) return;
+			// enabled=false turns OFF model classification only, mirroring bash;
+			// a per-session `/classifier off` pause does the same for just this
+			// session. Neither touches trust state, so cached verdicts survive.
+			if (!config.enabled || sessionOff.has(ctx.sessionManager.getSessionId())) return;
 			// Over-bound spawn-bearing code is blocked unseen, like bash: no
 			// classifier or dialog may approve text it did not read.
 			if (evalCode.length > config.maxCommandLength) {
@@ -2848,13 +2880,27 @@ export default function (pi: ExtensionAPI) {
 			// In write/always-ask this costs a model call before the native prompt,
 			// but never lets an invisible autoApprove bypass this gate.
 			// enabled=false turns OFF model classification only; the critical and
-			// env checks above, and static rule handling, stay enforced.
+			// env checks above, and static rule handling, stay enforced. A
+			// per-session `/classifier off` pause gates exactly the same layer,
+			// scoped to the session; global disabled dominates, so it keeps the
+			// config layer when both hold.
 			if (!config.enabled) {
 				if (dryRun) {
 					return dryRunStop({
 						would: "allow",
 						layer: "config",
 						why: "classification is disabled (/classifier enabled false)",
+						note: "critical, env, and static-rule checks stay active; no gate decision for this command",
+					});
+				}
+				return;
+			}
+			if (sessionOff.has(ctx.sessionManager.getSessionId())) {
+				if (dryRun) {
+					return dryRunStop({
+						would: "allow",
+						layer: "session",
+						why: "classification is paused for this session (/classifier off)",
 						note: "critical, env, and static-rule checks stay active; no gate decision for this command",
 					});
 				}
@@ -2997,6 +3043,9 @@ export default function (pi: ExtensionAPI) {
 		cache.delete(sessionId);
 		refusals.delete(sessionId);
 		grants.delete(sessionId);
+		// A session-scoped pause dies at boundaries too: a resumed session
+		// starts unpaused.
+		sessionOff.delete(sessionId);
 	};
 	pi.on("session_start", dropCurrent);
 	pi.on("session_before_switch", dropCurrent);
@@ -3021,5 +3070,7 @@ export default function (pi: ExtensionAPI) {
 		staleDisableWarned.delete(sessionId);
 		refusals.delete(sessionId);
 		grants.delete(sessionId);
+		// Same boundary rule for the session-scoped pause.
+		sessionOff.delete(sessionId);
 	});
 }

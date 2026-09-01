@@ -72,6 +72,7 @@ Plugin settings live in `~/.omp/omp-classifier.json`. View or change them with `
 Changing any key flushes the verdict cache and the session grants. To silence the model quickly, `/classifier enabled false` takes effect on the very next command. `omp plugin disable` needs a session restart, since interceptors bind when a session begins.
 
 An existing config file that pins `maxCommandLength: 2000` keeps 2000 after upgrading — defaults only apply to absent keys. `/classifier reset` rewrites the file with current defaults.
+`/classifier off` pauses model classification for the current session only. Critical-pattern, env-override, and static-rule checks stay active — the same behavior as `enabled false`, but scoped to the session. Cached verdicts keep being honored, other sessions are unaffected, and the pause dies with the session (a new session starts unpaused). `/classifier on` resumes classification for the session. The persistent `enabled` setting still dominates: `/classifier enabled false` keeps classification off everywhere until you turn it back on. `/classifier status` lists `pausedSessions`, and `dry-run` while paused reports `{ "would": "allow", "layer": "session" }`.
 
 `/classifier dry-run <command>` previews what the gate would do, side-effect free: no model call, no dialog, no cache, grant, refusal, or audit writes. It prints the first decision the gate would reach as JSON:
 
