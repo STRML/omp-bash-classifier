@@ -15,18 +15,23 @@ import {
 	makeEvent,
 	makeSettings,
 	modelCalls,
+	modelAttempts,
 	loggerInfos,
+	removeConfigFile,
 	resultText,
 	refusalOf,
 	selectCalls,
 	ALLOW_ONCE,
 	setClassifierReply,
 	setClassifierThrows,
+	setClassifierOutcomes,
+	writeConfigFile,
 } from "./fixtures";
 
 let seq = 0;
 
 beforeEach(async () => {
+	removeConfigFile();
 	await loadPlugin(makeSettings([]));
 	setClassifierReply("SAFE");
 	setClassifierThrows(false);
@@ -39,6 +44,15 @@ const fresh = (opts: Parameters<typeof makeCtx>[0] = {}) => {
 
 const gate = async (command: string, ctxOptions: Parameters<typeof makeCtx>[0] = {}, input: Record<string, unknown> = {}) =>
 	resultText(await fire("tool_call", makeEvent(command, input), fresh(ctxOptions)));
+
+const calledModelIds = (): string[] =>
+	modelAttempts.map(call => {
+		const model = call.model;
+		if (!model || typeof model !== "object" || !("id" in model) || typeof model.id !== "string") {
+			throw new Error("captured model has no string id");
+		}
+		return model.id;
+	});
 
 describe("verdict routing", () => {
 	test("SAFE passes through without a prompt", async () => {
@@ -171,6 +185,104 @@ describe("model identity and prompt construction", () => {
 
 		await fire("tool_call", makeEvent("make clean"), fresh({ model: session }));
 		expect(modelCalls[1].model).toBe(session);
+	});
+
+	test("provider failure advances through the configured @tiny chain", async () => {
+		await loadPlugin(
+			makeSettings([], undefined, {
+				modelRoles: { tiny: ["tiny-primary", "tiny-backup"] },
+			}),
+		);
+		setClassifierOutcomes({ error: "429 rate limit" }, { reply: "SAFE | read-only command" });
+		const result = resultText(
+			await fire(
+				"tool_call",
+				makeEvent("git status --short"),
+				fresh({ model: { id: "session-model" } }),
+			),
+		);
+
+		expect(result).toBe("ALLOWED");
+		expect(calledModelIds()).toEqual(["tiny-primary", "tiny-backup"]);
+	});
+
+	test("nested role aliases preserve every comma-separated fallback", async () => {
+		await loadPlugin(
+			makeSettings([], undefined, {
+				modelRoles: {
+					tiny: ["@smol"],
+					smol: ["tiny-primary,tiny-backup"],
+				},
+			}),
+		);
+		setClassifierOutcomes({ error: "primary unavailable" }, { reply: "SAFE | backup completed" });
+		const result = resultText(
+			await fire("tool_call", makeEvent("git status --short"), fresh()),
+		);
+
+		expect(result).toBe("ALLOWED");
+		expect(calledModelIds()).toEqual(["tiny-primary", "tiny-backup"]);
+	});
+
+	test("malformed output advances, but a valid UNSURE verdict stops", async () => {
+		await loadPlugin(
+			makeSettings([], undefined, {
+				modelRoles: { tiny: "tiny-primary,tiny-backup,tiny-third" },
+			}),
+		);
+		setClassifierOutcomes(
+			{ reply: "I think this is safe" },
+			{ reply: "UNSURE | needs a human" },
+			{ reply: "SAFE" },
+		);
+		const result = resultText(
+			await fire("tool_call", makeEvent("make deploy"), fresh()),
+		);
+
+		expect(result).toContain("classifier unsure");
+		expect(calledModelIds()).toEqual(["tiny-primary", "tiny-backup"]);
+	});
+
+	test("exhausting @tiny fails closed without trying the session model", async () => {
+		await loadPlugin(
+			makeSettings([], undefined, {
+				modelRoles: { tiny: ["tiny-primary", "tiny-backup"] },
+			}),
+		);
+		setClassifierOutcomes(
+			{ error: "provider unavailable" },
+			{ reply: "" },
+			{ reply: "SAFE" },
+		);
+		const result = resultText(
+			await fire(
+				"tool_call",
+				makeEvent("make build"),
+				fresh({ model: { id: "session-model" } }),
+			),
+		);
+
+		expect(result).toContain("classifier parse error");
+		expect(calledModelIds()).toEqual(["tiny-primary", "tiny-backup"]);
+	});
+
+	test("timeoutMs is shared across the chain while reserving backup time", async () => {
+		writeConfigFile({ timeoutMs: 40 });
+		await loadPlugin(
+			makeSettings([], undefined, {
+				modelRoles: { tiny: ["tiny-primary", "tiny-backup"] },
+			}),
+		);
+		setClassifierOutcomes(
+			{ reply: "SAFE", delayMs: 30 },
+			{ reply: "SAFE | backup completed", delayMs: 1 },
+		);
+		const result = resultText(
+			await fire("tool_call", makeEvent("git status --short"), fresh()),
+		);
+
+		expect(result).toBe("ALLOWED");
+		expect(calledModelIds()).toEqual(["tiny-primary", "tiny-backup"]);
 	});
 
 	test("command and resolved cwd travel as fenced JSON data", async () => {

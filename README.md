@@ -64,8 +64,8 @@ Plugin settings live in `~/.omp/omp-classifier.json`. View or change them with `
 | Key | Default | Meaning |
 |---|---|---|
 | `enabled` | `true` | `false` turns off model classification only. Critical-pattern and env checks still enforce. |
-| `model` | `""` (auto) | Explicit model id. Otherwise: `config.model` -> `@tiny` role -> session model. |
-| `timeoutMs` | `15000` | Classifier call budget. A timeout fails closed to a permission request. |
+| `model` | `""` (auto) | Explicit single model id. Auto mode tries the configured `@tiny` role in order; the session model is used only when no tiny candidate resolves. |
+| `timeoutMs` | `15000` | Chain-wide classifier budget. Time is reserved across remaining candidates; exhausting the deadline fails closed to a permission request. |
 | `maxCommandLength` | `8000` | Commands longer than this are blocked (bounds 64-100000; values outside fall back to the default). |
 | `evidenceUserMessages` | `0` | How many recent user messages (0-6) ride into the classify record as `evidence.userMessages`. `0` sends no evidence. Values outside the bounds fall back to the default. |
 
@@ -84,9 +84,9 @@ An existing config file that pins `maxCommandLength: 2000` keeps 2000 after upgr
 
 ## The model
 
-One call per novel command: single turn, reasoning disabled, 15s budget. Verdicts cache for the session, keyed by cwd, env, pty, timeout, async, and the command text, so reruns cost nothing.
+A novel command starts one classification chain: single-turn calls, reasoning disabled, under one 15s budget. A provider/auth/quota error, empty reply, timeout, or malformed verdict advances to the next configured candidate; a valid `SAFE`, `UNSAFE`, or `UNSURE` stops immediately. Verdicts cache for the session, keyed by the complete model chain plus cwd, env, pty, timeout, async, and command text, so reruns cost nothing.
 
-Default resolution uses the `@tiny` role, falling back to the session model. Assign the role in `/models` or a `config.yml` layer (set the record as a whole; the CLI cannot set one role):
+Auto mode resolves every configured candidate in the `@tiny` role and tries them in order. If at least one tiny candidate resolves, exhausting that chain fails closed; it does not continue to the stronger, costlier session model. The session model is used only when no tiny candidate resolves at all. Assign the role in `/models` or a `config.yml` layer (set the record as a whole; the CLI cannot set one role):
 
 ```yaml
 modelRoles:
@@ -126,7 +126,7 @@ The classify record can carry an `evidence` object whose fields have different a
 
 ## Privacy
 
-Classified command text, up to 8,000 characters plus the resolved working directory, goes to your model provider, under its logging and retention policies. Command text can hold private paths, proprietary snippets, inline env assignments, or secrets in flags. Caller-supplied `env` values are never sent; that path asks the human instead.
+Classified command text, up to 8,000 characters plus the resolved working directory, is sent to each attempted model candidate. A failover chain spanning providers can therefore send the same record to multiple providers, each under its own logging and retention policies. Command text can hold private paths, proprietary snippets, inline env assignments, or secrets in flags. Caller-supplied `env` values are never sent; that path asks the human instead.
 
 ## Development
 

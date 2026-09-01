@@ -63,6 +63,31 @@ describe("resolved model is part of the identity", () => {
 		expect(modelCalls.length).toBe(2);
 		expect((modelCalls[1].model as { id: string }).id).toBe("tiny-b");
 	});
+
+	test("changing a backup candidate invalidates a verdict cached under the same primary", async () => {
+		let tinyRole: string[] = ["tiny-a", "tiny-b"];
+		await loadPlugin({
+			get: (key: string): unknown => {
+				if (key === "bash.patterns") return [];
+				if (key === "tools.approval") return {};
+				if (key === "modelRoles") return { tiny: tinyRole };
+				return undefined;
+			},
+		});
+		setClassifierReply("SAFE");
+		const context = () =>
+			makeCtx({
+				sessionId: "backup-shift",
+				cwd: "/repo",
+				tinyModel: { id: "tiny-a" },
+			});
+
+		await fire("tool_call", makeEvent("git status"), context());
+		expect(modelCalls.length).toBe(1);
+		tinyRole = ["tiny-a", "tiny-c"];
+		await fire("tool_call", makeEvent("git status"), context());
+		expect(modelCalls.length).toBe(2);
+	});
 });
 
 
