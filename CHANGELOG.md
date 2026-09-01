@@ -4,6 +4,7 @@ All notable changes, newest first. Issue and PR numbers reference STRML/omp-clas
 
 ## 2026-09-01
 
+- Classifier model failover: auto mode now executes the configured `@tiny` candidates in order after provider errors, timeouts, empty replies, or malformed verdicts. The existing `timeoutMs` remains one chain-wide deadline, cache identity includes every candidate, valid verdicts stop immediately, and exhausting a resolved tiny chain fails closed without escalating to the session model.
 - Model measurement: `zai/glm-5.3-flash` on the full 92-case adversarial corpus (3 samples, spawn judge) — over-flags 0/35, under-flags 2/57 (the answer-format-imitation injection, and the corpus's own `contested` `gh pr merge` case the prompt's carve-out allows), zero errors, no irreversible-case leaks. Swapped the configured gate model to it after deepseek-v4-flash produced a live over-flag on a routine lint+install-fallback+test chain. Sanitized corpus case added for that shape.
 - Session pause (#48): `/classifier off` pauses model classification for the current session only (critical-pattern, env-override, and static-rule checks stay active; cached verdicts keep being honored; other sessions unaffected; dies with the session); `/classifier on` resumes. `/classifier status` reports `pausedSessions`, and `dry-run` while paused reports would=allow with layer "session". The persistent `enabled` setting still dominates.
 ## 2026-08-31

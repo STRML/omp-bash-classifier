@@ -25,6 +25,7 @@ export interface CapturedModelCall {
 }
 
 export const modelCalls: CapturedModelCall[] = [];
+export const modelAttempts: CapturedModelCall[] = [];
 export let classifierReply = "SAFE";
 export function setClassifierReply(value: string): void {
 	classifierReply = value;
@@ -32,12 +33,21 @@ export function setClassifierReply(value: string): void {
 export function setClassifierThrows(value: boolean): void {
 	classifierThrows = value;
 }
+export interface ClassifierOutcome {
+	reply?: string;
+	error?: string;
+	delayMs?: number;
+}
+export function setClassifierOutcomes(...outcomes: ClassifierOutcome[]): void {
+	classifierOutcomes.splice(0, classifierOutcomes.length, ...outcomes);
+}
 /** Make the stubbed completion slower than the configurable timeout (abort tests). */
 export function setClassifierDelay(ms: number): void {
 	classifierDelayMs = ms;
 }
 let classifierThrows = false;
 let classifierDelayMs = 5;
+const classifierOutcomes: ClassifierOutcome[] = [];
 
 // The published 17.3.8 pi-ai/coding-agent pair is not mutually coherent: 30
 // names coding-agent imports are absent from the pi-ai barrel. The live OMP
@@ -169,7 +179,15 @@ mock.module("@oh-my-pi/pi-ai", () => ({
 	withOAuthAccess: missingExportStub,
 	wrapFetchForCch: missingExportStub,
 	completeSimple: async (model: unknown, request: unknown, options: unknown) => {
-		if (classifierThrows) throw new Error("model call failed");
+		const outcome = classifierOutcomes.shift();
+		const captured: CapturedModelCall = {
+			model,
+			request: request as CapturedModelCall["request"],
+			options: options as CapturedModelCall["options"],
+		};
+		modelAttempts.push(captured);
+		if (classifierThrows && !outcome) throw new Error("model call failed");
+		if (outcome?.error) throw new Error(outcome.error);
 		const signal = (options as { signal?: AbortSignal } | undefined)?.signal;
 		await new Promise<void>((resolve, reject) => {
 			if (signal?.aborted) {
@@ -177,14 +195,10 @@ mock.module("@oh-my-pi/pi-ai", () => ({
 				return;
 			}
 			signal?.addEventListener("abort", () => reject(new Error("aborted before completion")));
-			setTimeout(resolve, classifierDelayMs);
+			setTimeout(resolve, outcome?.delayMs ?? classifierDelayMs);
 		});
-		modelCalls.push({
-			model,
-			request: request as CapturedModelCall["request"],
-			options: options as CapturedModelCall["options"],
-		});
-		return { content: [{ type: "text", text: classifierReply }] };
+		modelCalls.push(captured);
+		return { content: [{ type: "text", text: outcome?.reply ?? classifierReply }] };
 	},
 }));
 
@@ -208,6 +222,8 @@ export async function loadPlugin(settings: Record<string, unknown>): Promise<voi
 	handlers.clear();
 	registeredCommands.clear();
 	modelCalls.length = 0;
+	modelAttempts.length = 0;
+	classifierOutcomes.length = 0;
 	const mod = await import("../index.ts");
 	mod.default({
 		pi: { settings },
@@ -332,14 +348,27 @@ export function notifyCalls(ctx: ExtensionContext): string[][] {
 	return (ctx as unknown as { notifyCalls: string[][] }).notifyCalls;
 }
 
-export function makeSettings(patterns: unknown[], bashPolicy?: string): Record<string, unknown> {
+export function makeSettings(
+	patterns: unknown[],
+	bashPolicy?: string,
+	extras: Record<string, unknown> = {},
+): Record<string, unknown> {
 	const store: Record<string, unknown> = {
 		"bash.patterns": patterns,
 		"tools.approval": bashPolicy ? { bash: bashPolicy } : {},
+		...extras,
 	};
-	// The plugin reads host settings through settings.get(key), like the real
-	// Settings singleton.
-	return { get: (key: string): unknown => store[key] };
+	const get = (key: string): unknown => store[key];
+	const getModelRole = (role: string): string | undefined => {
+		const roles = get("modelRoles");
+		if (!roles || typeof roles !== "object" || Array.isArray(roles) || !(role in roles)) return undefined;
+		const value = Reflect.get(roles, role);
+		if (typeof value === "string") return value;
+		if (!Array.isArray(value) || !value.every(spec => typeof spec === "string")) return undefined;
+		return value.join(",");
+	};
+	// Mirror the host Settings methods used by the plugin and model resolver.
+	return { get, getModelRole };
 }
 
 let testConfigPath: string | undefined;

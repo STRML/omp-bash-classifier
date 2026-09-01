@@ -50,8 +50,8 @@
  *     throws. An SDK/isolated session may have no global settings at all, so an
  *     unreadable read degrades to "no static rules, classify everything" rather
  *     than blocking every bash call.
- *   - Classification uses the `@tiny` model role — the role core reserves for
- *     online title/memory/classifier work — falling back to the session model.
+ *   - Classification uses every candidate in the `@tiny` model role in order.
+ *     The session model is used only when no tiny candidate resolves.
  *
  * Fail-closed points: a command too long to display is blocked outright; an
  * `env` override, classifier error/timeout, and malformed verdict raise a
@@ -65,6 +65,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import type { ToolCallEvent } from "@oh-my-pi/pi-coding-agent";
+import { resolveConfiguredModelPatterns } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
 import { CRITICAL_BASH_PATTERNS } from "@oh-my-pi/pi-coding-agent/tools/bash";
 import { resolveToCwd } from "@oh-my-pi/pi-coding-agent/tools/path-utils";
 import { extractLeadingCdTarget, tokenizeShellSegments } from "@oh-my-pi/pi-coding-agent/tools/shell-tokenize";
@@ -2074,24 +2075,49 @@ export default function (pi: ExtensionAPI) {
 		}
 	};
 
-	const resolveClassifierModel = (ctx: ExtensionContext): Model | undefined => {
+	const modelIdentity = (model: Model): string => {
+		const provider = model.provider || "(unknown-provider)";
+		return `${provider}/${model.id}`;
+	};
+
+	const configuredTinySpecs = (): string[] =>
+		settings.getModelRole("tiny") ? resolveConfiguredModelPatterns("@tiny", settings) : [];
+
+	const resolveClassifierModels = (ctx: ExtensionContext): Model[] => {
 		const config = readClassifierConfig();
-		// Explicit config.model wins; otherwise `@tiny` (the role core reserves
-		// for online classifier work, with its own fallback chain), then the
-		// session model.
-		return ctx.models?.resolve(config.model) ?? ctx.models?.resolve("@tiny") ?? ctx.model;
+		if (config.model) {
+			const explicit = ctx.models?.resolve(config.model);
+			if (explicit) return [explicit];
+		}
+
+		const models: Model[] = [];
+		const seen = new Set<string>();
+		const append = (model: Model | undefined): void => {
+			if (!model) return;
+			const identity = modelIdentity(model);
+			if (seen.has(identity)) return;
+			seen.add(identity);
+			models.push(model);
+		};
+		const tinySpecs = configuredTinySpecs();
+		for (const spec of tinySpecs) append(ctx.models?.resolve(spec));
+		if (tinySpecs.length === 0) append(ctx.models?.resolve("@tiny"));
+		if (models.length > 0) return models;
+
+		append(ctx.model);
+		return models;
 	};
 
 	const classify = async (
 		ctx: ExtensionContext,
 		command: string,
 		cwd: string,
-		model: Model | undefined,
+		models: readonly Model[],
 		timeoutMs: number,
 		recordExtras: Record<string, unknown> = {},
 		operatorContext?: string,
 	): Promise<Judgement> => {
-		if (!model) return { verdict: "UNSURE", reason: "no model available to classify" };
+		if (models.length === 0) return { verdict: "UNSURE", reason: "no model available to classify" };
 		const sessionId = ctx.sessionManager.getSessionId();
 		// Per-call random delimiter: every model-controlled field is encoded as
 		// JSON inside it. Leaving cwd outside the fence gave a newline-bearing
@@ -2120,40 +2146,64 @@ export default function (pi: ExtensionAPI) {
 				`${JSON.stringify(record)}\n${fence}`,
 			timestamp: Date.now(),
 		} satisfies UserMessage;
-		const msg = await completeSimple(
-			model,
-			{ systemPrompt: [CLASSIFIER_PROMPT], messages: [promptMessage] },
-			{
-				apiKey: ctx.modelRegistry.resolver(model, sessionId),
-				// Verdicts must be reproducible: sampling at provider default let
-				// the same command flip SAFE/UNSAFE across retries. StreamOptions
-				// supports temperature directly (pi-ai types.d.ts).
-				temperature: 0,
-				disableReasoning: true,
-				// The runner bounds this handler (extensionHandlers.toolCallTimeoutMs,
-				// 30s default) and fails closed on timeout; keep the model call well
-				// inside that budget so the permission prompt still gets a chance.
-				// (`ctx.ui` dialogs pause that budget — runner.ts:147-154 — so the
-				// human is not on a clock.)
-				signal: AbortSignal.timeout(timeoutMs),
-			},
-		);
-		const text = msg.content
-			.filter((c): c is TextContent => c.type === "text")
-			.map(c => c.text)
-			.join(" ")
-			.trim();
-		// An exhausted/out-of-credit provider can resolve with NO text instead
-		// of throwing; surface that distinctly so it is not mistaken for a
-		// malformed verdict about the command.
-		if (text === "") {
-			return {
-				verdict: "PARSE_ERROR",
-				reason: "classifier model returned no content — check the model's provider credits/quota",
-				rawReply: "(empty reply)",
-			};
+
+		const deadline = Date.now() + timeoutMs;
+		const failures: string[] = [];
+		let lastParseError: Judgement | undefined;
+		for (const [index, model] of models.entries()) {
+			const remainingMs = deadline - Date.now();
+			if (remainingMs <= 0) {
+				failures.push("classifier chain deadline exhausted");
+				break;
+			}
+			const candidatesRemaining = models.length - index;
+			const attemptTimeoutMs = Math.max(1, Math.floor(remainingMs / candidatesRemaining));
+			const identity = modelIdentity(model);
+			try {
+				const msg = await completeSimple(
+					model,
+					{ systemPrompt: [CLASSIFIER_PROMPT], messages: [promptMessage] },
+					{
+						apiKey: ctx.modelRegistry.resolver(model, sessionId),
+						// Verdicts must be reproducible: sampling at provider default let
+						// the same command flip SAFE/UNSAFE across retries.
+						temperature: 0,
+						disableReasoning: true,
+						// timeoutMs is one chain-wide deadline. Equal shares reserve time
+						// for every remaining candidate; fast failures donate unused time.
+						signal: AbortSignal.timeout(attemptTimeoutMs),
+					},
+				);
+				const text = msg.content
+					.filter((c): c is TextContent => c.type === "text")
+					.map(c => c.text)
+					.join(" ")
+					.trim();
+				const judgement =
+					text === ""
+						? {
+								verdict: "PARSE_ERROR" as const,
+								reason: "classifier model returned no content — check the model's provider credits/quota",
+								rawReply: "(empty reply)",
+							}
+						: parseJudgement(text);
+				if (judgement.verdict !== "PARSE_ERROR") return judgement;
+				lastParseError = judgement;
+				if (index + 1 < models.length) {
+					pi.logger.warn(`classifier: ${identity} returned no verdict; trying fallback`);
+				}
+			} catch (err) {
+				const message = err instanceof Error ? err.message : String(err);
+				failures.push(`${identity}: ${message}`);
+				if (index + 1 < models.length) {
+					pi.logger.warn(`classifier: ${identity} failed; trying fallback: ${truncated(message, 160)}`);
+				}
+			}
 		}
-		return parseJudgement(text);
+
+		if (lastParseError) return lastParseError;
+		if (failures.length > 0) throw new Error(failures.join("; "));
+		return { verdict: "UNSURE", reason: "no model available to classify" };
 	};
 
 	/**
@@ -2565,9 +2615,9 @@ export default function (pi: ExtensionAPI) {
 			}
 			const cwd = ctx.cwd;
 			const target = { command: evalCode, cwd, envKeys: [], pty: false, timeout: undefined as number | undefined, async: false };
-			const resolvedModel = resolveClassifierModel(ctx);
+			const resolvedModels = resolveClassifierModels(ctx);
 			const scoped = sessionCache(ctx.sessionManager.getSessionId());
-			const cacheKey = JSON.stringify(["eval", resolvedModel?.id ?? "(none)", cwd, language, evalCode]);
+			const cacheKey = JSON.stringify(["eval", resolvedModels.map(modelIdentity), cwd, language, evalCode]);
 			// Session grant (issue #32): same user-tier authorization as the bash
 			// path — "Allow for session" on this payload's dialog promised the
 			// session off, so it must hold here too, not only for bash.
@@ -2585,7 +2635,7 @@ export default function (pi: ExtensionAPI) {
 			try {
 				let classifyError = "";
 				const cached = scoped.get(cacheKey);
-				const judgement = cached ?? (await classify(ctx, evalCode, cwd, resolvedModel, config.timeoutMs, { kind: "eval-code", language, ...recordExtras }, operatorContext).catch(
+				const judgement = cached ?? (await classify(ctx, evalCode, cwd, resolvedModels, config.timeoutMs, { kind: "eval-code", language, ...recordExtras }, operatorContext).catch(
 					(err: unknown) => {
 						classifyError = err instanceof Error ? err.message : String(err);
 						pi.logger.warn(`classifier: classify failed: ${classifyError}`);
@@ -2786,14 +2836,14 @@ export default function (pi: ExtensionAPI) {
 			const scoped = sessionCache(ctx.sessionManager.getSessionId());
 			// Every execution-affecting input is part of the identity. JSON avoids
 			// collisions when a value contains whichever delimiter text we choose.
-			// The resolved classifier model is part of the identity: a session
-			// whose @tiny role or live model changes must not reuse a SAFE that
-			// a different model produced. Resolution is per-session state, so
+			// The resolved classifier chain is part of the identity: a session
+			// whose @tiny role changes must not reuse a SAFE produced under a
+			// different primary or fallback. Resolution is per-session state, so
 			// this lives in the per-session key rather than the global
 			// config-signature clear.
-			const resolvedModel = resolveClassifierModel(ctx);
+			const resolvedModels = resolveClassifierModels(ctx);
 			const cacheKey = JSON.stringify([
-				resolvedModel?.id ?? "(none)", cwd, env.key, pty, timeout, async, command,
+				resolvedModels.map(modelIdentity), cwd, env.key, pty, timeout, async, command,
 			]);
 			// Refusal memory (issue #30): a reworded command meets its session's
 			// prior refusal. The record tells the model; the SAFE branch below
@@ -2931,7 +2981,7 @@ export default function (pi: ExtensionAPI) {
 				});
 			}
 			let classifyError = "";
-			const judgement = cached ?? (await classify(ctx, command, cwd, resolvedModel, config.timeoutMs, recordExtras, operatorContext).catch((err: unknown) => {
+			const judgement = cached ?? (await classify(ctx, command, cwd, resolvedModels, config.timeoutMs, recordExtras, operatorContext).catch((err: unknown) => {
 				// Provider errors (quota exhausted, auth, HTTP failures) previously
 				// vanished into an opaque "unavailable". Keep the message so the
 				// permission dialog says WHY.
