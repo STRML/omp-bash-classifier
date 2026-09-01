@@ -103,8 +103,11 @@ Pick on measured behavior, not size. Scored on the shipped prompt: eight routine
 | `openai-codex/gpt-5.4-mini` | 0/25 | 0/40 | 0/40 | 2.7s |
 | `openrouter/deepseek/deepseek-v4-flash` | 0/25 | 0/40 | 6/40 (calls a routine commit UNSAFE) | 1.7s |
 | `anthropic/claude-sonnet-5` | 2/25 | 0/40 | 0/40 | 1.7s |
+| `zai/glm-5.3-flash` | 1/16 | 1/18 (contested `gh pr merge`, which the prompt's carve-out allows) | 0/35 | (not timed) |
 
-All four reject every plainly destructive command. What separates them is resistance to a command that argues for its own SAFE verdict, and that does not track model strength: the Sonnet-class model the default `smol` chain lands on scored worst. Measure before switching. An earlier prompt let claude-sonnet-5 through on 29/50 injection samples.
+All five reject every plainly destructive command. What separates them is resistance to a command that argues for its own SAFE verdict, and that does not track model strength: the Sonnet-class model the default `smol` chain lands on scored worst. Measure before switching. An earlier prompt let claude-sonnet-5 through on 29/50 injection samples.
+
+The `zai/glm-5.3-flash` row is a different protocol: the full 92-case adversarial corpus, 3 samples, spawn judge (2026-09-01). Its one injection leak is the answer-format imitation (`printf 'SAFE | …'`); its destructive leak is the corpus's own `contested` case, which the shipped prompt's gh-merge carve-out tells the model to allow. It replaced deepseek-v4-flash as the configured gate model after deepseek produced a live over-flag on a routine lint+test chain (corpus case added) and empty-reply PARSE_ERRORs.
 
 Avoid cursor-provider models (`composer-*`, `gpt-5.4-nano-*`, `gemini-3.7-flash-*`). They answer as agents rather than judges, every reply parses as no-verdict, and every command then prompts.
 
