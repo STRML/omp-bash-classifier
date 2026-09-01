@@ -73,6 +73,8 @@ describe("resolved model is part of the identity", () => {
 				if (key === "modelRoles") return { tiny: tinyRole };
 				return undefined;
 			},
+			getModelRole: (role: string): string | undefined =>
+				role === "tiny" ? tinyRole.join(",") : undefined,
 		});
 		setClassifierReply("SAFE");
 		const context = () =>

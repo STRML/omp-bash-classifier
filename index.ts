@@ -65,10 +65,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import type { ToolCallEvent } from "@oh-my-pi/pi-coding-agent";
-import {
-	resolveConfiguredModelPatterns,
-	type ModelRoleLookup,
-} from "@oh-my-pi/pi-coding-agent/config/model-resolver";
+import { resolveConfiguredModelPatterns } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
 import { CRITICAL_BASH_PATTERNS } from "@oh-my-pi/pi-coding-agent/tools/bash";
 import { resolveToCwd } from "@oh-my-pi/pi-coding-agent/tools/path-utils";
 import { extractLeadingCdTarget, tokenizeShellSegments } from "@oh-my-pi/pi-coding-agent/tools/shell-tokenize";
@@ -2083,37 +2080,8 @@ export default function (pi: ExtensionAPI) {
 		return `${provider}/${model.id}`;
 	};
 
-	const modelRoleLookup: ModelRoleLookup = {
-		getModelRole: role => {
-			try {
-				const roles: unknown = settings.get("modelRoles");
-				if (!roles || typeof roles !== "object" || Array.isArray(roles) || !(role in roles)) return undefined;
-				const value = Reflect.get(roles, role);
-				if (typeof value === "string") return value;
-				if (!Array.isArray(value) || !value.every(spec => typeof spec === "string")) return undefined;
-				return value.join(",");
-			} catch {
-				return undefined;
-			}
-		},
-	};
-
-	const expandModelSpecs = (value: string, visited: ReadonlySet<string> = new Set()): string[] => {
-		const normalized = value.trim();
-		if (visited.has(normalized)) return [];
-		const nextVisited = new Set(visited);
-		nextVisited.add(normalized);
-		return resolveConfiguredModelPatterns(normalized, modelRoleLookup).flatMap(pattern => {
-			const nested = resolveConfiguredModelPatterns(pattern, modelRoleLookup);
-			if (nested.length === 1 && nested[0] === pattern) return [pattern];
-			return expandModelSpecs(pattern, nextVisited);
-		});
-	};
-
-	const configuredTinySpecs = (): string[] => {
-		const configured = modelRoleLookup.getModelRole("tiny");
-		return configured ? expandModelSpecs(configured) : [];
-	};
+	const configuredTinySpecs = (): string[] =>
+		settings.getModelRole("tiny") ? resolveConfiguredModelPatterns("@tiny", settings) : [];
 
 	const resolveClassifierModels = (ctx: ExtensionContext): Model[] => {
 		const config = readClassifierConfig();

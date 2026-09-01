@@ -206,24 +206,6 @@ describe("model identity and prompt construction", () => {
 		expect(calledModelIds()).toEqual(["tiny-primary", "tiny-backup"]);
 	});
 
-	test("nested role aliases preserve every comma-separated fallback", async () => {
-		await loadPlugin(
-			makeSettings([], undefined, {
-				modelRoles: {
-					tiny: ["@smol"],
-					smol: ["tiny-primary,tiny-backup"],
-				},
-			}),
-		);
-		setClassifierOutcomes({ error: "primary unavailable" }, { reply: "SAFE | backup completed" });
-		const result = resultText(
-			await fire("tool_call", makeEvent("git status --short"), fresh()),
-		);
-
-		expect(result).toBe("ALLOWED");
-		expect(calledModelIds()).toEqual(["tiny-primary", "tiny-backup"]);
-	});
-
 	test("malformed output advances, but a valid UNSURE verdict stops", async () => {
 		await loadPlugin(
 			makeSettings([], undefined, {

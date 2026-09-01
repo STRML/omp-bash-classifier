@@ -358,9 +358,17 @@ export function makeSettings(
 		"tools.approval": bashPolicy ? { bash: bashPolicy } : {},
 		...extras,
 	};
-	// The plugin reads host settings through settings.get(key), like the real
-	// Settings singleton.
-	return { get: (key: string): unknown => store[key] };
+	const get = (key: string): unknown => store[key];
+	const getModelRole = (role: string): string | undefined => {
+		const roles = get("modelRoles");
+		if (!roles || typeof roles !== "object" || Array.isArray(roles) || !(role in roles)) return undefined;
+		const value = Reflect.get(roles, role);
+		if (typeof value === "string") return value;
+		if (!Array.isArray(value) || !value.every(spec => typeof spec === "string")) return undefined;
+		return value.join(",");
+	};
+	// Mirror the host Settings methods used by the plugin and model resolver.
+	return { get, getModelRole };
 }
 
 let testConfigPath: string | undefined;
